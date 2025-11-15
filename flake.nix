@@ -281,38 +281,40 @@
 
             xdg.configFile."jellysync/config.yaml".source = configFile;
 
-            systemd.user.services.jellysync = {
-              Unit = {
-                Description = "Jellysync file synchronization";
-                After = [ "network-online.target" ];
-                Wants = [ "network-online.target" ];
+            systemd.user = {
+              services.jellysync = {
+                Unit = {
+                  Description = "Jellysync file synchronization";
+                  After = [ "network-online.target" ];
+                  Wants = [ "network-online.target" ];
+                };
+
+                Service = {
+                  ExecStart =
+                    let
+                      jobArgs =
+                        if cfg.jobNames != [ ] then
+                          lib.concatMapStringsSep " " (job: lib.escapeShellArg job) cfg.jobNames
+                        else
+                          "";
+                    in
+                    "${cfg.package}/bin/jellysync ${jobArgs}";
+                };
               };
 
-              Service = {
-                ExecStart =
-                  let
-                    jobArgs =
-                      if cfg.jobNames != [ ] then
-                        lib.concatMapStringsSep " " (job: lib.escapeShellArg job) cfg.jobNames
-                      else
-                        "";
-                  in
-                  "${cfg.package}/bin/jellysync ${jobArgs}";
-              };
-            };
+              timers.jellysync = {
+                Unit = {
+                  Description = "Jellysync file synchronization timer";
+                };
 
-            systemd.user.timers.jellysync = {
-              Unit = {
-                Description = "Jellysync file synchronization timer";
-              };
+                Timer = {
+                  OnCalendar = cfg.schedule;
+                  Persistent = cfg.persistent;
+                };
 
-              Timer = {
-                OnCalendar = cfg.schedule;
-                Persistent = cfg.persistent;
-              };
-
-              Install = {
-                WantedBy = [ "timers.target" ];
+                Install = {
+                  WantedBy = [ "timers.target" ];
+                };
               };
             };
           };

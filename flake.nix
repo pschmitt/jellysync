@@ -254,8 +254,8 @@
 
             schedule = mkOption {
               type = types.str;
-              default = "0 3 * * *";
-              description = "Systemd timer schedule (OnCalendar format). Default: daily at 3 AM.";
+              default = "hourly";
+              description = "Systemd timer schedule (OnCalendar format). Default: hourly";
               example = "hourly";
             };
 
@@ -306,7 +306,6 @@
             systemd.user.timers.jellysync = {
               Unit = {
                 Description = "Jellysync file synchronization timer";
-                Requires = [ "jellysync.service" ];
               };
 
               Timer = {

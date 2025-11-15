@@ -1,0 +1,634 @@
+#!/usr/bin/env bash
+#
+# jellysync - Sync files from SSH server to local directories
+# Copyright (C) 2024 pschmitt
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${JELLYSYNC_CONFIG:-${SCRIPT_DIR}/jellysync.yaml}"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Global variables
+declare -gA REMOTE=()
+declare -gA LOCAL=()
+declare -gA REMOTE_DIRS=()
+declare -gA LOCAL_DIRS=()
+declare -ga JOBS=()
+DRY_RUN=
+VERBOSE=
+
+usage() {
+  cat <<EOF
+jellysync - Sync files from SSH server to local directories
+
+Usage: ${0##*/} [OPTIONS] [JOB_NAME...]
+
+Options:
+  -c, --config FILE   Config file path (default: jellysync.yaml)
+  -n, --dry-run       Perform a dry run (no actual sync)
+  -v, --verbose       Verbose output
+  -l, --list          List all jobs
+  -h, --help          Show this help
+  --version           Show version
+
+Arguments:
+  JOB_NAME           Sync specific job(s). If omitted, sync all jobs.
+
+Examples:
+  ${0##*/}                    # Sync all jobs
+  ${0##*/} pluribus           # Sync only 'pluribus' job
+  ${0##*/} -n "Star Trek"     # Dry run for 'Star Trek' job
+  ${0##*/} -v pluribus movies # Sync multiple jobs with verbose output
+
+Config file: ${CONFIG_FILE}
+EOF
+}
+
+log() {
+  echo -e "${BLUE}[jellysync]${NC} $*"
+}
+
+log_success() {
+  echo -e "${GREEN}[✓]${NC} $*"
+}
+
+log_error() {
+  echo -e "${RED}[✗]${NC} $*" >&2
+}
+
+log_warning() {
+  echo -e "${YELLOW}[!]${NC} $*"
+}
+
+
+
+check_dependencies() {
+  local missing=()
+
+  if ! command -v yq &>/dev/null
+  then
+    missing+=(yq)
+  fi
+
+  if ! command -v rsync &>/dev/null
+  then
+    missing+=(rsync)
+  fi
+
+  if ! command -v ssh &>/dev/null
+  then
+    missing+=(ssh)
+  fi
+
+  if [[ ${#missing[@]} -gt 0 ]]
+  then
+    log_error "Missing required commands: ${missing[*]}"
+    return 1
+  fi
+}
+
+# Load config using yq (Go version)
+load_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]
+  then
+    log_error "Config file not found: $CONFIG_FILE"
+    return 1
+  fi
+
+  # Parse remote section
+  if ! REMOTE[hostname]=$(yq '.remote.hostname' "$CONFIG_FILE" 2>/dev/null)
+  then
+    log_error "Failed to parse remote.hostname from config"
+    return 1
+  fi
+
+  if ! REMOTE[username]=$(yq '.remote.username' "$CONFIG_FILE" 2>/dev/null)
+  then
+    log_error "Failed to parse remote.username from config"
+    return 1
+  fi
+
+  if ! REMOTE[port]=$(yq '.remote.port // 22' "$CONFIG_FILE" 2>/dev/null)
+  then
+    log_error "Failed to parse remote.port from config"
+    return 1
+  fi
+
+  if ! REMOTE[root]=$(yq '.remote.root' "$CONFIG_FILE" 2>/dev/null)
+  then
+    log_error "Failed to parse remote.root from config"
+    return 1
+  fi
+
+  # Parse local section
+  if ! LOCAL[root]=$(yq '.local.root' "$CONFIG_FILE" 2>/dev/null)
+  then
+    log_error "Failed to parse local.root from config"
+    return 1
+  fi
+
+  # Parse remote directories
+  local remote_dir_keys
+  remote_dir_keys=$(yq '.remote.directories | keys | .[]' "$CONFIG_FILE" 2>/dev/null)
+  if [[ -n "$remote_dir_keys" ]]
+  then
+    while IFS= read -r key
+    do
+      if [[ -n "$key" ]]
+      then
+        if ! REMOTE_DIRS[$key]=$(yq ".remote.directories.${key}" "$CONFIG_FILE" 2>/dev/null)
+        then
+          log_warning "Failed to parse remote directory: $key"
+        fi
+      fi
+    done <<< "$remote_dir_keys"
+  fi
+
+  # Parse local directories
+  local local_dir_keys
+  local_dir_keys=$(yq '.local.directories | keys | .[]' "$CONFIG_FILE" 2>/dev/null)
+  if [[ -n "$local_dir_keys" ]]
+  then
+    while IFS= read -r key
+    do
+      if [[ -n "$key" ]]
+      then
+        if ! LOCAL_DIRS[$key]=$(yq ".local.directories.${key}" "$CONFIG_FILE" 2>/dev/null)
+        then
+          log_warning "Failed to parse local directory: $key"
+        fi
+      fi
+    done <<< "$local_dir_keys"
+  fi
+
+  # Parse jobs
+  local job_count
+  local i
+  local job_name
+  local remote_dir
+  local local_dir
+  local directory
+  local job_data
+  if ! job_count=$(yq '.jobs | length' "$CONFIG_FILE" 2>/dev/null)
+  then
+    log_error "Failed to parse jobs from config"
+    return 1
+  fi
+
+  for ((i=0; i<job_count; i++))
+  do
+    if ! job_name=$(yq ".jobs[$i].name" "$CONFIG_FILE" 2>/dev/null)
+    then
+      log_warning "Failed to parse job name at index $i"
+      continue
+    fi
+
+    remote_dir=$(yq ".jobs[$i].remote_dir // \"\"" "$CONFIG_FILE" 2>/dev/null)
+    local_dir=$(yq ".jobs[$i].local_dir // \"\"" "$CONFIG_FILE" 2>/dev/null)
+    directory=$(yq ".jobs[$i].directory // \"\"" "$CONFIG_FILE" 2>/dev/null)
+
+    job_data="name=${job_name}"
+    if [[ -n "$remote_dir" && "$remote_dir" != "null" ]]
+    then
+      job_data+="|remote_dir=${remote_dir}"
+    fi
+
+    if [[ -n "$local_dir" && "$local_dir" != "null" ]]
+    then
+      job_data+="|local_dir=${local_dir}"
+    fi
+
+    if [[ -n "$directory" && "$directory" != "null" ]]
+    then
+      job_data+="|directory=${directory}"
+    fi
+
+    JOBS+=("$job_data")
+  done
+
+  # Validate required config
+  if [[ -z "${REMOTE[hostname]:-}" || "${REMOTE[hostname]}" == "null" ]]
+  then
+    log_error "Missing remote.hostname in config"
+    return 1
+  fi
+
+  if [[ -z "${REMOTE[username]:-}" || "${REMOTE[username]}" == "null" ]]
+  then
+    log_error "Missing remote.username in config"
+    return 1
+  fi
+
+  if [[ -z "${REMOTE[root]:-}" || "${REMOTE[root]}" == "null" ]]
+  then
+    log_error "Missing remote.root in config"
+    return 1
+  fi
+
+  if [[ -z "${LOCAL[root]:-}" || "${LOCAL[root]}" == "null" ]]
+  then
+    log_error "Missing local.root in config"
+    return 1
+  fi
+}
+
+# Expand path template with variables
+# Usage: expand_path --remote|--local "$path" "$job_name"
+expand_path() {
+  local mode=""
+  local target_path=""
+  local job_name=""
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]
+  do
+    case "$1" in
+      --remote)
+        mode="remote"
+        shift
+        ;;
+      --local)
+        mode="local"
+        shift
+        ;;
+      *)
+        if [[ -z "$target_path" ]]
+        then
+          target_path="$1"
+        else
+          job_name="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  # Replace $name with job name
+  target_path="${target_path//\$name/$job_name}"
+
+  # Replace directory variables (e.g., $tv_shows, $movies)
+  local dir_var
+  for dir_var in "${!REMOTE_DIRS[@]}"
+  do
+    if [[ "$mode" == "remote" ]]
+    then
+      target_path="${target_path//\$$dir_var/${REMOTE_DIRS[$dir_var]}}"
+    else
+      target_path="${target_path//\$$dir_var/${LOCAL_DIRS[$dir_var]}}"
+    fi
+  done
+
+  echo "$target_path"
+}
+
+# Expand tilde and $HOME in path
+expand_home() {
+  local path_str="$1"
+
+  # Expand $HOME
+  path_str="${path_str//\$HOME/$HOME}"
+
+  # Expand ~ at the beginning
+  if [[ "$path_str" =~ ^~ ]]
+  then
+    path_str="${path_str/#\~/$HOME}"
+  fi
+
+  echo "$path_str"
+}
+
+# Get full path (handle absolute vs relative)
+get_full_path() {
+  local base_root="$1"
+  local rel_path="$2"
+
+  # Expand ~ and $HOME first
+  base_root=$(expand_home "$base_root")
+  rel_path=$(expand_home "$rel_path")
+
+  if [[ "$rel_path" =~ ^/ ]]
+  then
+    # Absolute path
+    echo "$rel_path"
+  else
+    # Relative path
+    echo "${base_root%/}/${rel_path#/}"
+  fi
+}
+
+# List all jobs
+list_jobs() {
+  log "Available jobs in ${CONFIG_FILE}:"
+  echo
+
+  local job_data
+  local job_name
+  local pairs
+  local pair
+  local key
+  local value
+  for job_data in "${JOBS[@]}"
+  do
+    job_name=""
+
+    # Parse job data
+    while IFS='|' read -ra pairs
+    do
+      for pair in "${pairs[@]}"
+      do
+        IFS='=' read -r key value <<< "$pair"
+        if [[ "$key" == "name" ]]
+        then
+          job_name="$value"
+          break
+        fi
+      done
+    done <<< "$job_data"
+
+    echo "  • $job_name"
+  done
+
+  echo
+}
+
+# Sync a single job
+sync_job() {
+  local job_data="$1"
+
+  # Parse job configuration
+  local job_name=""
+  local remote_dir=""
+  local local_dir=""
+  local directory=""
+  local pairs
+  local pair
+  local key
+  local value
+
+  while IFS='|' read -ra pairs
+  do
+    for pair in "${pairs[@]}"
+    do
+      IFS='=' read -r key value <<< "$pair"
+      case "$key" in
+        name)
+          job_name="$value"
+          ;;
+        remote_dir)
+          remote_dir="$value"
+          ;;
+        local_dir)
+          local_dir="$value"
+          ;;
+        directory)
+          directory="$value"
+          ;;
+      esac
+    done
+  done <<< "$job_data"
+
+  if [[ -z "$job_name" ]]
+  then
+    return 1
+  fi
+
+  # Handle shorthand "directory" syntax
+  if [[ -n "$directory" && -z "$remote_dir" && -z "$local_dir" ]]
+  then
+    remote_dir="\$$directory/\$name"
+    local_dir="\$$directory/\$name"
+  fi
+
+  # Expand path templates
+  remote_dir=$(expand_path --remote "$remote_dir" "$job_name")
+  local_dir=$(expand_path --local "$local_dir" "$job_name")
+
+  # Get full paths
+  local remote_full
+  local local_full
+  remote_full=$(get_full_path "${REMOTE[root]}" "$remote_dir")
+  local_full=$(get_full_path "${LOCAL[root]}" "$local_dir")
+
+  # Build SSH/rsync command
+  local remote_host="${REMOTE[username]}@${REMOTE[hostname]}"
+  local remote_port="${REMOTE[port]:-22}"
+  local remote_path="${remote_host}:${remote_full}/"
+
+  log "Syncing job: ${GREEN}${job_name}${NC}"
+  if [[ -n "$VERBOSE" ]]
+  then
+    log "  Remote: ${remote_path}"
+    log "  Local:  ${local_full}/"
+  fi
+
+  # Ensure local directory exists
+  if [[ -z "$DRY_RUN" ]]
+  then
+    if ! mkdir -p "$local_full"
+    then
+      log_error "Failed to create local directory: $local_full"
+      return 1
+    fi
+  fi
+
+  # Build rsync command
+  local rsync_opts=(
+    -avz
+    --delete
+    -e "ssh -p ${remote_port}"
+  )
+
+  if [[ -n "$DRY_RUN" ]]
+  then
+    rsync_opts+=(--dry-run)
+  fi
+
+  if [[ -n "$VERBOSE" ]]
+  then
+    rsync_opts+=(-v)
+  else
+    rsync_opts+=(--info=progress2)
+  fi
+
+  # Execute rsync
+  if rsync "${rsync_opts[@]}" "$remote_path" "$local_full/"
+  then
+    log_success "Completed: ${job_name}"
+    return 0
+  else
+    log_error "Failed: ${job_name}"
+    return 1
+  fi
+}
+
+# Main sync function
+sync_jobs() {
+  local target_jobs=("$@")
+
+  local synced=0
+  local failed=0
+
+  local job_data
+  local job_name
+  local pairs
+  local pair
+  local key
+  local value
+  local should_sync
+  local target
+  for job_data in "${JOBS[@]}"
+  do
+    # Parse job name
+    job_name=""
+    while IFS='|' read -ra pairs
+    do
+      for pair in "${pairs[@]}"
+      do
+        IFS='=' read -r key value <<< "$pair"
+        if [[ "$key" == "name" ]]
+        then
+          job_name="$value"
+          break
+        fi
+      done
+    done <<< "$job_data"
+
+    # Skip if specific jobs requested and this isn't one
+    if [[ ${#target_jobs[@]} -gt 0 ]]
+    then
+      should_sync=
+      for target in "${target_jobs[@]}"
+      do
+        if [[ "$job_name" == "$target" ]]
+        then
+          should_sync=1
+          break
+        fi
+      done
+
+      if [[ -z "$should_sync" ]]
+      then
+        continue
+      fi
+    fi
+
+    # Sync the job
+    if sync_job "$job_data"
+    then
+      ((synced++))
+    else
+      ((failed++))
+    fi
+
+    echo
+  done
+
+  # Summary
+  log "Summary: ${GREEN}${synced} succeeded${NC}, ${RED}${failed} failed${NC}"
+
+  if [[ $failed -gt 0 ]]
+  then
+    return 1
+  fi
+
+  return 0
+}
+
+main() {
+  local target_jobs=()
+
+  # Parse command line arguments
+  while [[ $# -gt 0 ]]
+  do
+    case "$1" in
+      -h|--help)
+        usage
+        return 0
+        ;;
+      --version)
+        echo "jellysync v${VERSION}"
+        return 0
+        ;;
+      -c|--config)
+        CONFIG_FILE="$2"
+        shift 2
+        ;;
+      -n|--dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      -v|--verbose)
+        VERBOSE=1
+        shift
+        ;;
+      -l|--list)
+        if ! check_dependencies
+        then
+          return 1
+        fi
+        if ! load_config
+        then
+          return 1
+        fi
+        list_jobs
+        return 0
+        ;;
+      -*)
+        log_error "Unknown option: $1"
+        return 2
+        ;;
+      *)
+        target_jobs+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  # Main execution
+  if ! check_dependencies
+  then
+    return 1
+  fi
+
+  log "jellysync v${VERSION}"
+  if [[ -n "$DRY_RUN" ]]
+  then
+    log_warning "DRY RUN MODE - No files will be synced"
+  fi
+
+  if ! load_config
+  then
+    return 1
+  fi
+
+  if ! sync_jobs "${target_jobs[@]}"
+  then
+    return 1
+  fi
+
+  return 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]
+then
+  main "$@"
+fi

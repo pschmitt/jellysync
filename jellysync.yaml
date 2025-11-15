@@ -1,0 +1,31 @@
+remote:
+  hostname: tv.brkn.lol
+  username: pschmitt
+  port: 22
+  root: /mnt/data/videos
+  directories:
+    tv_shows: tv_shows
+    movies: movies
+    documentaries: documentaries
+
+local:
+  root: ~/Videos
+  directories:
+    tv_shows: "TV Shows"
+    movies: Movies
+    documentaries: /home/pschmitt/Documentaries
+
+jobs:
+  # Sync all of pluribus
+  - name: pluribus
+    remote_dir: $tv_shows/Pluribus
+    local_dir: $tv_shows/Pluribus
+
+  # Sync all of Star Trek using shorthand syntax
+  - name: Star Trek
+    directory: tv_shows
+
+  # Sync season 1 of The Penguin
+  - name: The Penguin
+    remote_dir: "$tv_shows/$name/Season 1"
+    local_dir: "$tv_shows/The Penguin - Season 1"

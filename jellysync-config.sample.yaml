@@ -1,6 +1,6 @@
 remote:
-  hostname: tv.brkn.lol
-  username: pschmitt
+  hostname: jellyfin.example.com
+  username: jelly
   port: 22
   root: /mnt/data/videos
   directories:
@@ -13,7 +13,7 @@ local:
   directories:
     tv_shows: "TV Shows"
     movies: Movies
-    documentaries: /home/pschmitt/Documentaries
+    documentaries: ~/Documentaries
 
 jobs:
   # Sync all of pluribus

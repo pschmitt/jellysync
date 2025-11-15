@@ -18,11 +18,8 @@ A bash tool to sync files from an SSH server to local directories with flexible 
 3. Run `./jellysync`
 
 ```bash
-# Make executable
-chmod +x jellysync
-
 # Run
-./jellysync
+./jellysync --help
 ```
 
 ## Configuration
@@ -31,31 +28,31 @@ Create a `jellysync.yaml` file with your sync configuration:
 
 ```yaml
 remote:
-  hostname: tv.brkn.lol
-  username: pschmitt
+  hostname: jellyfin.example.com
+  username: jelly
   port: 22
-  root: /mnt/data/videos  # all remote paths are relative to this root dir
+  root: /mnt/data/videos
   directories:
-    tv_shows: tv_shows  # relative path -> /mnt/data/videos/tv_shows
+    tv_shows: tv_shows
     movies: movies
     documentaries: documentaries
 
 local:
-  root: /home/pschmitt/Videos  # all local paths are relative to this dir
+  root: ~/Videos
   directories:
-    tv_shows: "TV Shows"  # relative path -> /home/pschmitt/Videos/TV Shows
+    tv_shows: "TV Shows"
     movies: Movies
-    documentaries: /home/pschmitt/Documentaries  # absolute path
+    documentaries: ~/Documentaries
 
 jobs:
   # Sync all of pluribus
   - name: pluribus
-    remote_dir: $tv_shows/Pluribus  # templated -> /mnt/data/videos/tv_shows/Pluribus
-    local_dir: $tv_shows/Pluribus   # templated -> /home/pschmitt/Videos/TV Shows/Pluribus
+    remote_dir: $tv_shows/Pluribus
+    local_dir: $tv_shows/Pluribus
 
   # Sync all of Star Trek (shorthand syntax)
   - name: Star Trek
-    directory: tv_shows  # shorthand for remote_dir: $tv_shows/$name + local_dir: $tv_shows/$name
+    directory: tv_shows
 
   # Sync season 1 of The Penguin
   - name: The Penguin
@@ -66,42 +63,81 @@ jobs:
 ### Configuration Sections
 
 #### Remote Section
-- `hostname`: SSH server hostname
-- `username`: SSH username
-- `port`: SSH port (default: 22)
-- `root`: Base directory on remote server
-- `directories`: Named directory mappings for templates
+
+| Setting | Required | Default | Description |
+|---------|----------|---------|-------------|
+| `hostname` | Yes | - | SSH server hostname or IP address |
+| `username` | Yes | - | SSH username for authentication |
+| `port` | No | 22 | SSH port number |
+| `root` | Yes | - | Base directory on remote server (all remote paths are relative to this) |
+| `directories` | No | - | Named directory mappings for use in templates |
+
+**Example:**
+```yaml
+remote:
+  hostname: jellyfin.example.com
+  username: jelly
+  port: 22
+  root: /mnt/data/videos
+  directories:
+    tv_shows: tv_shows        # -> /mnt/data/videos/tv_shows
+    movies: movies            # -> /mnt/data/videos/movies
+```
 
 #### Local Section
-- `root`: Base directory on local machine
-- `directories`: Named directory mappings for templates
-  - Can be relative (to root) or absolute paths
+
+| Setting | Required | Default | Description |
+|---------|----------|---------|-------------|
+| `root` | Yes | - | Base directory on local machine (supports `~` and `$HOME` expansion) |
+| `directories` | No | - | Named directory mappings for use in templates |
+
+**Notes:**
+- Supports tilde (`~`) and `$HOME` environment variable expansion
+- Directory paths can be relative (to `root`) or absolute
+- Absolute paths in `directories` override the `root` setting
+
+**Example:**
+```yaml
+local:
+  root: ~/Videos
+  directories:
+    tv_shows: "TV Shows"           # Relative -> ~/Videos/TV Shows
+    movies: Movies                 # Relative -> ~/Videos/Movies
+    documentaries: ~/Documentaries # Absolute -> ~/Documentaries
+```
 
 #### Jobs Section
 
 Each job defines a sync operation. Three syntax options:
 
-1. **Explicit paths**: Define both `remote_dir` and `local_dir`
-   ```yaml
-   - name: My Show
-     remote_dir: $tv_shows/My Show
-     local_dir: $tv_shows/My Show
-   ```
+| Option | Description | Use Case |
+|--------|-------------|----------|
+| **Explicit paths** | Define both `remote_dir` and `local_dir` | When remote and local paths differ |
+| **Shorthand** | Use `directory` key only | When both sides have the same relative path |
+| **Templates** | Use `$name` and `$directory` variables | For dynamic path construction |
 
-2. **Shorthand syntax**: Use `directory` for same relative path on both sides
-   ```yaml
-   - name: My Show
-     directory: tv_shows  # Expands to $tv_shows/$name on both sides
-   ```
+**1. Explicit paths:**
+```yaml
+- name: My Show
+  remote_dir: $tv_shows/My Show
+  local_dir: $tv_shows/My Show
+```
 
-3. **Template variables**:
-   - `$name`: Replaced with job name
-   - `$tv_shows`, `$movies`, etc.: Replaced with directory mappings
-   ```yaml
-   - name: The Penguin
-     remote_dir: "$tv_shows/$name/Season 1"
-     local_dir: "$tv_shows/$name - Season 1"
-   ```
+**2. Shorthand syntax:**
+```yaml
+- name: My Show
+  directory: tv_shows  # Expands to $tv_shows/$name on both remote and local
+```
+
+**3. Template variables:**
+- `$name`: Replaced with job name
+- `$tv_shows`, `$movies`, etc.: Replaced with directory mappings
+
+```yaml
+- name: The Penguin
+  remote_dir: "$tv_shows/$name/Season 1"
+  local_dir: "$tv_shows/$name - Season 1"
+```
 
 ## Usage
 

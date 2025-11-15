@@ -14,7 +14,7 @@ A bash tool to sync files from an SSH server to local directories with flexible 
 ## Installation
 
 1. Clone this repository
-2. Copy `jellysync.yaml.example` to `jellysync.yaml` and configure it
+2. Copy `jellysync-config.sample.yaml` to `jellysync.yaml` and configure it
 3. Run `./jellysync`
 
 ```bash

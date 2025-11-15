@@ -64,7 +64,9 @@ local:
     movies: Movies
     documentaries: ~/Documentaries
 
-# Optional: Custom rsync flags
+library:
+  season_pattern: "Season $season_number"
+
 rsync:
   flags:
     - -a
@@ -86,6 +88,26 @@ jobs:
   - name: The Penguin
     remote_dir: "$tv_shows/$name/Season 1"
     local_dir: "$tv_shows/The Penguin - Season 1"
+
+  # Sync seasons 1-10 of Andor (range)
+  - name: Andor
+    directory: tv_shows
+    seasons: "1-10"
+
+  # Sync specific seasons of Breaking Bad (list)
+  - name: "Breaking Bad"
+    directory: tv_shows
+    seasons: [1, 2, 5]
+
+  # Sync only latest season of The Paper
+  - name: "The Paper"
+    directory: tv_shows
+    seasons: "latest"
+
+  # Sync using wildcards (resolves to first match)
+  - name: "The Paper (2025)"
+    remote_dir: "$tv_shows/The Paper*"
+    local_dir: "$tv_shows/The Paper (2025)"
 ```
 
 ### Configuration Sections
@@ -134,6 +156,37 @@ local:
     documentaries: ~/Documentaries # Absolute -> ~/Documentaries
 ```
 
+#### Library Section
+
+| Setting | Required | Default | Description |
+|---------|----------|---------|-------------|
+| `season_pattern` | No | `"Season $season_number"` | Pattern for season directory names |
+
+**Available Variables:**
+- `$name` - Show name (from job name)
+- `$season_number` - Season number (1, 2, 3, etc.)
+
+**Pattern Examples:**
+```yaml
+library:
+  # Default pattern
+  season_pattern: "Season $season_number"
+  # Results: "Season 1", "Season 2", "Season 3"
+
+  # Include show name
+  season_pattern: "$name - Season $season_number"
+  # Results: "Breaking Bad - Season 1", "Breaking Bad - Season 2"
+
+  # Short format
+  season_pattern: "S$season_number"
+  # Results: "S1", "S2", "S3"
+```
+
+**Notes:**
+- Used when `seasons` filtering is specified in jobs
+- Pattern is used to find and match season directories on remote server
+- Must match the actual directory structure on your media server
+
 #### Rsync Section
 
 | Setting | Required | Default | Description |
@@ -159,7 +212,35 @@ rsync:
 
 #### Jobs Section
 
-Each job defines a sync operation. Three syntax options:
+Each job defines a sync operation.
+
+**Job Options:**
+
+| Option | Required | Type | Description |
+|--------|----------|------|-------------|
+| `name` | Yes | string | Name of the job (used in templates as `$name`) |
+| `remote_dir` | No | string | Remote directory path (supports templates and wildcards) |
+| `local_dir` | No | string | Local directory path (supports templates) |
+| `directory` | No | string | Shorthand: expands to `$directory/$name` for both remote and local |
+| `seasons` | No | string or array | Season filter: `"latest"`, `"1-10"`, or `[1, 2, 3]` |
+| `wildcard` | No | boolean | If `true`, adds `*name*` pattern to remote path |
+
+**Season Filtering:**
+
+The `seasons` option allows selective syncing of TV show seasons:
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| String (latest) | `"latest"` | Syncs only the most recent season |
+| String (range) | `"1-10"` | Syncs seasons 1 through 10 (inclusive) |
+| Array (list) | `[1, 2, 5]` | Syncs only seasons 1, 2, and 5 |
+
+**Notes:**
+- Season directories are matched using the `library.season_pattern` setting
+- Default pattern is `"Season $season_number"` (e.g., "Season 1", "Season 2")
+- Pattern must match actual directory names on remote server
+
+**Syntax options:**
 
 | Option | Description | Use Case |
 |--------|-------------|----------|
@@ -188,6 +269,21 @@ Each job defines a sync operation. Three syntax options:
 - name: The Penguin
   remote_dir: "$tv_shows/$name/Season 1"
   local_dir: "$tv_shows/$name - Season 1"
+```
+
+**4. Wildcard support:**
+Remote paths support wildcards (`*` and `?`) for pattern matching. The first matching directory will be used.
+
+```yaml
+# Explicit wildcard pattern
+- name: The Paper (2025)
+  remote_dir: "$tv_shows/The Paper*"  # Resolves to first match, e.g., "The Paper (2025)"
+  local_dir: "$tv_shows/The Paper (2025)"
+
+# Wildcard flag (automatically adds *name* pattern)
+- name: The Paper
+  directory: tv_shows
+  wildcard: true  # Will match *The Paper* on remote
 ```
 
 ## Usage
@@ -311,4 +407,6 @@ The tool uses these rsync options:
 
 ## License
 
-MIT
+This project is licensed under the GNU General Public License v3.0 (GPLv3).
+
+See [LICENSE](LICENSE) for details.

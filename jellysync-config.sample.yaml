@@ -15,6 +15,16 @@ local:
     movies: Movies
     documentaries: ~/Documentaries
 
+# Optional: Library settings
+library:
+  # Season directory pattern
+  # Available variables: $name (show name), $season_number
+  # Default: "Season $season_number"
+  season_pattern: "Season $season_number"
+  # Examples:
+  # season_pattern: "$name - Season $season_number"  # "Breaking Bad - Season 1"
+  # season_pattern: "S$season_number"                # "S1"
+
 # Optional: Custom rsync flags
 # If not specified, defaults to: -a -v -z --delete
 rsync:
@@ -40,3 +50,29 @@ jobs:
   - name: The Penguin
     remote_dir: "$tv_shows/$name/Season 1"
     local_dir: "$tv_shows/The Penguin - Season 1"
+
+  - name: Andor
+    directory: tv_shows
+    seasons: "1-10" # seasons 1 to 10 (string with range)
+
+  - name: "Breaking Bad"
+    directory: tv_shows
+    seasons: [1, 2, 5] # specific seasons (list)
+
+  - name: "The Paper"
+    directory: tv_shows
+    seasons: "latest" # only the latest season
+
+  - name: "South Park"
+    directory: tv_shows
+    seasons: [1, 2, 25] # seasons 1, 2 and 25
+
+  # Sync using wildcards (resolves to first match)
+  - name: "The Paper (2025)"
+    remote_dir: "$tv_shows/The Paper*"
+    local_dir: "$tv_shows/The Paper (2025)"
+
+  # Sync with wildcard flag (adds *name* pattern)
+  - name: The Paper
+    directory: tv_shows
+    wildcard: true # will match *The Paper* pattern

@@ -44,6 +44,7 @@ declare -gA REMOTE=()
 declare -gA LOCAL=()
 declare -gA REMOTE_DIRS=()
 declare -gA LOCAL_DIRS=()
+declare -gA LIBRARY=()
 declare -ga JOBS=()
 declare -ga RSYNC_OPTS=()
 DRY_RUN=
@@ -193,6 +194,10 @@ load_config() {
     done <<< "$local_dir_keys"
   fi
 
+  # Parse library settings
+  # shellcheck disable=SC2016
+  LIBRARY[season_pattern]=$(yq '.library.season_pattern // "Season $season_number"' "$CONFIG_FILE" 2>/dev/null)
+
   # Parse jobs
   local job_count
   local i
@@ -200,6 +205,7 @@ load_config() {
   local remote_dir
   local local_dir
   local directory
+  local wildcard
   local job_data
   if ! job_count=$(yq '.jobs | length' "$CONFIG_FILE" 2>/dev/null)
   then
@@ -218,6 +224,8 @@ load_config() {
     remote_dir=$(yq ".jobs[$i].remote_dir // \"\"" "$CONFIG_FILE" 2>/dev/null)
     local_dir=$(yq ".jobs[$i].local_dir // \"\"" "$CONFIG_FILE" 2>/dev/null)
     directory=$(yq ".jobs[$i].directory // \"\"" "$CONFIG_FILE" 2>/dev/null)
+    seasons=$(yq ".jobs[$i].seasons // \"\"" "$CONFIG_FILE" 2>/dev/null)
+    wildcard=$(yq ".jobs[$i].wildcard // false" "$CONFIG_FILE" 2>/dev/null)
 
     job_data="name=${job_name}"
     if [[ -n "$remote_dir" && "$remote_dir" != "null" ]]
@@ -233,6 +241,16 @@ load_config() {
     if [[ -n "$directory" && "$directory" != "null" ]]
     then
       job_data+="|directory=${directory}"
+    fi
+
+    if [[ -n "$seasons" && "$seasons" != "null" ]]
+    then
+      job_data+="|seasons=${seasons}"
+    fi
+
+    if [[ "$wildcard" == "true" ]]
+    then
+      job_data+="|wildcard=1"
     fi
 
     JOBS+=("$job_data")
@@ -368,6 +386,275 @@ get_full_path() {
   fi
 }
 
+# Resolve wildcard path on remote server
+# Returns the first matching directory
+resolve_remote_wildcard() {
+  local remote_path="$1"
+  local remote_host="${REMOTE[username]}@${REMOTE[hostname]}"
+  local remote_port="${REMOTE[port]:-22}"
+
+  # Check if path contains wildcard characters
+  if [[ ! "$remote_path" =~ [\*\?] ]]
+  then
+    # No wildcard, return as-is
+    echo "$remote_path"
+    return 0
+  fi
+
+  # Extract directory and pattern
+  local base_dir
+  local pattern
+  base_dir=$(dirname "$remote_path")
+  pattern=$(basename "$remote_path")
+
+  # List directories on remote that match the pattern
+  local matches
+  if ! matches=$(ssh -p "$remote_port" "$remote_host" "find '$base_dir' -maxdepth 1 -type d -name '$pattern' 2>/dev/null | sort")
+  then
+    log_error "Failed to resolve wildcard: $remote_path"
+    return 1
+  fi
+
+  if [[ -z "$matches" ]]
+  then
+    log_error "No matches found for wildcard: $remote_path"
+    return 1
+  fi
+
+  # Return first match
+  local first_match
+  first_match=$(echo "$matches" | head -1)
+
+  if [[ -n "$VERBOSE" ]]
+  then
+    log "  Resolved wildcard '$remote_path' -> '$first_match'"
+  fi
+
+  echo "$first_match"
+  return 0
+}
+
+# Build season pattern for finding directories
+build_season_find_pattern() {
+  local show_name="$1"
+  local pattern="${LIBRARY[season_pattern]}"
+
+  pattern="${pattern//\$name/$show_name}"
+  pattern="${pattern//\$season_number/*}"
+
+  echo "$pattern"
+}
+
+# Extract season number from directory name using pattern
+extract_season_number() {
+  local dir_name="$1"
+  local show_name="$2"
+  local pattern="${LIBRARY[season_pattern]}"
+  local escaped_name="$show_name"
+
+  # Escape special regex characters in show_name
+  escaped_name="${escaped_name//\\/\\\\}"
+  escaped_name="${escaped_name//./\\.}"
+  escaped_name="${escaped_name//[/\\[}"
+  escaped_name="${escaped_name//]/\\]}"
+  escaped_name="${escaped_name//\*/\\*}"
+  escaped_name="${escaped_name//^/\\^}"
+  escaped_name="${escaped_name//$/\\$}"
+  escaped_name="${escaped_name//(/\\(}"
+  escaped_name="${escaped_name//)/\\)}"
+  escaped_name="${escaped_name//+/\\+}"
+  escaped_name="${escaped_name//?/\\?}"
+  escaped_name="${escaped_name//\{/\\\{}"
+  escaped_name="${escaped_name//|/\\|}"
+
+  # Replace $name and $season_number in pattern to create regex
+  pattern="${pattern//\$name/$escaped_name}"
+  pattern="${pattern//\$season_number/([0-9]+)}"
+
+  if [[ "$dir_name" =~ $pattern ]]
+  then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  return 1
+}
+
+# Get season directories from remote server
+get_remote_seasons() {
+  local remote_full="$1"
+  local show_name="$2"
+  local remote_host="${REMOTE[username]}@${REMOTE[hostname]}"
+  local remote_port="${REMOTE[port]:-22}"
+  local find_pattern
+  local seasons
+
+  find_pattern=$(build_season_find_pattern "$show_name")
+
+  if ! seasons=$(ssh -p "$remote_port" "$remote_host" "find '$remote_full' -maxdepth 1 -type d -name '$find_pattern' 2>/dev/null | sort -V" 2>/dev/null)
+  then
+    return 1
+  fi
+
+  echo "$seasons"
+}
+
+# Sync job with season filtering
+sync_job_with_seasons() {
+  local job_name="$1"
+  local remote_full="$2"
+  local local_full="$3"
+  local seasons_spec="$4"
+  local remote_host="${REMOTE[username]}@${REMOTE[hostname]}"
+  local remote_port="${REMOTE[port]:-22}"
+  local available_seasons
+  local season_dirs
+  local season_dir
+  local season_num
+  local include_patterns
+  local rsync_opts
+
+  log "Syncing job: ${GREEN}${job_name}${NC} (with season filter)"
+
+  # Get available seasons from remote
+  if ! available_seasons=$(get_remote_seasons "$remote_full" "$job_name")
+  then
+    log_error "Failed to get seasons from remote: $remote_full"
+    return 1
+  fi
+
+  if [[ -z "$available_seasons" ]]
+  then
+    log_warning "No seasons found in: $remote_full"
+    log_warning "Using pattern: $(build_season_find_pattern "$job_name")"
+    return 1
+  fi
+
+  # Parse seasons specification
+  # Check if it's a YAML array (starts with '[') - use verbatim
+  if [[ "$seasons_spec" =~ ^\[ ]]
+  then
+    local season_list
+    season_list=$(echo "$seasons_spec" | sed 's/[][]//g' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    season_dirs=""
+
+    while IFS= read -r season_num
+    do
+      if [[ -n "$season_num" ]]
+      then
+        while IFS= read -r season_dir
+        do
+          local extracted_num
+          extracted_num=$(extract_season_number "$(basename "$season_dir")" "$job_name")
+          if [[ "$extracted_num" == "$season_num" ]]
+          then
+            season_dirs+="${season_dir}"$'\n'
+            break
+          fi
+        done <<< "$available_seasons"
+      fi
+    done <<< "$season_list"
+  elif [[ "$seasons_spec" == "latest" ]]
+  then
+    season_dirs=$(echo "$available_seasons" | tail -1)
+  elif [[ "$seasons_spec" =~ ^([0-9]+)-([0-9]+)$ ]]
+  then
+    local range_start="${BASH_REMATCH[1]}"
+    local range_end="${BASH_REMATCH[2]}"
+    season_dirs=""
+
+    while IFS= read -r season_dir
+    do
+      if season_num=$(extract_season_number "$(basename "$season_dir")" "$job_name")
+      then
+        if [[ $season_num -ge $range_start && $season_num -le $range_end ]]
+        then
+          season_dirs+="${season_dir}"$'\n'
+        fi
+      fi
+    done <<< "$available_seasons"
+  else
+    log_error "Invalid seasons specification: $seasons_spec"
+    log_error "Valid formats: 'latest', '1-10', or [1, 2, 3]"
+    return 1
+  fi
+
+  if [[ -z "$season_dirs" ]]
+  then
+    log_warning "No seasons matched specification: $seasons_spec"
+    return 1
+  fi
+
+  # Build include patterns for rsync
+  include_patterns=()
+  while IFS= read -r season_dir
+  do
+    if [[ -n "$season_dir" ]]
+    then
+      local season_name
+      season_name=$(basename "$season_dir")
+      include_patterns+=(--include="$season_name/***")
+    fi
+  done <<< "$season_dirs"
+
+  if [[ ${#include_patterns[@]} -eq 0 ]]
+  then
+    log_error "No valid season patterns generated"
+    return 1
+  fi
+
+  # Ensure local directory exists
+  if [[ -z "$DRY_RUN" ]]
+  then
+    if ! mkdir -p "$local_full"
+    then
+      log_error "Failed to create local directory: $local_full"
+      return 1
+    fi
+  fi
+
+  # Build rsync command with filtering
+  rsync_opts=("${RSYNC_OPTS[@]}")
+  rsync_opts+=(-e "ssh -p ${remote_port}")
+  rsync_opts+=("${include_patterns[@]}")
+  rsync_opts+=(--exclude='*')
+
+  if [[ -n "$DRY_RUN" ]]
+  then
+    rsync_opts+=(--dry-run)
+  fi
+
+  if [[ -n "$VERBOSE" ]]
+  then
+    rsync_opts+=(-v)
+  else
+    rsync_opts+=(--info=progress2)
+  fi
+
+  # Log seasons being synced
+  log "  Syncing seasons:"
+  while IFS= read -r season_dir
+  do
+    if [[ -n "$season_dir" ]]
+    then
+      log "    - $(basename "$season_dir")"
+    fi
+  done <<< "$season_dirs"
+
+  # Log rsync command
+  log "  Executing: rsync ${rsync_opts[*]} ${remote_host}:${remote_full}/ ${local_full}/"
+
+  # Execute rsync
+  if rsync "${rsync_opts[@]}" "${remote_host}:${remote_full}/" "$local_full/"
+  then
+    log_success "Completed: ${job_name}"
+    return 0
+  else
+    log_error "Failed: ${job_name}"
+    return 1
+  fi
+}
+
 # List all jobs
 list_jobs() {
   log "Available jobs in ${CONFIG_FILE}:"
@@ -412,6 +699,8 @@ sync_job() {
   local remote_dir=""
   local local_dir=""
   local directory=""
+  local seasons=""
+  local wildcard=""
   local pairs
   local pair
   local key
@@ -435,6 +724,12 @@ sync_job() {
         directory)
           directory="$value"
           ;;
+        seasons)
+          seasons="$value"
+          ;;
+        wildcard)
+          wildcard="$value"
+          ;;
       esac
     done
   done <<< "$job_data"
@@ -451,6 +746,18 @@ sync_job() {
     local_dir="\$$directory/\$name"
   fi
 
+  # Apply wildcard pattern if enabled
+  if [[ -n "$wildcard" ]]
+  then
+    if [[ -z "$remote_dir" ]]
+    then
+      remote_dir="\$$directory/*\$name*"
+    else
+      # Wrap the $name variable with wildcards
+      remote_dir="${remote_dir//\$name/*\$name*}"
+    fi
+  fi
+
   # Expand path templates
   remote_dir=$(expand_path --remote "$remote_dir" "$job_name")
   local_dir=$(expand_path --local "$local_dir" "$job_name")
@@ -459,7 +766,28 @@ sync_job() {
   local remote_full
   local local_full
   remote_full=$(get_full_path "${REMOTE[root]}" "$remote_dir")
+
+  # Resolve wildcards in remote path
+  if [[ "$remote_full" =~ [\*\?] ]]
+  then
+    if ! remote_full=$(resolve_remote_wildcard "$remote_full")
+    then
+      log_error "Failed to resolve remote path: $remote_dir"
+      return 1
+    fi
+  fi
+
   local_full=$(get_full_path "${LOCAL[root]}" "$local_dir")
+
+  # Handle seasons filtering
+  if [[ -n "$seasons" ]]
+  then
+    if ! sync_job_with_seasons "$job_name" "$remote_full" "$local_full" "$seasons"
+    then
+      return 1
+    fi
+    return 0
+  fi
 
   # Build SSH/rsync command
   local remote_host="${REMOTE[username]}@${REMOTE[hostname]}"
@@ -499,6 +827,9 @@ sync_job() {
     rsync_opts+=(--info=progress2)
   fi
 
+  # Log rsync command
+  log "  Executing: rsync ${rsync_opts[*]} ${remote_path} ${local_full}/"
+
   # Execute rsync
   if rsync "${rsync_opts[@]}" "$remote_path" "$local_full/"
   then
@@ -519,12 +850,14 @@ sync_jobs() {
 
   local job_data
   local job_name
+  local job_name_lower
   local pairs
   local pair
   local key
   local value
   local should_sync
   local target
+  local target_lower
   for job_data in "${JOBS[@]}"
   do
     # Parse job name
@@ -546,9 +879,11 @@ sync_jobs() {
     if [[ ${#target_jobs[@]} -gt 0 ]]
     then
       should_sync=
+      job_name_lower="${job_name,,}"
       for target in "${target_jobs[@]}"
       do
-        if [[ "$job_name" == "$target" ]]
+        target_lower="${target,,}"
+        if [[ "$job_name_lower" == "$target_lower" ]]
         then
           should_sync=1
           break

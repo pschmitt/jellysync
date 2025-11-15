@@ -56,6 +56,10 @@ Jellysync includes a Home Manager module for automated synchronization with syst
     services.jellysync = {
       enable = true;
 
+      # The package is automatically provided from the flake
+      # You can override it if needed:
+      # package = inputs.jellysync.packages.${pkgs.system}.default;
+
       settings = {
         remote = {
           hostname = "jellyfin.example.com";
@@ -109,7 +113,7 @@ Jellysync includes a Home Manager module for automated synchronization with syst
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enable` | bool | `false` | Enable the jellysync service |
-| `package` | package | `pkgs.jellysync` | The jellysync package to use |
+| `package` | package | *(auto)* | The jellysync package (automatically provided from flake) |
 | `settings` | attrs | - | Configuration settings (see Configuration section) |
 | `schedule` | string | `"0 3 * * *"` | Systemd timer schedule (OnCalendar format) |
 | `persistent` | bool | `true` | Run missed jobs after system restart |
@@ -136,9 +140,11 @@ schedule = "Mon *-*-* 02:00:00";
 
 **What it does:**
 - Creates `~/.config/jellysync/config.yaml` with your settings
-- Installs jellysync package
+- Installs jellysync package (automatically from the flake)
 - Sets up systemd user service and timer
 - Automatically syncs on schedule
+
+**Note:** The `package` option is optional and automatically defaults to the package provided by the jellysync flake. You only need to set it if you want to use a different version or build.
 
 ### Manual Installation
 

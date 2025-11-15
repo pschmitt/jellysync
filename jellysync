@@ -1247,6 +1247,13 @@ sync_jobs() {
     echo
   done
 
+  # Check if specific jobs were requested but none were synced
+  if [[ ${#target_jobs[@]} -gt 0 && $synced -eq 0 && $failed -eq 0 ]]
+  then
+    log_error "No jobs found matching: ${target_jobs[*]}"
+    return 2
+  fi
+
   # Summary
   log "Summary: ${GREEN}${synced} succeeded${NC}, ${RED}${failed} failed${NC}"
 
@@ -1326,12 +1333,8 @@ main() {
     return 1
   fi
 
-  if ! sync_jobs "${target_jobs[@]}"
-  then
-    return 1
-  fi
-
-  return 0
+  sync_jobs "${target_jobs[@]}"
+  return $?
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]

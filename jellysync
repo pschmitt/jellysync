@@ -17,8 +17,20 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 VERSION="1.0.0"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${JELLYSYNC_CONFIG:-${SCRIPT_DIR}/jellysync.yaml}"
+
+# Determine config file path
+if [[ -n "${JELLYSYNC_CONFIG:-}" ]]
+then
+  CONFIG_FILE="$JELLYSYNC_CONFIG"
+elif [[ -f "./jellysync.yaml" ]]
+then
+  CONFIG_FILE="./jellysync.yaml"
+elif [[ -f "$HOME/.config/jellysync/config.yaml" ]]
+then
+  CONFIG_FILE="$HOME/.config/jellysync/config.yaml"
+else
+  CONFIG_FILE="./jellysync.yaml"
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -33,6 +45,7 @@ declare -gA LOCAL=()
 declare -gA REMOTE_DIRS=()
 declare -gA LOCAL_DIRS=()
 declare -ga JOBS=()
+declare -ga RSYNC_OPTS=()
 DRY_RUN=
 VERBOSE=
 
@@ -249,6 +262,26 @@ load_config() {
     log_error "Missing local.root in config"
     return 1
   fi
+
+  # Parse rsync options (optional)
+  local rsync_flags
+  rsync_flags=$(yq '.rsync.flags[]? // ""' "$CONFIG_FILE" 2>/dev/null)
+  if [[ -n "$rsync_flags" ]]
+  then
+    while IFS= read -r flag
+    do
+      if [[ -n "$flag" ]]
+      then
+        RSYNC_OPTS+=("$flag")
+      fi
+    done <<< "$rsync_flags"
+  fi
+
+  # Use default rsync options if none specified
+  if [[ ${#RSYNC_OPTS[@]} -eq 0 ]]
+  then
+    RSYNC_OPTS=(-a -v -z --delete)
+  fi
 }
 
 # Expand path template with variables
@@ -451,11 +484,8 @@ sync_job() {
   fi
 
   # Build rsync command
-  local rsync_opts=(
-    -avz
-    --delete
-    -e "ssh -p ${remote_port}"
-  )
+  local rsync_opts=("${RSYNC_OPTS[@]}")
+  rsync_opts+=(-e "ssh -p ${remote_port}")
 
   if [[ -n "$DRY_RUN" ]]
   then
@@ -610,6 +640,7 @@ main() {
   fi
 
   log "jellysync v${VERSION}"
+  log "Config: ${CONFIG_FILE}"
   if [[ -n "$DRY_RUN" ]]
   then
     log_warning "DRY RUN MODE - No files will be synced"

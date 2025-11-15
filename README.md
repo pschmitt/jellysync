@@ -44,6 +44,14 @@ local:
     movies: Movies
     documentaries: ~/Documentaries
 
+# Optional: Custom rsync flags
+rsync:
+  flags:
+    - -a
+    - -v
+    - -z
+    - --delete
+
 jobs:
   # Sync all of pluribus
   - name: pluribus
@@ -104,6 +112,29 @@ local:
     tv_shows: "TV Shows"           # Relative -> ~/Videos/TV Shows
     movies: Movies                 # Relative -> ~/Videos/Movies
     documentaries: ~/Documentaries # Absolute -> ~/Documentaries
+```
+
+#### Rsync Section
+
+| Setting | Required | Default | Description |
+|---------|----------|---------|-------------|
+| `flags` | No | `-a -v -z --delete` | Array of rsync command-line flags |
+
+**Notes:**
+- If not specified, uses default flags: `-a -v -z --delete`
+- Common flags: `--progress`, `--bwlimit=RATE`, `--exclude=PATTERN`
+- SSH connection flags (`-e "ssh -p PORT"`) are added automatically
+
+**Example:**
+```yaml
+rsync:
+  flags:
+    - -a              # Archive mode
+    - -v              # Verbose
+    - -z              # Compress
+    - --delete        # Delete extraneous files
+    - --progress      # Show progress
+    - --bwlimit=5000  # Limit bandwidth to 5000 KB/s
 ```
 
 #### Jobs Section
@@ -176,9 +207,32 @@ Each job defines a sync operation. Three syntax options:
 - `-h, --help`: Show help message
 - `--version`: Show version
 
+## Configuration File Locations
+
+jellysync searches for configuration files in the following order:
+
+1. **`JELLYSYNC_CONFIG` environment variable** (if set)
+2. **`./jellysync.yaml`** (current directory)
+3. **`~/.config/jellysync/config.yaml`** (user config directory)
+4. Falls back to `./jellysync.yaml` (will error if not found)
+
+The active configuration file path is displayed when jellysync runs.
+
+**Examples:**
+```bash
+# Use default search order
+./jellysync --list
+
+# Use specific config file
+./jellysync --config /path/to/config.yaml
+
+# Use environment variable
+JELLYSYNC_CONFIG=~/my-config.yaml ./jellysync
+```
+
 ## Environment Variables
 
-- `JELLYSYNC_CONFIG`: Default config file path (overrides `./jellysync.yaml`)
+- `JELLYSYNC_CONFIG`: Override config file path (highest priority)
 
 ## How It Works
 

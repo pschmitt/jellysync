@@ -538,6 +538,34 @@ check_dependencies() {
 - Validate all required fields explicitly
 - Provide helpful error messages
 
+## Documentation
+
+### README.md Maintenance
+
+**CRITICAL:** Keep README.md synchronized with code changes, especially:
+
+- **Configuration sections:** Any new config options must be documented
+- **Configuration tables:** Update tables when adding/modifying config keys
+- **Search paths:** Keep config file search order documented
+- **Examples:** Update YAML examples to match current format
+- **Default values:** Document defaults for all optional settings
+
+**When adding a new config section:**
+1. Add it to the YAML example at the top of Configuration section
+2. Create a table with: Setting | Required | Default | Description
+3. Add usage notes and examples
+4. Update `jellysync-config.sample.yaml`
+5. Test that the example works
+
+**Example workflow:**
+```bash
+# 1. Add feature to code
+# 2. Update README.md configuration section
+# 3. Update sample config file
+# 4. Verify examples work
+./jellysync --config jellysync-config.sample.yaml --list
+```
+
 ## Testing
 
 Before committing:
@@ -567,6 +595,7 @@ All source files must include the GPL header:
 
 ## Code Review Checklist
 
+### Code Quality
 - [ ] No `set -e` or `|| true` patterns
 - [ ] All `then`/`do`/`else` on new lines (no semicolons)
 - [ ] Case statements use multi-line format
@@ -586,3 +615,11 @@ All source files must include the GPL header:
 - [ ] Functions have proper error handling
 - [ ] User-facing errors have helpful messages
 - [ ] GPL license header present in all source files
+
+### Documentation
+- [ ] **README.md updated** if config format changed
+- [ ] Configuration tables reflect current code
+- [ ] All new config options documented with examples
+- [ ] Default values documented for optional settings
+- [ ] `jellysync-config.sample.yaml` matches README examples
+- [ ] Config file search order documented correctly

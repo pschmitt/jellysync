@@ -15,6 +15,17 @@ local:
     movies: Movies
     documentaries: ~/Documentaries
 
+# Optional: Custom rsync flags
+# If not specified, defaults to: -a -v -z --delete
+rsync:
+  flags:
+    - -a
+    - -v
+    - -z
+    - --delete
+    # - --progress
+    # - --bwlimit=10000
+
 jobs:
   # Sync all of pluribus
   - name: pluribus

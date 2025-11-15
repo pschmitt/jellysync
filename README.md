@@ -161,12 +161,15 @@ local:
 | Setting | Required | Default | Description |
 |---------|----------|---------|-------------|
 | `season_pattern` | No | `"Season $season_number"` | Pattern for season directory names |
+| `episode_pattern` | No | `"E$episode_number"` | Pattern for episode file names |
 
-**Available Variables:**
+**Season Pattern:**
+
+Available Variables:
 - `$name` - Show name (from job name)
 - `$season_number` - Season number (1, 2, 3, etc.)
 
-**Pattern Examples:**
+Pattern Examples:
 ```yaml
 library:
   # Default pattern
@@ -182,10 +185,32 @@ library:
   # Results: "S1", "S2", "S3"
 ```
 
+**Episode Pattern:**
+
+Available Variables:
+- `$episode_number` - Episode number (1, 2, 3, etc.)
+
+Pattern Examples:
+```yaml
+library:
+  # Default pattern
+  episode_pattern: "E$episode_number"
+  # Matches: "E01", "E02", "E10"
+
+  # Full word pattern
+  episode_pattern: "Episode $episode_number"
+  # Matches: "Episode 01", "Episode 02"
+
+  # Common S##E## pattern
+  episode_pattern: "S[0-9]+E$episode_number"
+  # Matches: "S01E01", "S02E05"
+```
+
 **Notes:**
-- Used when `seasons` filtering is specified in jobs
-- Pattern is used to find and match season directories on remote server
-- Must match the actual directory structure on your media server
+- `season_pattern` is used when `seasons` filtering is specified in jobs
+- `episode_pattern` is used when `episodes` filtering is specified in jobs
+- Patterns are used to find and match directories/files on remote server
+- Must match the actual naming structure on your media server
 
 #### Rsync Section
 
@@ -223,6 +248,7 @@ Each job defines a sync operation.
 | `local_dir` | No | string | Local directory path (supports templates) |
 | `directory` | No | string | Shorthand: expands to `$directory/$name` for both remote and local |
 | `seasons` | No | string or array | Season filter: `"latest"`, `"1-10"`, or `[1, 2, 3]` |
+| `episodes` | No | string or array | Episode filter: `"latest"`, `"1-10"`, or `[1, 2, 3]` |
 | `wildcard` | No | boolean | If `true`, adds `*name*` pattern to remote path |
 
 **Season Filtering:**
@@ -232,6 +258,7 @@ The `seasons` option allows selective syncing of TV show seasons:
 | Format | Example | Description |
 |--------|---------|-------------|
 | String (latest) | `"latest"` | Syncs only the most recent season |
+| String (latest-N) | `"latest-3"` | Syncs the latest 3 seasons |
 | String (range) | `"1-10"` | Syncs seasons 1 through 10 (inclusive) |
 | Array (list) | `[1, 2, 5]` | Syncs only seasons 1, 2, and 5 |
 
@@ -239,6 +266,24 @@ The `seasons` option allows selective syncing of TV show seasons:
 - Season directories are matched using the `library.season_pattern` setting
 - Default pattern is `"Season $season_number"` (e.g., "Season 1", "Season 2")
 - Pattern must match actual directory names on remote server
+
+**Episode Filtering:**
+
+The `episodes` option allows selective syncing of episodes within seasons:
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| String (latest) | `"latest"` | Syncs only the most recent episode |
+| String (latest-N) | `"latest-5"` | Syncs the latest 5 episodes |
+| String (range) | `"1-10"` | Syncs episodes 1 through 10 (inclusive) |
+| Array (list) | `[1, 2, 5]` | Syncs only episodes 1, 2, and 5 |
+
+**Notes:**
+- Episode files are matched using the `library.episode_pattern` setting
+- Default pattern is `"E$episode_number"` (e.g., "E01", "E02")
+- Can be combined with `seasons` to filter both seasons and episodes
+- Can be used without `seasons` for single-directory content
+- Pattern must match actual file names on remote server
 
 **Syntax options:**
 
@@ -284,6 +329,42 @@ Remote paths support wildcards (`*` and `?`) for pattern matching. The first mat
 - name: The Paper
   directory: tv_shows
   wildcard: true  # Will match *The Paper* on remote
+```
+
+**5. Season and Episode Filtering:**
+
+Combine season and episode filters for precise control:
+
+```yaml
+# Sync episodes 1-5 of season 1
+- name: The Office
+  directory: tv_shows
+  seasons: "1"
+  episodes: "1-5"
+
+# Sync latest episode from seasons 1 and 2
+- name: Friends
+  directory: tv_shows
+  seasons: [1, 2]
+  episodes: "latest"
+
+# Sync latest 3 episodes from latest 2 seasons
+- name: Modern Family
+  directory: tv_shows
+  seasons: "latest-2"
+  episodes: "latest-3"
+
+# Sync specific episodes from latest season
+- name: Seinfeld
+  directory: tv_shows
+  seasons: "latest"
+  episodes: [1, 2, 10]
+
+# Episodes without seasons (single directory)
+- name: Stand-up Special
+  remote_dir: "$movies/Stand-up Special"
+  local_dir: "$movies/Stand-up Special"
+  episodes: "1-3"
 ```
 
 ## Usage

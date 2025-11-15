@@ -25,6 +25,15 @@ library:
   # season_pattern: "$name - Season $season_number"  # "Breaking Bad - Season 1"
   # season_pattern: "S$season_number"                # "S1"
 
+  # Episode file pattern
+  # Available variables: $episode_number
+  # Default: "E$episode_number"
+  episode_pattern: "E$episode_number"
+  # Examples:
+  # episode_pattern: "E$episode_number"              # "E01", "E02"
+  # episode_pattern: "Episode $episode_number"       # "Episode 01"
+  # episode_pattern: "S[0-9]+E$episode_number"       # Matches "S01E01" pattern
+
 # Optional: Custom rsync flags
 # If not specified, defaults to: -a -v -z --delete
 rsync:
@@ -66,6 +75,37 @@ jobs:
   - name: "South Park"
     directory: tv_shows
     seasons: [1, 2, 25] # seasons 1, 2 and 25
+
+  - name: "Modern Family"
+    directory: tv_shows
+    seasons: "latest-3" # latest 3 seasons
+
+  # Episode filtering examples
+  - name: "The Office"
+    directory: tv_shows
+    seasons: "1"
+    episodes: "1-5" # episodes 1 to 5 of season 1
+
+  - name: "Friends"
+    directory: tv_shows
+    seasons: [1, 2]
+    episodes: "latest" # only the latest episode from seasons 1 and 2
+
+  - name: "Brooklyn Nine-Nine"
+    directory: tv_shows
+    seasons: "latest-2"
+    episodes: "latest-5" # latest 5 episodes from the latest 2 seasons
+
+  - name: "Seinfeld"
+    directory: tv_shows
+    seasons: "latest"
+    episodes: [1, 2, 10] # specific episodes from the latest season
+
+  # Episodes without seasons (for movies or single-directory shows)
+  - name: "Stand-up Special"
+    remote_dir: "$movies/Stand-up Special"
+    local_dir: "$movies/Stand-up Special"
+    episodes: "1-3" # first 3 episodes/parts
 
   # Sync using wildcards (resolves to first match)
   - name: "The Paper (2025)"

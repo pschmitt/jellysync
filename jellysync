@@ -197,6 +197,8 @@ load_config() {
   # Parse library settings
   # shellcheck disable=SC2016
   LIBRARY[season_pattern]=$(yq '.library.season_pattern // "Season $season_number"' "$CONFIG_FILE" 2>/dev/null)
+  # shellcheck disable=SC2016
+  LIBRARY[episode_pattern]=$(yq '.library.episode_pattern // "E$episode_number"' "$CONFIG_FILE" 2>/dev/null)
 
   # Parse jobs
   local job_count
@@ -206,6 +208,7 @@ load_config() {
   local local_dir
   local directory
   local wildcard
+  local episodes
   local job_data
   if ! job_count=$(yq '.jobs | length' "$CONFIG_FILE" 2>/dev/null)
   then
@@ -225,6 +228,7 @@ load_config() {
     local_dir=$(yq ".jobs[$i].local_dir // \"\"" "$CONFIG_FILE" 2>/dev/null)
     directory=$(yq ".jobs[$i].directory // \"\"" "$CONFIG_FILE" 2>/dev/null)
     seasons=$(yq ".jobs[$i].seasons // \"\"" "$CONFIG_FILE" 2>/dev/null)
+    episodes=$(yq ".jobs[$i].episodes // \"\"" "$CONFIG_FILE" 2>/dev/null)
     wildcard=$(yq ".jobs[$i].wildcard // false" "$CONFIG_FILE" 2>/dev/null)
 
     job_data="name=${job_name}"
@@ -246,6 +250,11 @@ load_config() {
     if [[ -n "$seasons" && "$seasons" != "null" ]]
     then
       job_data+="|seasons=${seasons}"
+    fi
+
+    if [[ -n "$episodes" && "$episodes" != "null" ]]
+    then
+      job_data+="|episodes=${episodes}"
     fi
 
     if [[ "$wildcard" == "true" ]]
@@ -499,12 +508,284 @@ get_remote_seasons() {
   echo "$seasons"
 }
 
+# Build episode pattern for finding files
+build_episode_find_pattern() {
+  local pattern="${LIBRARY[episode_pattern]}"
+
+  pattern="${pattern//\$episode_number/*}"
+
+  echo "$pattern"
+}
+
+# Extract episode number from file/directory name using pattern
+extract_episode_number() {
+  local file_name="$1"
+  local pattern="${LIBRARY[episode_pattern]}"
+
+  # Replace $episode_number in pattern to create regex
+  pattern="${pattern//\$episode_number/([0-9]+)}"
+
+  if [[ "$file_name" =~ $pattern ]]
+  then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  return 1
+}
+
+# Get episode files from remote server
+get_remote_episodes() {
+  local remote_season="$1"
+  local remote_host="${REMOTE[username]}@${REMOTE[hostname]}"
+  local remote_port="${REMOTE[port]:-22}"
+  local find_pattern
+  local episodes
+
+  find_pattern=$(build_episode_find_pattern)
+
+  if ! episodes=$(ssh -p "$remote_port" "$remote_host" "find '$remote_season' -maxdepth 1 -type f -name '*$find_pattern*' 2>/dev/null | sort -V" 2>/dev/null)
+  then
+    return 1
+  fi
+
+  echo "$episodes"
+}
+
+# Sync job with episode filtering within a season
+sync_job_with_episodes() {
+  local job_name="$1"
+  local remote_season="$2"
+  local local_season="$3"
+  local episodes_spec="$4"
+  local remote_host="${REMOTE[username]}@${REMOTE[hostname]}"
+  local remote_port="${REMOTE[port]:-22}"
+  local available_episodes
+  local episode_files
+  local episode_file
+  local episode_num
+  local include_patterns
+  local rsync_opts
+
+  # Get available episodes from remote
+  if ! available_episodes=$(get_remote_episodes "$remote_season")
+  then
+    log_error "Failed to get episodes from remote: $remote_season"
+    return 1
+  fi
+
+  if [[ -z "$available_episodes" ]]
+  then
+    log_warning "No episodes found in: $remote_season"
+    log_warning "Using pattern: $(build_episode_find_pattern)"
+    return 1
+  fi
+
+  # Parse episodes specification
+  if [[ "$episodes_spec" =~ ^\[ ]]
+  then
+    local episode_list
+    episode_list=$(echo "$episodes_spec" | sed 's/[][]//g' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    episode_files=""
+
+    while IFS= read -r episode_num
+    do
+      if [[ -n "$episode_num" ]]
+      then
+        while IFS= read -r episode_file
+        do
+          local extracted_num
+          if extracted_num=$(extract_episode_number "$(basename "$episode_file")")
+          then
+            if [[ "$extracted_num" == "$episode_num" ]]
+            then
+              episode_files+="${episode_file}"$'\n'
+            fi
+          fi
+        done <<< "$available_episodes"
+      fi
+    done <<< "$episode_list"
+  elif [[ "$episodes_spec" == "latest" ]]
+  then
+    local latest_episode_num
+    local extracted_num
+    while IFS= read -r episode_file
+    do
+      if [[ -n "$episode_file" ]]
+      then
+        if extracted_num=$(extract_episode_number "$(basename "$episode_file")")
+        then
+          if [[ -z "$latest_episode_num" ]] || [[ $extracted_num -gt $latest_episode_num ]]
+          then
+            latest_episode_num=$extracted_num
+          fi
+        fi
+      fi
+    done <<< "$available_episodes"
+
+    if [[ -n "$latest_episode_num" ]]
+    then
+      episode_files=""
+      while IFS= read -r episode_file
+      do
+        if [[ -n "$episode_file" ]]
+        then
+          if extracted_num=$(extract_episode_number "$(basename "$episode_file")")
+          then
+            if [[ $extracted_num -eq $latest_episode_num ]]
+            then
+              episode_files+="${episode_file}"$'\n'
+            fi
+          fi
+        fi
+      done <<< "$available_episodes"
+    fi
+  elif [[ "$episodes_spec" =~ ^latest-([0-9]+)$ ]]
+  then
+    local count="${BASH_REMATCH[1]}"
+    local episode_nums
+    local extracted_num
+    episode_nums=""
+
+    while IFS= read -r episode_file
+    do
+      if [[ -n "$episode_file" ]]
+      then
+        if extracted_num=$(extract_episode_number "$(basename "$episode_file")")
+        then
+          if ! echo "$episode_nums" | grep -q "^${extracted_num}$"
+          then
+            episode_nums+="${extracted_num}"$'\n'
+          fi
+        fi
+      fi
+    done <<< "$available_episodes"
+
+    episode_nums=$(echo "$episode_nums" | sort -rn | head -n "$count")
+
+    episode_files=""
+    while IFS= read -r target_num
+    do
+      if [[ -n "$target_num" ]]
+      then
+        while IFS= read -r episode_file
+        do
+          if [[ -n "$episode_file" ]]
+          then
+            if extracted_num=$(extract_episode_number "$(basename "$episode_file")")
+            then
+              if [[ $extracted_num -eq $target_num ]]
+              then
+                episode_files+="${episode_file}"$'\n'
+              fi
+            fi
+          fi
+        done <<< "$available_episodes"
+      fi
+    done <<< "$episode_nums"
+  elif [[ "$episodes_spec" =~ ^([0-9]+)-([0-9]+)$ ]]
+  then
+    local range_start="${BASH_REMATCH[1]}"
+    local range_end="${BASH_REMATCH[2]}"
+    episode_files=""
+
+    while IFS= read -r episode_file
+    do
+      if episode_num=$(extract_episode_number "$(basename "$episode_file")")
+      then
+        if [[ $episode_num -ge $range_start && $episode_num -le $range_end ]]
+        then
+          episode_files+="${episode_file}"$'\n'
+        fi
+      fi
+    done <<< "$available_episodes"
+  else
+    log_error "Invalid episodes specification: $episodes_spec"
+    log_error "Valid formats: 'latest', 'latest-N', '1-10', or [1, 2, 3]"
+    return 1
+  fi
+
+  if [[ -z "$episode_files" ]]
+  then
+    log_warning "No episodes matched specification: $episodes_spec"
+    return 1
+  fi
+
+  # Build include patterns for rsync
+  include_patterns=()
+  while IFS= read -r episode_file
+  do
+    if [[ -n "$episode_file" ]]
+    then
+      local episode_name
+      episode_name=$(basename "$episode_file")
+      include_patterns+=(--include="$episode_name")
+    fi
+  done <<< "$episode_files"
+
+  if [[ ${#include_patterns[@]} -eq 0 ]]
+  then
+    log_error "No valid episode patterns generated"
+    return 1
+  fi
+
+  # Ensure local directory exists
+  if [[ -z "$DRY_RUN" ]]
+  then
+    if ! mkdir -p "$local_season"
+    then
+      log_error "Failed to create local directory: $local_season"
+      return 1
+    fi
+  fi
+
+  # Build rsync command with filtering
+  rsync_opts=("${RSYNC_OPTS[@]}")
+  rsync_opts+=(-e "ssh -p ${remote_port}")
+  rsync_opts+=("${include_patterns[@]}")
+  rsync_opts+=(--exclude='*')
+
+  if [[ -n "$DRY_RUN" ]]
+  then
+    rsync_opts+=(--dry-run)
+  fi
+
+  if [[ -n "$VERBOSE" ]]
+  then
+    rsync_opts+=(-v)
+  else
+    rsync_opts+=(--info=progress2)
+  fi
+
+  # Log episodes being synced
+  log "  Syncing episodes:"
+  while IFS= read -r episode_file
+  do
+    if [[ -n "$episode_file" ]]
+    then
+      log "    - $(basename "$episode_file")"
+    fi
+  done <<< "$episode_files"
+
+  # Log rsync command
+  log "  Executing: rsync ${rsync_opts[*]} ${remote_host}:${remote_season}/ ${local_season}/"
+
+  # Execute rsync
+  if rsync "${rsync_opts[@]}" "${remote_host}:${remote_season}/" "$local_season/"
+  then
+    return 0
+  else
+    return 1
+  fi
+}
+
 # Sync job with season filtering
 sync_job_with_seasons() {
   local job_name="$1"
   local remote_full="$2"
   local local_full="$3"
   local seasons_spec="$4"
+  local episodes_spec="${5:-}"
   local remote_host="${REMOTE[username]}@${REMOTE[hostname]}"
   local remote_port="${REMOTE[port]:-22}"
   local available_seasons
@@ -513,8 +794,14 @@ sync_job_with_seasons() {
   local season_num
   local include_patterns
   local rsync_opts
+  local filter_desc="with season filter"
 
-  log "Syncing job: ${GREEN}${job_name}${NC} (with season filter)"
+  if [[ -n "$episodes_spec" ]]
+  then
+    filter_desc="with season and episode filter"
+  fi
+
+  log "Syncing job: ${GREEN}${job_name}${NC} ($filter_desc)"
 
   # Get available seasons from remote
   if ! available_seasons=$(get_remote_seasons "$remote_full" "$job_name")
@@ -557,6 +844,10 @@ sync_job_with_seasons() {
   elif [[ "$seasons_spec" == "latest" ]]
   then
     season_dirs=$(echo "$available_seasons" | tail -1)
+  elif [[ "$seasons_spec" =~ ^latest-([0-9]+)$ ]]
+  then
+    local count="${BASH_REMATCH[1]}"
+    season_dirs=$(echo "$available_seasons" | tail -n "$count")
   elif [[ "$seasons_spec" =~ ^([0-9]+)-([0-9]+)$ ]]
   then
     local range_start="${BASH_REMATCH[1]}"
@@ -575,7 +866,7 @@ sync_job_with_seasons() {
     done <<< "$available_seasons"
   else
     log_error "Invalid seasons specification: $seasons_spec"
-    log_error "Valid formats: 'latest', '1-10', or [1, 2, 3]"
+    log_error "Valid formats: 'latest', 'latest-N', '1-10', or [1, 2, 3]"
     return 1
   fi
 
@@ -585,6 +876,49 @@ sync_job_with_seasons() {
     return 1
   fi
 
+  # Log seasons being synced
+  log "  Syncing seasons:"
+  while IFS= read -r season_dir
+  do
+    if [[ -n "$season_dir" ]]
+    then
+      log "    - $(basename "$season_dir")"
+    fi
+  done <<< "$season_dirs"
+
+  # If episode filtering is specified, handle each season separately
+  if [[ -n "$episodes_spec" ]]
+  then
+    local success=1
+    while IFS= read -r season_dir
+    do
+      if [[ -n "$season_dir" ]]
+      then
+        local season_name
+        local local_season
+        season_name=$(basename "$season_dir")
+        local_season="$local_full/$season_name"
+
+        log "  Processing season: $season_name"
+
+        if ! sync_job_with_episodes "$job_name" "$season_dir" "$local_season" "$episodes_spec"
+        then
+          success=
+        fi
+      fi
+    done <<< "$season_dirs"
+
+    if [[ -n "$success" ]]
+    then
+      log_success "Completed: ${job_name}"
+      return 0
+    else
+      log_error "Failed: ${job_name}"
+      return 1
+    fi
+  fi
+
+  # No episode filtering - sync full seasons
   # Build include patterns for rsync
   include_patterns=()
   while IFS= read -r season_dir
@@ -630,16 +964,6 @@ sync_job_with_seasons() {
   else
     rsync_opts+=(--info=progress2)
   fi
-
-  # Log seasons being synced
-  log "  Syncing seasons:"
-  while IFS= read -r season_dir
-  do
-    if [[ -n "$season_dir" ]]
-    then
-      log "    - $(basename "$season_dir")"
-    fi
-  done <<< "$season_dirs"
 
   # Log rsync command
   log "  Executing: rsync ${rsync_opts[*]} ${remote_host}:${remote_full}/ ${local_full}/"
@@ -700,6 +1024,7 @@ sync_job() {
   local local_dir=""
   local directory=""
   local seasons=""
+  local episodes=""
   local wildcard=""
   local pairs
   local pair
@@ -726,6 +1051,9 @@ sync_job() {
           ;;
         seasons)
           seasons="$value"
+          ;;
+        episodes)
+          episodes="$value"
           ;;
         wildcard)
           wildcard="$value"
@@ -779,13 +1107,25 @@ sync_job() {
 
   local_full=$(get_full_path "${LOCAL[root]}" "$local_dir")
 
-  # Handle seasons filtering
+  # Handle seasons filtering (and optionally episodes)
   if [[ -n "$seasons" ]]
   then
-    if ! sync_job_with_seasons "$job_name" "$remote_full" "$local_full" "$seasons"
+    if ! sync_job_with_seasons "$job_name" "$remote_full" "$local_full" "$seasons" "$episodes"
     then
       return 1
     fi
+    return 0
+  fi
+
+  # Handle episodes filtering without seasons (single directory with episodes)
+  if [[ -n "$episodes" ]]
+  then
+    log "Syncing job: ${GREEN}${job_name}${NC} (with episode filter)"
+    if ! sync_job_with_episodes "$job_name" "$remote_full" "$local_full" "$episodes"
+    then
+      return 1
+    fi
+    log_success "Completed: ${job_name}"
     return 0
   fi
 

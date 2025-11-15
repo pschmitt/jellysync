@@ -549,6 +549,7 @@ check_dependencies() {
 - **Search paths:** Keep config file search order documented
 - **Examples:** Update YAML examples to match current format
 - **Default values:** Document defaults for all optional settings
+- **Filtering features:** Document season/episode filtering with examples
 
 **When adding a new config section:**
 1. Add it to the YAML example at the top of Configuration section
@@ -556,6 +557,13 @@ check_dependencies() {
 3. Add usage notes and examples
 4. Update `jellysync-config.sample.yaml`
 5. Test that the example works
+
+**When adding filtering features (seasons/episodes/etc):**
+1. Document in Library section with pattern examples
+2. Add to Jobs section table with type and description
+3. Create dedicated subsection with format examples (latest, range, list)
+4. Update syntax options section with examples
+5. Add working examples to `jellysync-config.sample.yaml`
 
 **Example workflow:**
 ```bash

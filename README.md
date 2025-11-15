@@ -30,6 +30,116 @@ nix profile install github:pschmitt/jellysync
 }
 ```
 
+### Using Home Manager
+
+Jellysync includes a Home Manager module for automated synchronization with systemd timers.
+
+**1. Add jellysync to your flake inputs:**
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    home-manager.url = "github:nix-community/home-manager";
+    jellysync.url = "github:pschmitt/jellysync";
+  };
+}
+```
+
+**2. Import the module in your home-manager configuration:**
+```nix
+{
+  home-manager.users.youruser = { pkgs, ... }: {
+    imports = [
+      inputs.jellysync.homeManagerModules.default
+    ];
+
+    services.jellysync = {
+      enable = true;
+
+      settings = {
+        remote = {
+          hostname = "jellyfin.example.com";
+          username = "jelly";
+          port = 22;
+          root = "/mnt/data/videos";
+          directories = {
+            movies = "movies";
+            tv_shows = "tv_shows";
+          };
+        };
+
+        local = {
+          root = "~/Videos";
+          directories = {
+            movies = "Movies";
+            tv_shows = "TV Shows";
+          };
+        };
+
+        jobs = {
+          pluribus = {
+            remote_dir = "$tv_shows/Pluribus";
+            local_dir = "$tv_shows/Pluribus";
+          };
+          "Star Trek" = {
+            directory = "tv_shows";
+          };
+          Andor = {
+            directory = "tv_shows";
+            seasons = "latest-2";
+          };
+        };
+      };
+
+      # Sync schedule (systemd timer format)
+      schedule = "0 3 * * *";  # Daily at 3 AM
+      
+      # Run missed jobs after system restart
+      persistent = true;
+
+      # Optional: sync only specific jobs
+      jobNames = [ "pluribus" "Star Trek" ];
+    };
+  };
+}
+```
+
+**Module Options:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enable` | bool | `false` | Enable the jellysync service |
+| `package` | package | `pkgs.jellysync` | The jellysync package to use |
+| `settings` | attrs | - | Configuration settings (see Configuration section) |
+| `schedule` | string | `"0 3 * * *"` | Systemd timer schedule (OnCalendar format) |
+| `persistent` | bool | `true` | Run missed jobs after system restart |
+| `jobNames` | list of strings | `[]` | Specific jobs to sync (empty = all jobs) |
+
+**Schedule Examples:**
+
+```nix
+# Daily at 3 AM (default)
+schedule = "0 3 * * *";
+
+# Every hour
+schedule = "hourly";
+
+# Every 6 hours
+schedule = "*-*-* 0/6:00:00";
+
+# Twice daily (6 AM and 6 PM)
+schedule = "0 6,18 * * *";
+
+# Every Monday at 2 AM
+schedule = "Mon *-*-* 02:00:00";
+```
+
+**What it does:**
+- Creates `~/.config/jellysync/config.yaml` with your settings
+- Installs jellysync package
+- Sets up systemd user service and timer
+- Automatically syncs on schedule
+
 ### Manual Installation
 
 1. Clone this repository

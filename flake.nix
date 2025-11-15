@@ -12,7 +12,12 @@
       nixpkgs,
       flake-utils,
     }:
-    flake-utils.lib.eachDefaultSystem (
+    {
+      # Home-manager module
+      homeManagerModules.default = import ./home-manager-module.nix;
+      homeManagerModules.jellysync = self.homeManagerModules.default;
+    }
+    // flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};

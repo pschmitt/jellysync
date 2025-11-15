@@ -325,6 +325,12 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         version = "0.1.0";
+        dependencies = with pkgs; [
+          bash
+          yq-go
+          rsync
+          openssh
+        ];
       in
       {
         packages.default = pkgs.stdenv.mkDerivation {
@@ -335,12 +341,7 @@
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
 
-          buildInputs = [
-            pkgs.bash
-            pkgs.yq-go
-            pkgs.rsync
-            pkgs.openssh
-          ];
+          buildInputs = dependencies;
 
           dontBuild = true;
 
@@ -351,13 +352,7 @@
             install -Dm755 jellysync $out/bin/jellysync
 
             wrapProgram $out/bin/jellysync \
-              --prefix PATH : ${
-                pkgs.lib.makeBinPath [
-                  pkgs.yq-go
-                  pkgs.rsync
-                  pkgs.openssh
-                ]
-              }
+              --prefix PATH : ${pkgs.lib.makeBinPath dependencies}
 
             runHook postInstall
           '';
@@ -378,17 +373,13 @@
         # Development shell
         devShells.default = pkgs.mkShell {
           inputsFrom = [ self.packages.${system}.default ];
-          packages = with pkgs; [
-            # dependencies
-            bash
-            yq-go
-            rsync
-            openssh
-
-            # linting tools
-            shellcheck
-            statix
-          ];
+          packages =
+            (with pkgs; [
+              # linting tools
+              shellcheck
+              statix
+            ])
+            ++ dependencies;
         };
       }
     )

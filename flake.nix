@@ -289,7 +289,6 @@
               };
 
               Service = {
-                Type = "oneshot";
                 ExecStart =
                   let
                     jobArgs =

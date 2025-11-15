@@ -1,1 +1,13 @@
+# Nix build results
+result
+result-*
+flake.lock
+
+# Config files
 jellysync.yaml
+*.local.yaml
+
+# Backup files
+*~
+*.swp
+*.swo

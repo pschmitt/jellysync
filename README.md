@@ -13,9 +13,29 @@ A bash tool to sync files from an SSH server to local directories with flexible 
 
 ## Installation
 
+### Using Nix (Recommended)
+
+```bash
+# Run directly with nix run
+nix run github:pschmitt/jellysync -- --help
+
+# Install to your profile
+nix profile install github:pschmitt/jellysync
+
+# Or add to your NixOS configuration
+{
+  inputs.jellysync.url = "github:pschmitt/jellysync";
+  # ...
+  environment.systemPackages = [ inputs.jellysync.packages.${system}.default ];
+}
+```
+
+### Manual Installation
+
 1. Clone this repository
-2. Copy `jellysync-config.sample.yaml` to `jellysync.yaml` and configure it
-3. Run `./jellysync`
+2. Ensure dependencies are installed: `bash`, `yq` (Go version), `rsync`, `ssh`
+3. Copy `jellysync-config.sample.yaml` to `jellysync.yaml` and configure it
+4. Run `./jellysync`
 
 ```bash
 # Run
@@ -279,6 +299,8 @@ The tool uses these rsync options:
 - `rsync`
 - `ssh` access to remote server
 - SSH key authentication recommended
+
+**Note:** When using Nix, all dependencies are automatically provided.
 
 ## Tips
 

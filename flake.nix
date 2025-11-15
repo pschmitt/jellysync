@@ -299,7 +299,6 @@
                         "";
                   in
                   "${cfg.package}/bin/jellysync ${jobArgs}";
-                Environment = [ "PATH=${lib.makeBinPath [ cfg.package ]}" ];
               };
             };
 

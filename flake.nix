@@ -23,7 +23,7 @@
         }:
         let
           cfg = config.services.jellysync;
-          defaultPkg = self.packages.${pkgs.system}.default;
+          defaultPkg = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
           yamlFormat = pkgs.formats.yaml { };
 
           # Convert jobs from attrset to list format for YAML
@@ -67,7 +67,7 @@
             package = mkOption {
               type = types.package;
               default = defaultPkg;
-              defaultText = literalExpression "inputs.jellysync.packages.\${pkgs.system}.default";
+              defaultText = literalExpression "inputs.jellysync.packages.\${pkgs.stdenv.hostPlatform.system}.default";
               description = "The jellysync package to use.";
             };
 

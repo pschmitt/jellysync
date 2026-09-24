@@ -428,10 +428,31 @@ struct UserData {
     is_played: Option<bool>,
 }
 
+/// Cheap unauthenticated reachability check used by the TUI's offline mode.
+async fn jellyfin_reachable(config: &Jellyfin) -> bool {
+    let Ok(client) = HttpClient::builder()
+        .user_agent("jellysync/1.1.0")
+        .timeout(Duration::from_secs(3))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!(
+            "{}/System/Ping",
+            config.base_url.trim_end_matches('/')
+        ))
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
+}
+
 async fn jellyfin_login(config: &Jellyfin) -> Result<JellyfinApi> {
     let base = config.base_url.trim_end_matches('/').to_string();
     let client = HttpClient::builder()
         .user_agent("jellysync/1.1.0")
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(60))
         .build()?;
     let (token, user_id) = if let Some(api_key_file) = &config.api_key_file {
         let token = std::fs::read_to_string(api_key_file)
@@ -791,7 +812,7 @@ async fn download_library_items(
             failures.join("; ")
         );
     }
-    update_job(&job, "success", &format!("downloaded {count} item(s)"))?;
+    update_job(&job, "success", &format!("{count} item(s) downloaded"))?;
     Ok(count)
 }
 
@@ -1000,7 +1021,7 @@ async fn jellyfin_job(
             failures.join("; ")
         );
     }
-    update_job(&job.name, "success", &format!("downloaded {count} item(s)"))?;
+    update_job(&job.name, "success", &format!("{count} item(s) downloaded"))?;
     Ok(())
 }
 
@@ -1735,15 +1756,28 @@ async fn reconcile_existing(config: &Config) -> Result<usize> {
 }
 
 async fn tui(config: Config) -> Result<()> {
-    let reconcile_config = config.clone();
-    let reconcile_task = tokio::spawn(async move { reconcile_existing(&reconcile_config).await });
+    // Status messages used to read "downloaded N item(s)".
+    db()?.execute(
+        "UPDATE jobs SET message=substr(message,12)||' downloaded' WHERE message LIKE 'downloaded % item(s)'",
+        [],
+    )?;
     let mut out = stdout();
     enable_raw_mode()?;
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let result = async move {
         let backend = CrosstermBackend::new(out);
         let mut terminal = Terminal::new(backend)?;
+        let query_started = Instant::now();
         let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
+        if query_started.elapsed() >= Duration::from_millis(900) {
+            // ratatui-image gives up after 1s but leaves its query thread blocked on stdin,
+            // where it swallows keystrokes until it reads a Device Status Report. Request one
+            // so that thread exits before our event loop starts reading input.
+            use std::io::Write as _;
+            let mut out = stdout();
+            let _ = out.write_all(b"\x1b[5n").and_then(|()| out.flush());
+            std::thread::sleep(Duration::from_millis(200));
+        }
         let mut poster_cache = HashMap::<String, Vec<u8>>::new();
         let mut poster_cache_order = VecDeque::<String>::new();
         let (resize_request_tx, resize_request_rx) = std::sync::mpsc::channel::<ResizeRequest>();
@@ -1769,16 +1803,16 @@ async fn tui(config: Config) -> Result<()> {
         let mut explore: Option<ExploreState> = None;
         let mut explore_notice: Option<(String, bool)> = None;
         let mut explore_task: Option<tokio::task::JoinHandle<Result<usize>>> = None;
-        let mut reconcile_task = Some(reconcile_task);
+        // None when Jellyfin is not configured; otherwise the latest ping result
+        // (Some(None) while the first check is still running).
+        let mut online: Option<Option<bool>> = config.jellyfin.as_ref().map(|_| None);
+        let mut ping_task: Option<tokio::task::JoinHandle<bool>> = None;
+        let mut pinged_at: Option<Instant> = None;
+        let mut reconciled = false;
+        let mut reconcile_task: Option<tokio::task::JoinHandle<Result<usize>>> = None;
         let mut catalog_task: Option<CatalogTask> = None;
         let mut library_cache: Option<(JellyfinApi, Vec<MediaItem>)> = None;
-        let mut job_poster_catalog_task: Option<JobPosterCatalogTask> = config
-            .jellyfin
-            .as_ref()
-            .map(|_| {
-                let config = config.clone();
-                tokio::spawn(async move { jellyfin_job_poster_catalog(&config).await })
-            });
+        let mut job_poster_catalog_task: Option<JobPosterCatalogTask> = None;
         let mut job_poster_tasks = HashMap::<String, PosterTask>::new();
         let mut job_poster_protocols = HashMap::<String, StatefulProtocol>::new();
         let mut explore_poster_tasks = HashMap::<String, PosterTask>::new();
@@ -1835,12 +1869,50 @@ async fn tui(config: Config) -> Result<()> {
             {
                 dashboard_task = Some(tokio::task::spawn_blocking(dashboard_snapshot));
             }
+            if ping_task.as_ref().is_some_and(|task| task.is_finished()) {
+                let task = ping_task.take().expect("finished ping task exists");
+                let reachable = task.await.unwrap_or(false);
+                let was_online = online == Some(Some(true));
+                let was_offline = online == Some(Some(false));
+                online = Some(Some(reachable));
+                pinged_at = Some(Instant::now());
+                if reachable && !was_online {
+                    if !reconciled && reconcile_task.is_none() {
+                        let config = config.clone();
+                        reconcile_task =
+                            Some(tokio::spawn(async move { reconcile_existing(&config).await }));
+                    }
+                    if job_poster_catalog_task.is_none() && job_poster_protocols.is_empty() {
+                        let config = config.clone();
+                        job_poster_catalog_task = Some(tokio::spawn(async move {
+                            jellyfin_job_poster_catalog(&config).await
+                        }));
+                    }
+                } else if !reachable && !was_offline {
+                    sync_notice = Some((
+                        "Offline: Jellyfin is unreachable; local files, playback and clearing still work".into(),
+                        false,
+                    ));
+                }
+            }
+            if let (Some(jellyfin), None) = (config.jellyfin.as_ref(), ping_task.as_ref()) {
+                let interval = if online == Some(Some(true)) { 60 } else { 10 };
+                if pinged_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(interval)) {
+                    let jellyfin = jellyfin.clone();
+                    ping_task = Some(tokio::spawn(async move { jellyfin_reachable(&jellyfin).await }));
+                }
+            } else if online.is_none() && !reconciled && reconcile_task.is_none() {
+                let config = config.clone();
+                reconcile_task = Some(tokio::spawn(async move { reconcile_existing(&config).await }));
+            }
             if reconcile_task
                 .as_ref()
                 .is_some_and(|task| task.is_finished())
             {
                 let task = reconcile_task.take().expect("finished reconcile task exists");
-                sync_notice = Some(match task.await {
+                let result = task.await;
+                reconciled = matches!(result, Ok(Ok(_)));
+                sync_notice = Some(match result {
                     Ok(Ok(0)) => ("Finished scanning existing media".into(), true),
                     Ok(Ok(count)) => (format!("Indexed {count} existing media files"), true),
                     Ok(Err(error)) => (format!("Could not reconcile existing files: {error:#}"), false),
@@ -1919,7 +1991,7 @@ async fn tui(config: Config) -> Result<()> {
                     }
                     Ok(Err(error)) => {
                         explore = None;
-                        explore_notice = Some((format!("Could not open Explore: {error:#}"), false));
+                        sync_notice = Some((format!("Could not open Explore: {error:#}"), false));
                     }
                     Err(error) => {
                         explore = None;
@@ -2267,7 +2339,7 @@ async fn tui(config: Config) -> Result<()> {
             let [header, body, footer] = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),
+                    Constraint::Length(1),
                     Constraint::Min(4),
                     Constraint::Length(2),
                 ])
@@ -2378,6 +2450,19 @@ async fn tui(config: Config) -> Result<()> {
                         })
                         .add_modifier(Modifier::BOLD),
                     ),
+                    Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+                    match online {
+                        None => Span::raw(""),
+                        Some(None) => Span::styled("CHECKING", state_style("stopped")),
+                        Some(Some(true)) => Span::styled(
+                            "ONLINE",
+                            state_style("success").add_modifier(Modifier::BOLD),
+                        ),
+                        Some(Some(false)) => Span::styled(
+                            "OFFLINE",
+                            state_style("failed").add_modifier(Modifier::BOLD),
+                        ),
+                    },
                     Span::styled("  ·  timer ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         dashboard.timer.clone(),
@@ -2388,20 +2473,14 @@ async fn tui(config: Config) -> Result<()> {
                         },
                     ),
                 ]);
-                frame.render_widget(
-                    Paragraph::new(header_text).block(
-                        Block::default()
-                            .borders(Borders::BOTTOM)
-                            .border_style(Style::default().fg(Color::DarkGray)),
-                    ),
-                    header,
-                );
+                frame.render_widget(Paragraph::new(header_text), header);
 
                 let jobs_title = format!("Jobs · {}", jobs.len());
                 let downloads_title = format!(
-                    "Files: {} ({})",
+                    "Files: {} ({} {})",
                     selected_job.map_or("no job selected", |job| job.name.as_str()),
-                    downloads.len()
+                    downloads.len(),
+                    if downloads.len() == 1 { "file" } else { "files" }
                 );
                 let jobs_block = panel_block(&jobs_title, !download_focus);
                 let downloads_block = panel_block(&downloads_title, download_focus);
@@ -2514,7 +2593,7 @@ async fn tui(config: Config) -> Result<()> {
                     frame.render_widget(Clear, popup);
                     frame.render_widget(
                         Paragraph::new(lines)
-                            .block(panel_block(&format!("{title} · i / Esc close"), true))
+                            .block(panel_block(&format!("{title} · p play · i / Esc close"), true))
                             .style(Style::default().fg(Color::White)),
                         popup,
                     );
@@ -2847,8 +2926,8 @@ async fn tui(config: Config) -> Result<()> {
                         Line::from("  Mouse drag        resize Jobs/Details split"),
                         Line::from("  s / S             sync selected / all jobs"),
                         Line::from("  b                 browse the Jellyfin library"),
-                        Line::from("  i                 job configuration / file media info"),
-                        Line::from("  p / Enter         play selected download (or double-click)"),
+                        Line::from("  i / Enter         job configuration / file media info"),
+                        Line::from("  p / double-click  play selected file"),
                         Line::from("  o                 open the show/movie download directory"),
                         Line::from("  x / X / c         clear file / season / show (x on ad-hoc job removes it)"),
                         Line::from("  Ctrl-C, Ctrl-C    quit the TUI"),
@@ -3072,6 +3151,16 @@ async fn tui(config: Config) -> Result<()> {
                     show_job_config = false;
                 } else if show_help && key.code == KeyCode::Esc {
                     show_help = false;
+                } else if file_info.is_some() && key.code == KeyCode::Char('p') {
+                    if let Some(entry) = downloads.get(selected_download) {
+                        sync_notice = match play_download(&config, entry) {
+                            Ok(()) => Some((
+                                format!("Playing {} with {}", entry.path.display(), config.player),
+                                true,
+                            )),
+                            Err(error) => Some((format!("Could not start player: {error:#}"), false)),
+                        };
+                    }
                 } else if file_info.is_some()
                     && matches!(key.code, KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q'))
                 {
@@ -3274,7 +3363,7 @@ async fn tui(config: Config) -> Result<()> {
                     last_ctrl_c = None;
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('i') if download_focus && !downloads.is_empty() => {
+                        KeyCode::Char('i') | KeyCode::Enter if download_focus && !downloads.is_empty() => {
                             if let Some(entry) = downloads.get(selected_download) {
                                 let path = entry.path.clone();
                                 file_info = Some((
@@ -3289,6 +3378,20 @@ async fn tui(config: Config) -> Result<()> {
                         }
                         KeyCode::Char('i') if !jobs.is_empty() => {
                             show_job_config = !show_job_config;
+                        }
+                        KeyCode::Char('b') if online == Some(Some(false)) => {
+                            sync_notice = Some((
+                                "Offline: Jellyfin is unreachable, so browsing is unavailable".into(),
+                                false,
+                            ));
+                        }
+                        KeyCode::Char('s' | 'S')
+                            if online == Some(Some(false)) && config.download.mode == "jellyfin" =>
+                        {
+                            sync_notice = Some((
+                                "Offline: Jellyfin is unreachable, so syncing is unavailable".into(),
+                                false,
+                            ));
                         }
                         KeyCode::Char('b') => {
                             if explore_task.is_some() {
@@ -3410,7 +3513,7 @@ async fn tui(config: Config) -> Result<()> {
                         {
                             confirm_clear = Some(ClearScope::Show)
                         }
-                        KeyCode::Char('p') | KeyCode::Enter if download_focus && !downloads.is_empty() => {
+                        KeyCode::Char('p') if download_focus && !downloads.is_empty() => {
                             if let Some(entry) = downloads.get(selected_download) {
                                 sync_notice = match play_download(&config, entry) {
                                     Ok(()) => Some((
@@ -3508,7 +3611,14 @@ fn optional_bool_display(value: Option<bool>) -> String {
 
 async fn probe_media(path: PathBuf) -> Result<MediaSummary> {
     let output = Command::new("ffprobe")
-        .args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
+        .args([
+            "-v",
+            "error",
+            "-show_format",
+            "-show_streams",
+            "-of",
+            "json",
+        ])
         .arg(&path)
         .stdin(Stdio::null())
         .output()
@@ -3593,13 +3703,11 @@ fn media_summary(probe: &serde_json::Value) -> MediaSummary {
         if let (Some(width), Some(height)) = (number(stream, "width"), number(stream, "height")) {
             parts.push(format!("{width}x{height}"));
         }
-        if let Some(rate) = text(stream, "avg_frame_rate")
-            .and_then(|rate| {
-                let (num, den) = rate.split_once('/')?;
-                let (num, den): (f64, f64) = (num.parse().ok()?, den.parse().ok()?);
-                (den > 0.0 && num > 0.0).then(|| num / den)
-            })
-        {
+        if let Some(rate) = text(stream, "avg_frame_rate").and_then(|rate| {
+            let (num, den) = rate.split_once('/')?;
+            let (num, den): (f64, f64) = (num.parse().ok()?, den.parse().ok()?);
+            (den > 0.0 && num > 0.0).then(|| num / den)
+        }) {
             parts.push(format!("{rate:.3} fps").replace(".000", ""));
         }
         if text(stream, "pix_fmt").is_some_and(|fmt| fmt.contains("10")) {
@@ -3643,7 +3751,11 @@ fn media_summary(probe: &serde_json::Value) -> MediaSummary {
             format!(
                 "{}{}",
                 language(stream),
-                if flag(stream, "forced") { " (forced)" } else { "" }
+                if flag(stream, "forced") {
+                    " (forced)"
+                } else {
+                    ""
+                }
             )
         })
         .collect();

@@ -19,7 +19,7 @@ local:
 jellyfin:
   base_url: https://jellyfin.example.com
   username: jelly
-  password_file: /run/secrets/jellyfin/password
+  api_key_file: /run/secrets/jellyfin/api-key
 
 # Optional: Library settings
 library:

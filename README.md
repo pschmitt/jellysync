@@ -191,12 +191,14 @@ local:
     movies: Movies
     documentaries: ~/Documentaries
 
-# Required only for jobs with unwatched: true. Keep the password in a secret
-# file and point password_file at it; never put the password in this config.
+# Required for Jellyfin download mode. Keep the API key in a secret
+# file and point api_key_file at it; never put the key in this config.
 jellyfin:
   base_url: https://jellyfin.example.com
+  api_key_file: /run/secrets/jellyfin/api-key
   username: jelly
-  password_file: /run/secrets/jellyfin/password
+  # Optional when Jellysync can resolve username through the API.
+  user_id: 0123456789abcdef0123456789abcdef
 
 library:
   season_pattern: "Season $season_number"
@@ -314,15 +316,17 @@ local:
 
 #### Jellyfin Section
 
-Required only when a job uses `unwatched: true`. Jellysync authenticates as the configured user, queries that user's unplayed episode paths, and syncs matching files. Store the password in a separate readable file, such as a SOPS-managed secret.
+Required when jobs use Jellyfin library sync. Jellysync uses a Jellyfin API key and a user ID to query media and per-user watched status. Store the API key in a separate readable file, such as a SOPS-managed secret.
 
 | Setting | Required | Description |
 |---------|----------|-------------|
 | `base_url` | Yes | Jellyfin server base URL, without a trailing slash |
-| `username` | Yes | Jellyfin account used to check watched status |
-| `password_file` | Yes | Path to a file containing that account's password |
+| `api_key_file` | Recommended | Path to a file containing a Jellyfin API key |
+| `user_id` | No | Jellyfin user ID; otherwise resolved from `username` |
+| `username` | With API key or password | Jellyfin account used for watched status and user lookup |
+| `password_file` | Legacy only | Path to a file containing that account's password |
 
-The access token is kept in a private temporary directory for the run. Jellysync closes the API session after it fetches the unplayed episode paths.
+Jellysync sends the API key using Jellyfin's `Authorization: MediaBrowser` header. The key stays in memory for the run and is never written to the state database.
 
 #### Library Section
 
@@ -558,7 +562,7 @@ jellysync --config /path/to/config.yaml config
 - `sync [JOB...]`: Sync all jobs or selected jobs
 - `status`: Show latest job state and systemd timer state
 - `prune [--apply] [JOB...]`: Preview deletions, or apply them
-- `tui`: Review jobs/downloads; use Tab, arrows, `d` (file), `s` (season), `S` (show), and `y` to clear tracked files
+- `tui`: Review jobs/downloads and existing files; `r` syncs the selected job, `R` syncs all jobs, and `d` (file), `s` (season), `S` (show), then `y` clears media
 - `-h, --help`: Show help message
 - `--version`: Show version
 

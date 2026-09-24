@@ -178,13 +178,27 @@
                       };
 
                       username = lib.mkOption {
-                        type = lib.types.str;
-                        description = "Jellyfin user used to query watched status.";
+                        type = lib.types.nullOr lib.types.str;
+                        default = null;
+                        description = "Jellyfin user used to query watched status and resolve user_id.";
                       };
 
                       password_file = lib.mkOption {
-                        type = lib.types.str;
-                        description = "Path to a file containing the Jellyfin user's password.";
+                        type = lib.types.nullOr lib.types.str;
+                        default = null;
+                        description = "Path to a file containing the Jellyfin user's password (legacy authentication).";
+                      };
+
+                      api_key_file = lib.mkOption {
+                        type = lib.types.nullOr lib.types.str;
+                        default = null;
+                        description = "Path to a file containing a Jellyfin API key.";
+                      };
+
+                      user_id = lib.mkOption {
+                        type = lib.types.nullOr lib.types.str;
+                        default = null;
+                        description = "Jellyfin user ID; set this or username when using an API key.";
                       };
                     };
                   }

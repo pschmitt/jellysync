@@ -427,6 +427,7 @@
         runtimeInputs = [
           pkgs.rsync
           pkgs.openssh
+          pkgs.ffmpeg-headless
         ]
         ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.systemd ];
       in

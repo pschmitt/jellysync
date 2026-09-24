@@ -344,6 +344,10 @@ struct MediaItem {
 type PosterFetch = Result<Option<(Vec<u8>, StatefulProtocol)>>;
 type PosterTask = tokio::task::JoinHandle<(String, PosterFetch)>;
 type CatalogTask = tokio::task::JoinHandle<Result<(JellyfinApi, Vec<MediaItem>)>>;
+type MediaSummary = Vec<(String, String)>;
+/// File name plus the ffprobe summary once it has finished.
+type FileInfo = (String, Option<std::result::Result<MediaSummary, String>>);
+type FileInfoTask = tokio::task::JoinHandle<Result<MediaSummary>>;
 type PreviewEpisodeTask = tokio::task::JoinHandle<(String, Result<Vec<MediaItem>>)>;
 type JobPosterCatalogTask =
     tokio::task::JoinHandle<Result<(JellyfinApi, Vec<(String, MediaItem)>)>>;
@@ -1760,6 +1764,8 @@ async fn tui(config: Config) -> Result<()> {
         let mut confirm_clear = None;
         let mut show_help = false;
         let mut show_job_config = false;
+        let mut file_info: Option<FileInfo> = None;
+        let mut file_info_task: Option<FileInfoTask> = None;
         let mut explore: Option<ExploreState> = None;
         let mut explore_notice: Option<(String, bool)> = None;
         let mut explore_task: Option<tokio::task::JoinHandle<Result<usize>>> = None;
@@ -1813,6 +1819,16 @@ async fn tui(config: Config) -> Result<()> {
                     }
                 }
                 dashboard_refreshed_at = Instant::now();
+            }
+            if file_info_task.as_ref().is_some_and(|task| task.is_finished()) {
+                let task = file_info_task.take().expect("finished file info task exists");
+                let result = match task.await {
+                    Ok(result) => result.map_err(|error| format!("{error:#}")),
+                    Err(error) => Err(format!("probe stopped: {error}")),
+                };
+                if let Some((_, info)) = file_info.as_mut() {
+                    *info = Some(result);
+                }
             }
             if dashboard_task.is_none()
                 && dashboard_refreshed_at.elapsed() >= Duration::from_millis(500)
@@ -2477,6 +2493,32 @@ async fn tui(config: Config) -> Result<()> {
                         popup,
                     );
                 }
+                if let Some((name, info)) = &file_info {
+                    let popup = centered_rect(96, 14, area);
+                    let value_width = usize::from(popup.width.saturating_sub(16));
+                    let lines = match info {
+                        None => vec![Line::from(Span::styled(
+                            "Probing…",
+                            Style::default().fg(Color::Gray),
+                        ))],
+                        Some(Ok(rows)) => rows
+                            .iter()
+                            .map(|(label, value)| config_line(label, truncate(value, value_width)))
+                            .collect(),
+                        Some(Err(error)) => vec![Line::from(Span::styled(
+                            error.clone(),
+                            Style::default().fg(Color::Red),
+                        ))],
+                    };
+                    let title = truncate_near_end(name, usize::from(popup.width.saturating_sub(20)));
+                    frame.render_widget(Clear, popup);
+                    frame.render_widget(
+                        Paragraph::new(lines)
+                            .block(panel_block(&format!("{title} · i / Esc close"), true))
+                            .style(Style::default().fg(Color::White)),
+                        popup,
+                    );
+                }
 
                 let footer_lines = if confirm_clear.is_some() {
                     vec![Line::from(vec![
@@ -2805,7 +2847,7 @@ async fn tui(config: Config) -> Result<()> {
                         Line::from("  Mouse drag        resize Jobs/Details split"),
                         Line::from("  s / S             sync selected / all jobs"),
                         Line::from("  b                 browse the Jellyfin library"),
-                        Line::from("  i                 show selected job configuration"),
+                        Line::from("  i                 job configuration / file media info"),
                         Line::from("  p / Enter         play selected download (or double-click)"),
                         Line::from("  o                 open the show/movie download directory"),
                         Line::from("  x / X / c         clear file / season / show (x on ad-hoc job removes it)"),
@@ -3030,6 +3072,13 @@ async fn tui(config: Config) -> Result<()> {
                     show_job_config = false;
                 } else if show_help && key.code == KeyCode::Esc {
                     show_help = false;
+                } else if file_info.is_some()
+                    && matches!(key.code, KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q'))
+                {
+                    if let Some(task) = file_info_task.take() {
+                        task.abort();
+                    }
+                    file_info = None;
                 } else if show_job_config && key.code == KeyCode::Esc {
                     show_job_config = false;
                 } else if show_job_config && key.code == KeyCode::Char('q') {
@@ -3225,6 +3274,19 @@ async fn tui(config: Config) -> Result<()> {
                     last_ctrl_c = None;
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('i') if download_focus && !downloads.is_empty() => {
+                            if let Some(entry) = downloads.get(selected_download) {
+                                let path = entry.path.clone();
+                                file_info = Some((
+                                    path.file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                    None,
+                                ));
+                                file_info_task = Some(tokio::spawn(probe_media(path)));
+                            }
+                        }
                         KeyCode::Char('i') if !jobs.is_empty() => {
                             show_job_config = !show_job_config;
                         }
@@ -3278,13 +3340,18 @@ async fn tui(config: Config) -> Result<()> {
                         KeyCode::Tab => download_focus = !download_focus,
                         KeyCode::Left => download_focus = false,
                         KeyCode::Right => download_focus = !downloads.is_empty(),
+                        // Wrap within the Files list instead of moving the job selection.
                         KeyCode::Up if download_focus => {
-                            selected_download = selected_download.saturating_sub(1)
+                            selected_download = selected_download
+                                .checked_sub(1)
+                                .unwrap_or(downloads.len().saturating_sub(1))
                         }
-                        KeyCode::Down
-                            if download_focus && selected_download + 1 < downloads.len() =>
-                        {
-                            selected_download += 1
+                        KeyCode::Down if download_focus => {
+                            selected_download = if selected_download + 1 < downloads.len() {
+                                selected_download + 1
+                            } else {
+                                0
+                            }
                         }
                         KeyCode::Up => {
                             let next = selected.saturating_sub(1);
@@ -3437,6 +3504,153 @@ fn optional_bool_display(value: Option<bool>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "—".into())
+}
+
+async fn probe_media(path: PathBuf) -> Result<MediaSummary> {
+    let output = Command::new("ffprobe")
+        .args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("run ffprobe")?;
+    if !output.status.success() {
+        bail!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let probe: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse ffprobe output")?;
+    Ok(media_summary(&probe))
+}
+
+fn media_summary(probe: &serde_json::Value) -> MediaSummary {
+    let text = |value: &serde_json::Value, key: &str| {
+        value.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    };
+    let number = |value: &serde_json::Value, key: &str| {
+        value.get(key).and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|v| v.parse().ok()))
+        })
+    };
+    let language = |stream: &serde_json::Value| {
+        stream
+            .get("tags")
+            .and_then(|tags| text(tags, "language"))
+            .unwrap_or_else(|| "und".into())
+    };
+    let flag = |stream: &serde_json::Value, key: &str| {
+        stream
+            .get("disposition")
+            .and_then(|d| d.get(key))
+            .and_then(|v| v.as_i64())
+            == Some(1)
+    };
+    let format = probe.get("format").cloned().unwrap_or_default();
+    let mut rows = Vec::new();
+
+    let container = text(&format, "format_name")
+        .and_then(|name| name.split(',').next().map(str::to_string))
+        .unwrap_or_else(|| "?".into());
+    let mut file = vec![container];
+    if let Some(duration) = number(&format, "duration") {
+        let seconds = duration as u64;
+        file.push(format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        ));
+    }
+    if let Some(size) = number(&format, "size") {
+        file.push(format_bytes(size as u64));
+    }
+    if let Some(bitrate) = number(&format, "bit_rate") {
+        file.push(format!("{:.1} Mb/s", bitrate / 1_000_000.0));
+    }
+    rows.push(("File".to_string(), file.join(", ")));
+
+    let streams = probe
+        .get("streams")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let of_type = |kind: &str| -> Vec<&serde_json::Value> {
+        streams
+            .iter()
+            .filter(|stream| text(stream, "codec_type").as_deref() == Some(kind))
+            .filter(|stream| !flag(stream, "attached_pic"))
+            .collect()
+    };
+    for stream in of_type("video") {
+        let mut parts = vec![
+            text(stream, "codec_name")
+                .unwrap_or_else(|| "?".into())
+                .to_uppercase(),
+        ];
+        if let (Some(width), Some(height)) = (number(stream, "width"), number(stream, "height")) {
+            parts.push(format!("{width}x{height}"));
+        }
+        if let Some(rate) = text(stream, "avg_frame_rate")
+            .and_then(|rate| {
+                let (num, den) = rate.split_once('/')?;
+                let (num, den): (f64, f64) = (num.parse().ok()?, den.parse().ok()?);
+                (den > 0.0 && num > 0.0).then(|| num / den)
+            })
+        {
+            parts.push(format!("{rate:.3} fps").replace(".000", ""));
+        }
+        if text(stream, "pix_fmt").is_some_and(|fmt| fmt.contains("10")) {
+            parts.push("10-bit".into());
+        }
+        match text(stream, "color_transfer").as_deref() {
+            Some("smpte2084") => parts.push("HDR10".into()),
+            Some("arib-std-b67") => parts.push("HLG".into()),
+            _ => {}
+        }
+        rows.push(("Video".to_string(), parts.join(", ")));
+    }
+    let audio: Vec<String> = of_type("audio")
+        .into_iter()
+        .map(|stream| {
+            let channels = match number(stream, "channels").map(|c| c as u64) {
+                Some(1) => "mono".to_string(),
+                Some(2) => "2.0".to_string(),
+                Some(6) => "5.1".to_string(),
+                Some(8) => "7.1".to_string(),
+                Some(n) => format!("{n}ch"),
+                None => "?".to_string(),
+            };
+            format!(
+                "{} {} {}{}",
+                language(stream),
+                text(stream, "codec_name")
+                    .unwrap_or_else(|| "?".into())
+                    .to_uppercase(),
+                channels,
+                if flag(stream, "default") { "*" } else { "" }
+            )
+        })
+        .collect();
+    if !audio.is_empty() {
+        rows.push(("Audio".to_string(), audio.join(", ")));
+    }
+    let subtitles: Vec<String> = of_type("subtitle")
+        .into_iter()
+        .map(|stream| {
+            format!(
+                "{}{}",
+                language(stream),
+                if flag(stream, "forced") { " (forced)" } else { "" }
+            )
+        })
+        .collect();
+    if !subtitles.is_empty() {
+        rows.push(("Subtitles".to_string(), subtitles.join(", ")));
+    }
+    rows
 }
 
 fn config_line(label: &str, value: impl Into<String>) -> Line<'static> {

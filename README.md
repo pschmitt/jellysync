@@ -579,7 +579,7 @@ jellysync --config /path/to/config.yaml config
 - `sync [JOB...]`: Sync all jobs or selected jobs
 - `status`: Show latest job state and systemd timer state
 - `prune [--apply] [JOB...]`: Preview deletions, or apply them
-- `tui`: Select a job to see its files; `s` syncs that job, `S` syncs all jobs, `b` opens Jellyfin Explore, and `o` opens the job's download directory. Explore searches the library, renders posters with `ratatui-image` (including Kitty graphics protocol support), shows a series' episodes in the details pane (`Tab` to focus, `Space`/`a` to select), and downloads movies or selected episodes with `d`. In the main view, `x` (file), `X` (season), `c` (show), then `y` clears media; `x` on an ad-hoc job removes it. `p`, `Enter` or a double-click plays a file. Mouse clicks and scrolling select rows.
+- `tui`: Select a job to see its files; `s` syncs that job, `S` syncs all jobs, `b` opens Jellyfin Explore, and `o` opens the job's download directory. Explore searches the library, renders posters with `ratatui-image` (including Kitty graphics protocol support), shows a series' episodes in the details pane (`Tab` to focus, `Space`/`a` to select), and downloads movies or selected episodes with `d`. In the main view, `x` (file), `X` (season), `c` (show), then `y` clears media; `x` on an ad-hoc job removes it. `p`, `Enter` or a double-click plays a file. `i` shows the job configuration, or a short `ffprobe` summary (container, duration, size, bitrate, video/audio/subtitle streams) when a file is selected. Mouse clicks and scrolling select rows.
 - `-h, --help`: Show help message
 - `--version`: Show version
 

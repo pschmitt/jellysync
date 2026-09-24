@@ -1,6 +1,6 @@
 # jellysync
 
-A bash tool to sync files from an SSH server to local directories with flexible configuration.
+Jellysync is a Rust CLI for syncing media from Jellyfin or over rsync and SSH. Jellyfin HTTP downloads are the default and resume interrupted files; season, episode, and unwatched filters are supported. The rsync-over-SSH mode currently supports unfiltered jobs.
 
 ## Features
 
@@ -10,6 +10,8 @@ A bash tool to sync files from an SSH server to local directories with flexible 
 - 🔍 Dry-run mode to preview changes
 - 📊 Progress reporting with colored output
 - ⚙️ Flexible YAML configuration
+- 🖥️ Terminal status view and systemd service controls
+- ⚡ Configurable parallel job execution (default: 2)
 
 ## Installation
 
@@ -146,17 +148,26 @@ schedule = "Mon *-*-* 02:00:00";
 
 **Note:** The `package` option is optional and automatically defaults to the package provided by the jellysync flake. You only need to set it if you want to use a different version or build.
 
+### Commands
+
+```console
+jellysync sync [JOB]...       # Sync all jobs or selected jobs
+jellysync status              # Show recent job status and timer state
+jellysync tui                 # Open the terminal status view
+jellysync prune [JOB]...      # Preview stale managed downloads
+jellysync prune --apply       # Apply the prune
+jellysync start               # Start the user systemd service
+jellysync stop                # Stop the user systemd service
+jellysync config              # Print the parsed config
+```
+
+Use `--config FILE` to select a config and `--parallelism N` to override the worker limit for a sync. Legacy positional invocation (`jellysync JOB...`) remains an alias for `jellysync sync JOB...`.
+
 ### Manual Installation
 
-1. Clone this repository
-2. Ensure dependencies are installed: `bash`, `curl`, `jq`, `yq` (Go version), `rsync`, `ssh`
-3. Copy `jellysync-config.sample.yaml` to `jellysync.yaml` and configure it
-4. Run `./jellysync`
+Install the flake package with Nix, then copy `jellysync-config.sample.yaml` to `~/.config/jellysync/config.yaml` and configure it.
 
-```bash
-# Run
-./jellysync --help
-```
+GitHub Releases publish archives for Linux x86_64 (glibc and musl), macOS Apple Silicon, and Android aarch64 for Termux. In Termux, extract the `aarch64-linux-android` archive and copy `jellysync` into `$PREFIX/bin`.
 
 ## Configuration
 
@@ -195,7 +206,11 @@ rsync:
     - -a
     - -v
     - -z
-    - --delete
+
+download:
+  mode: jellyfin # jellyfin (HTTP, default) or rsync (SSH)
+
+parallelism: 2 # Concurrent jobs; default is 2
 
 jobs:
   # Sync all of pluribus
@@ -248,6 +263,8 @@ jobs:
     remote_dir: "$tv_shows/The Paper*"
     local_dir: "$tv_shows/The Paper (2025)"
 ```
+
+Jellyfin is the default `download.mode`. The HTTP downloader keeps interrupted data in `.partial` files and resumes from the saved byte offset with an HTTP Range request. If the server declines the range, Jellysync restarts that file from byte zero. `parallelism` defaults to two concurrent transfers.
 
 ### Configuration Sections
 
@@ -367,10 +384,10 @@ library:
 
 | Setting | Required | Default | Description |
 |---------|----------|---------|-------------|
-| `flags` | No | `-a -v -z --delete` | Array of rsync command-line flags |
+| `flags` | No | `-a -v -z` | Array of rsync command-line flags |
 
 **Notes:**
-- If not specified, uses default flags: `-a -v -z --delete`
+- If not specified, uses default flags: `-a -v -z`
 - Common flags: `--progress`, `--bwlimit=RATE`, `--exclude=PATTERN`
 - SSH connection flags (`-e "ssh -p PORT"`) are added automatically
 
@@ -381,7 +398,6 @@ rsync:
     - -a              # Archive mode
     - -v              # Verbose
     - -z              # Compress
-    - --delete        # Delete extraneous files
     - --progress      # Show progress
     - --bwlimit=5000  # Limit bandwidth to 5000 KB/s
 ```
@@ -524,37 +540,25 @@ Combine season and episode filters for precise control:
 ## Usage
 
 ```bash
-# Show help
-./jellysync --help
-
-# List all configured jobs
-./jellysync --list
-
-# Sync all jobs
-./jellysync
-
-# Sync specific job(s)
-./jellysync pluribus
-./jellysync "Star Trek" "The Penguin"
-
-# Dry run (preview changes)
-./jellysync --dry-run
-./jellysync -n pluribus
-
-# Verbose output
-./jellysync --verbose
-./jellysync -v
-
-# Use custom config file
-./jellysync --config /path/to/config.yaml
+jellysync --help
+jellysync sync
+jellysync sync pluribus
+jellysync sync "Star Trek" "The Penguin"
+jellysync status
+jellysync tui
+jellysync prune
+jellysync prune --apply
+jellysync --config /path/to/config.yaml config
 ```
 
 ## Options
 
 - `-c, --config FILE`: Specify config file path (default: `jellysync.yaml`)
-- `-n, --dry-run`: Preview changes without syncing
-- `-v, --verbose`: Show detailed output
-- `-l, --list`: List all configured jobs
+- `--parallelism N`: Override the concurrent worker limit
+- `sync [JOB...]`: Sync all jobs or selected jobs
+- `status`: Show latest job state and systemd timer state
+- `prune [--apply] [JOB...]`: Preview deletions, or apply them
+- `tui`: Review jobs/downloads; use Tab, arrows, `d` (file), `s` (season), `S` (show), and `y` to clear tracked files
 - `-h, --help`: Show help message
 - `--version`: Show version
 
@@ -572,13 +576,13 @@ The active configuration file path is displayed when jellysync runs.
 **Examples:**
 ```bash
 # Use default search order
-./jellysync --list
+jellysync config
 
 # Use specific config file
-./jellysync --config /path/to/config.yaml
+jellysync --config /path/to/config.yaml config
 
 # Use environment variable
-JELLYSYNC_CONFIG=~/my-config.yaml ./jellysync
+JELLYSYNC_CONFIG=~/my-config.yaml jellysync config
 ```
 
 ## Environment Variables
@@ -595,11 +599,11 @@ JELLYSYNC_CONFIG=~/my-config.yaml ./jellysync
 
 ### Rsync Options
 
-The tool uses these rsync options:
+The Rust tool uses these rsync options:
 - `-a`: Archive mode (preserves permissions, timestamps, etc.)
 - `-v`: Verbose output (or `--info=progress2` in non-verbose mode)
 - `-z`: Compress during transfer
-- `--delete`: Remove files from destination that don't exist in source
+- `--partial`: Keep interrupted transfers so a later run can resume them
 
 ## Examples
 
@@ -615,18 +619,17 @@ The tool uses these rsync options:
 
 ### Preview Changes
 ```bash
-./jellysync --dry-run --verbose
+jellysync prune
 ```
 
 ### Sync Multiple Specific Jobs
 ```bash
-./jellysync pluribus "The Penguin"
+jellysync sync pluribus "The Penguin"
 ```
 
 ## Requirements
 
-- `bash` 4.0+
-- `yq` (Go version: https://github.com/mikefarah/yq)
+- Jellysync Rust executable
 - `rsync`
 - `ssh` access to remote server
 - SSH key authentication recommended
@@ -636,8 +639,7 @@ The tool uses these rsync options:
 ## Tips
 
 - Set up SSH key authentication to avoid password prompts
-- Use `--dry-run` first to preview changes
-- The `--delete` flag removes files locally that don't exist remotely
+- Use `jellysync prune` to preview deletions before applying them
 - Absolute paths in `local.directories` override the `local.root`
 
 ## License

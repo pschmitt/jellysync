@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl compiler
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y clang-18
+      - uses: nttld/setup-ndk@v1
+        if: matrix.target == 'aarch64-linux-android'
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+      - uses: cargo-bins/cargo-binstall@main
+        if: matrix.target == 'aarch64-linux-android'
+      - name: Install cargo-ndk
+        if: matrix.target == 'aarch64-linux-android'
+        run: cargo binstall --no-confirm --force cargo-ndk
+      - name: Build musl binary
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: TARGET_CC=clang-18 TARGET_AR=llvm-ar-18 cargo build --locked --release --target ${{ matrix.target }}
+      - name: Build Android binary
+        if: matrix.target == 'aarch64-linux-android'
+        run: cargo ndk --target aarch64-linux-android --platform 24 -- build --locked --release
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Build binary
+        if: matrix.target != 'x86_64-unknown-linux-musl' && matrix.target != 'aarch64-linux-android'
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package release archive
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          package="jellysync-${version}-${{ matrix.target }}"
+          mkdir "$package"
+          cp "target/${{ matrix.target }}/release/jellysync" "$package/"
+          cp README.md LICENSE "$package/"
+          tar -czf "${package}.tar.gz" "$package"
+          sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: jellysync-*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Generate aggregate checksums
+        run: cd dist && sha256sum -- *.tar.gz > SHA256SUMS
+      - name: Verify release assets
+        run: cd dist && sha256sum --check SHA256SUMS
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

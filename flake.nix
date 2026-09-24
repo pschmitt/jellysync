@@ -1,5 +1,5 @@
 {
-  description = "A bash tool to sync files from an SSH server to local directories";
+  description = "Sync Jellyfin media from rsync/SSH or Jellyfin HTTP";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -22,6 +22,12 @@
           ...
         }:
         let
+          inherit (lib)
+            literalExpression
+            mkIf
+            mkOption
+            types
+            ;
           cfg = config.services.jellysync;
           defaultPkg = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
           yamlFormat = pkgs.formats.yaml { };
@@ -52,6 +58,12 @@
               rsyncConfig = lib.optionalAttrs (cfg.settings.rsync != null) {
                 inherit (cfg.settings) rsync;
               };
+              transferConfig = {
+                download = {
+                  mode = cfg.settings.downloadMode;
+                };
+                parallelism = cfg.settings.parallelism;
+              };
               jobsConfig =
                 if (cfg.settings.jobs != null && cfg.settings.jobs != { }) then
                   {
@@ -60,50 +72,66 @@
                 else
                   { };
             in
-            yamlFormat.generate "jellysync-config.yaml" (baseConfig // libConfig // rsyncConfig // jobsConfig);
+            yamlFormat.generate "jellysync-config.yaml" (
+              baseConfig // libConfig // rsyncConfig // transferConfig // jobsConfig
+            );
         in
-        with lib;
         {
           options.services.jellysync = {
-            enable = mkEnableOption "jellysync file synchronization service";
+            enable = lib.mkEnableOption "jellysync file synchronization service";
 
-            package = mkOption {
-              type = types.package;
+            package = lib.mkOption {
+              type = lib.types.package;
               default = defaultPkg;
               defaultText = literalExpression "inputs.jellysync.packages.\${pkgs.stdenv.hostPlatform.system}.default";
               description = "The jellysync package to use.";
             };
 
             settings = {
-              remote = mkOption {
-                type = types.submodule {
+              downloadMode = lib.mkOption {
+                type = lib.types.enum [
+                  "rsync"
+                  "jellyfin"
+                ];
+                default = "jellyfin";
+                description = "Download files through rsync over SSH or directly from Jellyfin.";
+              };
+
+              parallelism = lib.mkOption {
+                type = lib.types.ints.positive;
+                default = 2;
+                description = "Maximum number of jobs downloaded concurrently.";
+              };
+
+              remote = lib.mkOption {
+                type = lib.types.submodule {
                   options = {
-                    hostname = mkOption {
-                      type = types.str;
+                    hostname = lib.mkOption {
+                      type = lib.types.str;
                       description = "Remote SSH hostname.";
                       example = "jellyfin.example.com";
                     };
 
-                    username = mkOption {
-                      type = types.str;
+                    username = lib.mkOption {
+                      type = lib.types.str;
                       description = "Remote SSH username.";
                       example = "jelly";
                     };
 
-                    port = mkOption {
-                      type = types.port;
+                    port = lib.mkOption {
+                      type = lib.types.port;
                       default = 22;
                       description = "Remote SSH port.";
                     };
 
-                    root = mkOption {
-                      type = types.str;
+                    root = lib.mkOption {
+                      type = lib.types.str;
                       description = "Remote root directory (all remote paths are relative to this).";
                       example = "/mnt/data/videos";
                     };
 
-                    directories = mkOption {
-                      type = types.attrsOf types.str;
+                    directories = lib.mkOption {
+                      type = lib.types.attrsOf lib.types.str;
                       default = { };
                       description = "Named remote directory mappings (relative to root).";
                       example = {
@@ -116,17 +144,17 @@
                 description = "Remote server configuration.";
               };
 
-              local = mkOption {
-                type = types.submodule {
+              local = lib.mkOption {
+                type = lib.types.submodule {
                   options = {
-                    root = mkOption {
-                      type = types.str;
+                    root = lib.mkOption {
+                      type = lib.types.str;
                       description = "Local root directory (all local paths are relative to this).";
                       example = "~/Videos";
                     };
 
-                    directories = mkOption {
-                      type = types.attrsOf types.str;
+                    directories = lib.mkOption {
+                      type = lib.types.attrsOf lib.types.str;
                       default = { };
                       description = "Named local directory mappings (relative to root or absolute).";
                       example = {
@@ -139,23 +167,23 @@
                 description = "Local directory configuration.";
               };
 
-              jellyfin = mkOption {
-                type = types.nullOr (
-                  types.submodule {
+              jellyfin = lib.mkOption {
+                type = lib.types.nullOr (
+                  lib.types.submodule {
                     options = {
-                      base_url = mkOption {
-                        type = types.str;
+                      base_url = lib.mkOption {
+                        type = lib.types.str;
                         description = "Jellyfin server base URL.";
                         example = "https://jellyfin.example.com";
                       };
 
-                      username = mkOption {
-                        type = types.str;
+                      username = lib.mkOption {
+                        type = lib.types.str;
                         description = "Jellyfin user used to query watched status.";
                       };
 
-                      password_file = mkOption {
-                        type = types.str;
+                      password_file = lib.mkOption {
+                        type = lib.types.str;
                         description = "Path to a file containing the Jellyfin user's password.";
                       };
                     };
@@ -199,7 +227,6 @@
                           "-a"
                           "-v"
                           "-z"
-                          "--delete"
                         ];
                         description = "Custom rsync flags.";
                       };
@@ -333,7 +360,7 @@
                         else
                           "";
                     in
-                    "${cfg.package}/bin/jellysync ${jobArgs}";
+                    "${cfg.package}/bin/jellysync sync ${jobArgs}";
                 };
               };
 
@@ -359,48 +386,32 @@
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        version = "0.1.0";
-        dependencies = with pkgs; [
-          bash
-          curl
-          jq
-          yq-go
-          rsync
-          openssh
-        ];
+        version = "1.1.0";
+        runtimeInputs = [
+          pkgs.rsync
+          pkgs.openssh
+        ]
+        ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.systemd ];
       in
       {
-        packages.default = pkgs.stdenv.mkDerivation {
+        packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "jellysync";
           inherit version;
-
           src = ./.;
-
+          cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ pkgs.makeWrapper ];
-
-          buildInputs = dependencies;
-
-          dontBuild = true;
-
-          installPhase = ''
-            runHook preInstall
-
-            mkdir -p $out/bin
-            install -Dm755 jellysync $out/bin/jellysync
-
+          postInstall = ''
             wrapProgram $out/bin/jellysync \
-              --prefix PATH : ${pkgs.lib.makeBinPath dependencies}
-
-            runHook postInstall
+              --prefix PATH : ${pkgs.lib.makeBinPath runtimeInputs}
           '';
 
           meta = {
-            description = "Sync files from SSH server to local directories with flexible YAML configuration";
+            description = "Sync Jellyfin media from rsync/SSH or Jellyfin HTTP";
             homepage = "https://github.com/pschmitt/jellysync";
             license = pkgs.lib.licenses.gpl3Only;
             maintainers = with pkgs.lib.maintainers; [ pschmitt ];
             mainProgram = "jellysync";
-            platforms = pkgs.lib.platforms.unix;
+            platforms = pkgs.lib.platforms.linux;
           };
         };
 
@@ -409,14 +420,14 @@
 
         # Development shell
         devShells.default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${system}.default ];
-          packages =
-            (with pkgs; [
-              # linting tools
-              shellcheck
-              statix
-            ])
-            ++ dependencies;
+          packages = with pkgs; [
+            cargo
+            rustc
+            rustfmt
+            clippy
+            rsync
+            openssh
+          ];
         };
       }
     )

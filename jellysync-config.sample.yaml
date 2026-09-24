@@ -41,15 +41,21 @@ library:
   # episode_pattern: "S[0-9]+E$episode_number"       # Matches "S01E01" pattern
 
 # Optional: Custom rsync flags
-# If not specified, defaults to: -a -v -z --delete
+# If not specified, defaults to: -a -v -z
 rsync:
   flags:
     - -a
     - -v
     - -z
-    - --delete
     # - --progress
     # - --bwlimit=10000
+
+# Optional: choose where file data is downloaded from (default: jellyfin)
+download:
+  mode: jellyfin # jellyfin (HTTP, default) or rsync (SSH)
+
+# Optional: number of concurrent jobs (default: 2)
+parallelism: 2
 
 jobs:
   # Sync all of pluribus
@@ -90,10 +96,6 @@ jobs:
   - name: "The Paper"
     directory: tv_shows
     seasons: "latest" # only the latest season
-
-  - name: "South Park"
-    directory: tv_shows
-    seasons: [1, 2, 25] # seasons 1, 2 and 25
 
   - name: "Modern Family"
     directory: tv_shows

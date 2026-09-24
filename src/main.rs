@@ -2316,7 +2316,7 @@ async fn tui(config: Config) -> Result<()> {
                         Line::from(vec![
                             Span::styled("● ", state_style(&entry.status)),
                             Span::styled(
-                                truncate(&filename, download_text_width),
+                                truncate_near_end(&filename, download_text_width),
                                 Style::default()
                                     .fg(Color::White)
                                     .add_modifier(Modifier::BOLD),
@@ -3517,6 +3517,23 @@ fn truncate(value: &str, max_chars: usize) -> String {
                 .collect::<String>()
         )
     }
+}
+
+/// Ellipsize near the end so the start of the name and the tail (episode tag and
+/// extension, e.g. "S01E05.mkv") both stay visible.
+fn truncate_near_end(value: &str, max_chars: usize) -> String {
+    const TAIL_CHARS: usize = 12;
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let tail = TAIL_CHARS.min(keep / 2);
+    let head = keep - tail;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

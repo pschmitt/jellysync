@@ -45,8 +45,12 @@ declare -gA LOCAL=()
 declare -gA REMOTE_DIRS=()
 declare -gA LOCAL_DIRS=()
 declare -gA LIBRARY=()
+declare -gA JELLYFIN=()
 declare -ga JOBS=()
 declare -ga RSYNC_OPTS=()
+JELLYFIN_UNWATCHED_PATHS=
+JELLYFIN_UNWATCHED_LOADED=
+JELLYFIN_TMP_DIR=
 DRY_RUN=
 VERBOSE=
 
@@ -200,6 +204,42 @@ load_config() {
   # shellcheck disable=SC2016
   LIBRARY[episode_pattern]=$(yq '.library.episode_pattern // "E$episode_number"' "$CONFIG_FILE" 2>/dev/null)
 
+  # Parse optional Jellyfin settings
+  local jellyfin_enabled
+  jellyfin_enabled=$(yq '(.jellyfin // null) != null' "$CONFIG_FILE" 2>/dev/null)
+  if [[ "$jellyfin_enabled" == "true" ]]
+  then
+    if ! JELLYFIN[base_url]=$(yq '.jellyfin.base_url // ""' "$CONFIG_FILE" 2>/dev/null)
+    then
+      log_error "Failed to parse jellyfin.base_url from config"
+      return 1
+    fi
+
+    if ! JELLYFIN[username]=$(yq '.jellyfin.username // ""' "$CONFIG_FILE" 2>/dev/null)
+    then
+      log_error "Failed to parse jellyfin.username from config"
+      return 1
+    fi
+
+    if ! JELLYFIN[password_file]=$(yq '.jellyfin.password_file // ""' "$CONFIG_FILE" 2>/dev/null)
+    then
+      log_error "Failed to parse jellyfin.password_file from config"
+      return 1
+    fi
+
+    if [[ -z "${JELLYFIN[base_url]}" || -z "${JELLYFIN[username]}" || -z "${JELLYFIN[password_file]}" ]]
+    then
+      log_error "Jellyfin settings require base_url, username, and password_file"
+      return 1
+    fi
+
+    if ! command -v curl &>/dev/null || ! command -v jq &>/dev/null
+    then
+      log_error "Jellyfin watched-state filtering requires curl and jq"
+      return 1
+    fi
+  fi
+
   # Parse jobs
   local job_count
   local i
@@ -208,6 +248,7 @@ load_config() {
   local local_dir
   local directory
   local wildcard
+  local unwatched
   local episodes
   local job_data
   if ! job_count=$(yq '.jobs | length' "$CONFIG_FILE" 2>/dev/null)
@@ -230,6 +271,7 @@ load_config() {
     seasons=$(yq ".jobs[$i].seasons // \"\"" "$CONFIG_FILE" 2>/dev/null)
     episodes=$(yq ".jobs[$i].episodes // \"\"" "$CONFIG_FILE" 2>/dev/null)
     wildcard=$(yq ".jobs[$i].wildcard // false" "$CONFIG_FILE" 2>/dev/null)
+    unwatched=$(yq ".jobs[$i].unwatched // false" "$CONFIG_FILE" 2>/dev/null)
 
     job_data="name=${job_name}"
     if [[ -n "$remote_dir" && "$remote_dir" != "null" ]]
@@ -260,6 +302,16 @@ load_config() {
     if [[ "$wildcard" == "true" ]]
     then
       job_data+="|wildcard=1"
+    fi
+
+    if [[ "$unwatched" == "true" ]]
+    then
+      if [[ "$jellyfin_enabled" != "true" ]]
+      then
+        log_error "Job '$job_name' enables unwatched filtering but Jellyfin is not configured"
+        return 1
+      fi
+      job_data+="|unwatched=1"
     fi
 
     JOBS+=("$job_data")
@@ -489,6 +541,167 @@ extract_season_number() {
   return 1
 }
 
+cleanup_jellyfin_tmp_dir() {
+  if [[ -n "$JELLYFIN_TMP_DIR" && -d "$JELLYFIN_TMP_DIR" ]]
+  then
+    rm -rf -- "$JELLYFIN_TMP_DIR"
+  fi
+}
+
+load_jellyfin_session() {
+  local username_json
+  local password_json
+  local auth_request_file
+  local auth_response
+  local access_token
+  local user_id
+  local auth_header_file
+
+  if [[ -n "${JELLYFIN[auth_header_file]:-}" ]]
+  then
+    return 0
+  fi
+
+  if [[ ! -r "${JELLYFIN[password_file]}" ]]
+  then
+    log_error "Cannot read Jellyfin password file: ${JELLYFIN[password_file]}"
+    return 1
+  fi
+
+  if ! JELLYFIN_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/jellysync.XXXXXX")
+  then
+    log_error "Failed to create temporary directory for Jellyfin authentication"
+    return 1
+  fi
+  chmod 700 "$JELLYFIN_TMP_DIR"
+  trap cleanup_jellyfin_tmp_dir EXIT
+
+  auth_request_file="$JELLYFIN_TMP_DIR/auth.json"
+  auth_header_file="$JELLYFIN_TMP_DIR/headers.conf"
+  username_json=$(jq -Rn --arg username "${JELLYFIN[username]}" '$username')
+  if ! password_json=$(jq -Rs . < "${JELLYFIN[password_file]}")
+  then
+    log_error "Failed to encode Jellyfin password"
+    return 1
+  fi
+
+  if ! printf '{"Username":%s,"Pw":%s}\n' "$username_json" "$password_json" > "$auth_request_file"
+  then
+    log_error "Failed to prepare Jellyfin authentication request"
+    return 1
+  fi
+  unset password_json
+
+  if ! auth_response=$(curl --fail --silent --show-error \
+    --request POST \
+    --header 'Content-Type: application/json' \
+    --header "X-Emby-Authorization: MediaBrowser Client=\"jellysync\", Device=\"jellysync\", DeviceId=\"jellysync\", Version=\"$VERSION\"" \
+    --data-binary "@$auth_request_file" \
+    "${JELLYFIN[base_url]%/}/Users/AuthenticateByName")
+  then
+    log_error "Jellyfin authentication request failed"
+    return 1
+  fi
+
+  if ! access_token=$(jq -er '.AccessToken | select(type == "string" and length > 0)' <<< "$auth_response")
+  then
+    log_error "Jellyfin authentication response did not contain an access token"
+    return 1
+  fi
+
+  if ! user_id=$(jq -er '.User.Id | select(type == "string" and length > 0)' <<< "$auth_response")
+  then
+    log_error "Jellyfin authentication response did not contain a user ID"
+    return 1
+  fi
+  unset auth_response
+
+  if ! printf 'header = "X-Emby-Token: %s"\n' "$access_token" > "$auth_header_file"
+  then
+    log_error "Failed to prepare Jellyfin API request headers"
+    return 1
+  fi
+  chmod 600 "$auth_header_file"
+  unset access_token
+
+  JELLYFIN[auth_header_file]="$auth_header_file"
+  JELLYFIN[user_id]="$user_id"
+  JELLYFIN[base_url]="${JELLYFIN[base_url]%/}"
+}
+
+load_jellyfin_unwatched_paths() {
+  local endpoint
+  local response
+  local offset=0
+  local page_size=1000
+  local total_count=1
+  local page_count
+  local page_paths
+
+  if [[ -n "$JELLYFIN_UNWATCHED_LOADED" ]]
+  then
+    return 0
+  fi
+
+  if ! load_jellyfin_session
+  then
+    return 1
+  fi
+
+  endpoint="${JELLYFIN[base_url]}/Users/${JELLYFIN[user_id]}/Items"
+  JELLYFIN_UNWATCHED_PATHS=
+
+  while (( offset < total_count ))
+  do
+    if ! response=$(curl --fail --silent --show-error \
+      --config "${JELLYFIN[auth_header_file]}" \
+      --get "$endpoint" \
+      --data-urlencode 'Recursive=true' \
+      --data-urlencode 'IncludeItemTypes=Episode' \
+      --data-urlencode 'Filters=IsUnplayed' \
+      --data-urlencode 'Fields=Path' \
+      --data-urlencode "StartIndex=$offset" \
+      --data-urlencode "Limit=$page_size")
+    then
+      log_error "Failed to query unwatched episodes from Jellyfin"
+      return 1
+    fi
+
+    if ! page_count=$(jq -er '.TotalRecordCount | numbers' <<< "$response")
+    then
+      log_error "Jellyfin response did not contain a valid item count"
+      return 1
+    fi
+
+    if ! page_paths=$(jq -er '.Items[]? | .Path | strings' <<< "$response")
+    then
+      page_paths=
+    fi
+
+    if [[ -n "$page_paths" ]]
+    then
+      if [[ -n "$JELLYFIN_UNWATCHED_PATHS" ]]
+      then
+        JELLYFIN_UNWATCHED_PATHS+=$'\n'
+      fi
+      JELLYFIN_UNWATCHED_PATHS+="$page_paths"
+    fi
+
+    total_count="$page_count"
+    offset=$((offset + page_size))
+  done
+
+  if ! curl --fail --silent --show-error \
+    --config "${JELLYFIN[auth_header_file]}" \
+    --request POST \
+    "${JELLYFIN[base_url]}/Sessions/Logout" >/dev/null
+  then
+    log_warning "Could not close the Jellyfin API session"
+  fi
+
+  JELLYFIN_UNWATCHED_LOADED=1
+}
+
 # Get season directories from remote server
 get_remote_seasons() {
   local remote_full="$1"
@@ -566,6 +779,7 @@ sync_job_with_episodes() {
   local episode_num
   local include_patterns
   local rsync_opts
+  local unwatched_paths
 
   # Get available episodes from remote
   if ! available_episodes=$(get_remote_episodes "$remote_season")
@@ -582,7 +796,29 @@ sync_job_with_episodes() {
   fi
 
   # Parse episodes specification
-  if [[ "$episodes_spec" =~ ^\[ ]]
+  if [[ "$episodes_spec" == "unwatched" ]]
+  then
+    if ! load_jellyfin_unwatched_paths
+    then
+      return 1
+    fi
+
+    unwatched_paths="$JELLYFIN_UNWATCHED_PATHS"
+    episode_files=
+    while IFS= read -r episode_file
+    do
+      if [[ -n "$episode_file" ]] && grep -Fqx -- "$episode_file" <<< "$unwatched_paths"
+      then
+        episode_files+="${episode_file}"$'\n'
+      fi
+    done <<< "$available_episodes"
+
+    if [[ -z "$episode_files" ]]
+    then
+      log "No unwatched episodes matched in: $remote_season"
+      return 0
+    fi
+  elif [[ "$episodes_spec" =~ ^\[ ]]
   then
     local episode_list
     episode_list=$(echo "$episodes_spec" | sed 's/[][]//g' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -798,7 +1034,12 @@ sync_job_with_seasons() {
 
   if [[ -n "$episodes_spec" ]]
   then
-    filter_desc="with season and episode filter"
+    if [[ "$episodes_spec" == "unwatched" ]]
+    then
+      filter_desc="with unwatched-episode filter"
+    else
+      filter_desc="with season and episode filter"
+    fi
   fi
 
   log "Syncing job: ${GREEN}${job_name}${NC} ($filter_desc)"
@@ -841,6 +1082,9 @@ sync_job_with_seasons() {
         done <<< "$available_seasons"
       fi
     done <<< "$season_list"
+  elif [[ "$seasons_spec" == "all" ]]
+  then
+    season_dirs="$available_seasons"
   elif [[ "$seasons_spec" == "latest" ]]
   then
     season_dirs=$(echo "$available_seasons" | tail -1)
@@ -1026,6 +1270,7 @@ sync_job() {
   local seasons=""
   local episodes=""
   local wildcard=""
+  local unwatched=""
   local pairs
   local pair
   local key
@@ -1058,6 +1303,9 @@ sync_job() {
         wildcard)
           wildcard="$value"
           ;;
+        unwatched)
+          unwatched="$value"
+          ;;
       esac
     done
   done <<< "$job_data"
@@ -1065,6 +1313,20 @@ sync_job() {
   if [[ -z "$job_name" ]]
   then
     return 1
+  fi
+
+  if [[ -n "$unwatched" ]]
+  then
+    if [[ -n "$episodes" ]]
+    then
+      log_error "Job '$job_name' cannot combine unwatched with an episodes filter"
+      return 1
+    fi
+    if [[ -z "$seasons" ]]
+    then
+      seasons="all"
+    fi
+    episodes="unwatched"
   fi
 
   # Handle shorthand "directory" syntax

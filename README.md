@@ -149,7 +149,7 @@ schedule = "Mon *-*-* 02:00:00";
 ### Manual Installation
 
 1. Clone this repository
-2. Ensure dependencies are installed: `bash`, `yq` (Go version), `rsync`, `ssh`
+2. Ensure dependencies are installed: `bash`, `curl`, `jq`, `yq` (Go version), `rsync`, `ssh`
 3. Copy `jellysync-config.sample.yaml` to `jellysync.yaml` and configure it
 4. Run `./jellysync`
 
@@ -180,6 +180,13 @@ local:
     movies: Movies
     documentaries: ~/Documentaries
 
+# Required only for jobs with unwatched: true. Keep the password in a secret
+# file and point password_file at it; never put the password in this config.
+jellyfin:
+  base_url: https://jellyfin.example.com
+  username: jelly
+  password_file: /run/secrets/jellyfin/password
+
 library:
   season_pattern: "Season $season_number"
 
@@ -209,6 +216,22 @@ jobs:
   - name: Andor
     directory: tv_shows
     seasons: "1-10"
+
+  # Sync only episodes marked unplayed by this Jellyfin user
+  - name: South Park
+    directory: tv_shows
+    seasons: latest-2
+    unwatched: true
+
+  # Sync the latest season
+  - name: Slow Horses
+    directory: tv_shows
+    seasons: latest
+
+  # Sync season 13 and any later seasons
+  - name: American Horror Story
+    directory: tv_shows
+    seasons: "13-9999"
 
   # Sync specific seasons of Breaking Bad (list)
   - name: "Breaking Bad"
@@ -271,6 +294,18 @@ local:
     movies: Movies                 # Relative -> ~/Videos/Movies
     documentaries: ~/Documentaries # Absolute -> ~/Documentaries
 ```
+
+#### Jellyfin Section
+
+Required only when a job uses `unwatched: true`. Jellysync authenticates as the configured user, queries that user's unplayed episode paths, and syncs matching files. Store the password in a separate readable file, such as a SOPS-managed secret.
+
+| Setting | Required | Description |
+|---------|----------|-------------|
+| `base_url` | Yes | Jellyfin server base URL, without a trailing slash |
+| `username` | Yes | Jellyfin account used to check watched status |
+| `password_file` | Yes | Path to a file containing that account's password |
+
+The access token is kept in a private temporary directory for the run. Jellysync closes the API session after it fetches the unplayed episode paths.
 
 #### Library Section
 
@@ -366,6 +401,7 @@ Each job defines a sync operation.
 | `seasons` | No | string or array | Season filter: `"latest"`, `"1-10"`, or `[1, 2, 3]` |
 | `episodes` | No | string or array | Episode filter: `"latest"`, `"1-10"`, or `[1, 2, 3]` |
 | `wildcard` | No | boolean | If `true`, adds `*name*` pattern to remote path |
+| `unwatched` | No | boolean | If `true`, syncs episodes marked unplayed by the configured Jellyfin user |
 
 **Season Filtering:**
 
@@ -400,6 +436,8 @@ The `episodes` option allows selective syncing of episodes within seasons:
 - Can be combined with `seasons` to filter both seasons and episodes
 - Can be used without `seasons` for single-directory content
 - Pattern must match actual file names on remote server
+- `unwatched: true` requires the Jellyfin section and cannot be combined with `episodes`; it can be combined with `seasons`
+- If `seasons` is omitted, `unwatched: true` scans all seasons
 
 **Syntax options:**
 

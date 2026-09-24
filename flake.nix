@@ -42,6 +42,9 @@
             let
               baseConfig = {
                 inherit (cfg.settings) remote local;
+              }
+              // lib.optionalAttrs (cfg.settings.jellyfin != null) {
+                inherit (cfg.settings) jellyfin;
               };
               libConfig = lib.optionalAttrs (cfg.settings.library != null) {
                 inherit (cfg.settings) library;
@@ -134,6 +137,32 @@
                   };
                 };
                 description = "Local directory configuration.";
+              };
+
+              jellyfin = mkOption {
+                type = types.nullOr (
+                  types.submodule {
+                    options = {
+                      base_url = mkOption {
+                        type = types.str;
+                        description = "Jellyfin server base URL.";
+                        example = "https://jellyfin.example.com";
+                      };
+
+                      username = mkOption {
+                        type = types.str;
+                        description = "Jellyfin user used to query watched status.";
+                      };
+
+                      password_file = mkOption {
+                        type = types.str;
+                        description = "Path to a file containing the Jellyfin user's password.";
+                      };
+                    };
+                  }
+                );
+                default = null;
+                description = "Jellyfin authentication for watched-state filtering.";
               };
 
               library = mkOption {
@@ -235,6 +264,12 @@
                         default = null;
                         description = "Enable wildcard matching (*name*).";
                       };
+
+                      unwatched = mkOption {
+                        type = types.nullOr types.bool;
+                        default = null;
+                        description = "Sync only episodes marked unplayed for the configured Jellyfin user.";
+                      };
                     };
                   }
                 );
@@ -327,6 +362,8 @@
         version = "0.1.0";
         dependencies = with pkgs; [
           bash
+          curl
+          jq
           yq-go
           rsync
           openssh

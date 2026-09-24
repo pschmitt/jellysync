@@ -15,6 +15,12 @@ local:
     movies: Movies
     documentaries: ~/Documentaries
 
+# Required only for jobs with unwatched: true. Use a secret file for passwords.
+jellyfin:
+  base_url: https://jellyfin.example.com
+  username: jelly
+  password_file: /run/secrets/jellyfin/password
+
 # Optional: Library settings
 library:
   # Season directory pattern
@@ -63,6 +69,19 @@ jobs:
   - name: Andor
     directory: tv_shows
     seasons: "1-10" # seasons 1 to 10 (string with range)
+
+  - name: South Park
+    directory: tv_shows
+    seasons: latest-2
+    unwatched: true # only episodes marked unplayed by Jellyfin
+
+  - name: Slow Horses
+    directory: tv_shows
+    seasons: latest
+
+  - name: American Horror Story
+    directory: tv_shows
+    seasons: "13-9999" # season 13 and later
 
   - name: "Breaking Bad"
     directory: tv_shows

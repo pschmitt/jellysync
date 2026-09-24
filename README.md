@@ -184,7 +184,7 @@ In Explore, `Tab`, `→` or `Enter` moves focus from the library to the details
 pane of the selected show; there, `↑`/`↓` move through episodes, `Space`
 selects one, `a` selects all, and `d` or `Enter` downloads the selection
 (`Enter` on a movie downloads it). In the library pane every printable key goes to the search; `Ctrl-F` cycles the type filter. `Tab`, `←` or `Esc` returns to the
-library and `q` closes Explore; after closing Explore, the main view selects the job and file you just
+library and `q` closes Explore from the details pane (in the library pane `q` goes to the search); after closing Explore, the main view selects the job and file you just
 queued.
 
 When the terminal is tall enough, a Details panel sits above the Files list:
@@ -204,7 +204,12 @@ Use `--config FILE` to select a config and `-j N` (`--parallelism`, `--parallel`
 
 `Ctrl-C` closes the open dialog (help, job config, file info, clear
 confirmation, Explore) without counting towards quitting; two more `Ctrl-C`
-presses in the main view quit.
+presses in the main view quit, as does `q`. `Esc` only closes dialogs. Dialogs
+are modal: keys and clicks other than their own do nothing while one is open.
+`PgUp`/`PgDn`/`Home`/`End` jump through the focused list, and the footer only
+lists keys that apply to the focused panel. The clear confirmation names the
+exact files it will delete (fixed when you press `x`/`X`/`c`); `X` clears the
+season group shown in the list. Footer notices disappear after a few seconds.
 
 ### Development
 

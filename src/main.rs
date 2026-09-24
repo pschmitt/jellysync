@@ -412,6 +412,9 @@ struct MediaProbe {
 type ProbeTask = tokio::task::JoinHandle<Result<MediaProbe>>;
 /// Files probed in the background at once for the Files list badges.
 const PROBE_CONCURRENCY: usize = 4;
+/// How long a successful footer notice stays; failures stay twice as long.
+const NOTICE_TTL: Duration = Duration::from_secs(8);
+const QUIT_HINT: &str = "Press Ctrl-C again to quit";
 struct EpisodeInfo {
     season: Option<u32>,
     episode: Option<u32>,
@@ -429,6 +432,8 @@ struct JobDetails {
     poster: Option<StatefulProtocol>,
 }
 type JobDetailsTask = tokio::task::JoinHandle<Result<JobDetails>>;
+/// A list index together with the identity (job name or item id) it pointed at.
+type Anchor = (usize, String);
 /// A row in the Files list: a season heading or an index into the file list.
 enum FileRow {
     Season(String),
@@ -2048,7 +2053,7 @@ async fn prune(config: Config, target: Vec<String>, apply: bool, json_output: bo
                     if !json_output {
                         println!("pruning {}", entry.path.display());
                     }
-                    clear_tracked(&config, entry, ClearScope::File)?;
+                    clear_tracked(&config, std::slice::from_ref(entry))?;
                 } else if !json_output {
                     println!("would prune {}", entry.path.display());
                 }
@@ -2093,11 +2098,116 @@ async fn prune(config: Config, target: Vec<String>, apply: bool, json_output: bo
     }
     Ok(())
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum ClearScope {
     File,
     Season,
     Show,
+}
+
+/// A pending clear: the exact files it removes are fixed when it is requested,
+/// so list refreshes or re-sorting before the confirmation cannot change them.
+struct ClearRequest {
+    scope: ClearScope,
+    job: String,
+    adhoc: bool,
+    targets: Vec<DownloadEntry>,
+    label: String,
+}
+
+/// Build a clear request for the selected job, or None when there is nothing to clear.
+fn clear_request(
+    scope: ClearScope,
+    job: &TuiJob,
+    downloads: &[DownloadEntry],
+    rows: &[FileRow],
+    selected: usize,
+) -> Option<ClearRequest> {
+    let files = |count: usize| format!("{count} {}", if count == 1 { "file" } else { "files" });
+    let show = job.name.trim_start_matches("library:");
+    let (targets, label) = match scope {
+        ClearScope::File => {
+            let entry = downloads.get(selected)?;
+            (
+                vec![entry.clone()],
+                entry
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+        ClearScope::Season => {
+            let targets: Vec<_> = season_files(rows, downloads, selected)
+                .into_iter()
+                .map(|index| downloads[index].clone())
+                .collect();
+            let position = rows
+                .iter()
+                .position(|row| matches!(row, FileRow::File(index) if *index == selected))?;
+            let season = rows[..position].iter().rev().find_map(|row| match row {
+                FileRow::Season(label) => Some(label.clone()),
+                FileRow::File(_) => None,
+            });
+            let label = match season {
+                Some(season) => format!("{show} · {season} ({})", files(targets.len())),
+                None => format!("{show} · this folder ({})", files(targets.len())),
+            };
+            (targets, label)
+        }
+        ClearScope::Show => {
+            // An ad-hoc job without files can still be removed from the list.
+            if downloads.is_empty() && !job.adhoc {
+                return None;
+            }
+            (
+                downloads.to_vec(),
+                format!("{show} · all {}", files(downloads.len())),
+            )
+        }
+    };
+    if targets.is_empty() && scope != ClearScope::Show {
+        return None;
+    }
+    Some(ClearRequest {
+        scope,
+        job: job.name.clone(),
+        adhoc: job.adhoc,
+        targets,
+        label,
+    })
+}
+
+/// Indices of the files in the same season group as the file at `selected`.
+/// Without season headings, files sharing its folder form the group.
+fn season_files(rows: &[FileRow], downloads: &[DownloadEntry], selected: usize) -> Vec<usize> {
+    let Some(position) = rows
+        .iter()
+        .position(|row| matches!(row, FileRow::File(index) if *index == selected))
+    else {
+        return Vec::new();
+    };
+    let grouped = rows.iter().any(|row| matches!(row, FileRow::Season(_)));
+    if !grouped {
+        let folder = downloads
+            .get(selected)
+            .and_then(|entry| entry.path.parent());
+        return (0..downloads.len())
+            .filter(|index| downloads[*index].path.parent() == folder)
+            .collect();
+    }
+    let start = rows[..position]
+        .iter()
+        .rposition(|row| matches!(row, FileRow::Season(_)))
+        .map_or(0, |heading| heading + 1);
+    rows[start..]
+        .iter()
+        .map_while(|row| match row {
+            FileRow::File(index) => Some(*index),
+            FileRow::Season(_) => None,
+        })
+        .collect()
 }
 #[derive(Clone)]
 struct DownloadEntry {
@@ -2122,7 +2232,9 @@ struct TuiJob {
     adhoc: bool,
 }
 
-fn dashboard_snapshot() -> Result<DashboardSnapshot> {
+/// Jobs and transfers from the state DB; the timer state (a `systemctl` call)
+/// only when `check_timer` is set, otherwise left empty.
+fn dashboard_snapshot(check_timer: bool) -> Result<DashboardSnapshot> {
     let conn = db()?;
     let mut history = BTreeMap::new();
     let mut statement = conn.prepare("SELECT name,status,message,updated_at FROM jobs")?;
@@ -2139,13 +2251,17 @@ fn dashboard_snapshot() -> Result<DashboardSnapshot> {
         history.insert(name, (state, message.unwrap_or_default(), time));
     }
     let downloads = tracked_downloads()?;
-    let timer = std::process::Command::new("systemctl")
-        .args(["--user", "is-active", "jellysync.timer"])
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|state| !state.is_empty())
-        .unwrap_or_else(|| "unknown".into());
+    let timer = if check_timer {
+        std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "jellysync.timer"])
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|state| !state.is_empty())
+            .unwrap_or_else(|| "unknown".into())
+    } else {
+        String::new()
+    };
     Ok(DashboardSnapshot {
         history,
         downloads,
@@ -2169,34 +2285,44 @@ fn tracked_downloads() -> Result<Vec<DownloadEntry>> {
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-fn clear_tracked(config: &Config, selected: &DownloadEntry, scope: ClearScope) -> Result<usize> {
-    let root = PathBuf::from(&config.local.root)
-        .canonicalize()
-        .context("local root must exist before clearing downloads")?;
-    let parent = selected.path.parent().map(Path::to_path_buf);
-    let targets: Vec<_> = tracked_downloads()?
-        .into_iter()
-        .filter(|entry| match scope {
-            ClearScope::File => entry.item_id == selected.item_id,
-            ClearScope::Season => {
-                entry.job == selected.job && entry.path.parent() == parent.as_deref()
-            }
-            ClearScope::Show => entry.job == selected.job,
-        })
-        .collect();
-    let conn = db()?;
+/// Delete the given tracked files (and their partial data) and mark them cleared.
+fn clear_tracked(config: &Config, targets: &[DownloadEntry]) -> Result<usize> {
+    let mut roots = vec![
+        PathBuf::from(&config.local.root)
+            .canonicalize()
+            .context("local root must exist before clearing downloads")?,
+    ];
+    // Jobs may download outside local.root (absolute local_dir or directory).
     let job_names: HashSet<_> = targets.iter().map(|entry| entry.job.clone()).collect();
-    for entry in &targets {
+    for job in &job_names {
+        if let Ok(dir) = job_directory(config, job).and_then(|dir| Ok(dir.canonicalize()?)) {
+            roots.push(dir);
+        }
+    }
+    // Check every path before deleting anything so a refusal never leaves a
+    // half-cleared selection behind.
+    let mut doomed = Vec::new();
+    for entry in targets {
         let partial = PathBuf::from(format!("{}.partial", entry.path.to_string_lossy()));
         for path in [&entry.path, &partial] {
-            if path.exists() {
-                let canonical = path.canonicalize()?;
-                if canonical == root || !canonical.starts_with(&root) {
-                    bail!("refusing to clear a tracked file outside the configured local root");
-                }
-                std::fs::remove_file(canonical)?;
+            if path.symlink_metadata().is_err() {
+                continue;
             }
+            if !path_within_roots(path, &roots)? {
+                bail!(
+                    "refusing to clear {} outside the configured download directories",
+                    path.display()
+                );
+            }
+            doomed.push(path.clone());
         }
+    }
+    for path in doomed {
+        // Removes a symlink itself, never its target.
+        std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    let conn = db()?;
+    for entry in targets {
         conn.execute(
             "UPDATE transfers SET status='cleared',updated_at=datetime('now') WHERE item_id=?1",
             params![entry.item_id],
@@ -2300,10 +2426,13 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
         let mut download_focus = false;
         let mut main_split = 50u16;
         let mut resizing_split = false;
-        let mut confirm_clear = None;
+        let mut confirm_clear: Option<ClearRequest> = None;
         let mut show_help = false;
         let mut show_job_config = false;
         let mut file_info: Option<FileInfo> = None;
+        let mut file_info_entry: Option<DownloadEntry> = None;
+        // (index, job name) and (index, item id) selected when the last frame was drawn.
+        let mut selection_anchor: (Option<Anchor>, Option<Anchor>) = (None, None);
         let mut file_info_task: Option<FileInfoTask> = None;
         let mut file_meta: Option<FileMeta> = None;
         // Job and item to select in the main view once Explore closes (after a download).
@@ -2334,10 +2463,12 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
         let mut probe_tasks = HashMap::<PathBuf, ProbeTask>::new();
         let mut explore_poster_tasks = HashMap::<String, PosterTask>::new();
         let mut explore_poster_protocols = HashMap::<String, StatefulProtocol>::new();
+        let mut explore_poster_failed = HashSet::<String>::new();
         let mut preview_episode_task: Option<PreviewEpisodeTask> = None;
         let mut poster_task: Option<PosterTask> = None;
         let mut sync_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
-        let mut sync_notice = None;
+        let mut sync_notice: Option<(String, bool)> = None;
+        let mut notice_seen: Option<(String, Instant)> = None;
         let mut last_ctrl_c: Option<Instant> = None;
         let mut last_download_click: Option<(usize, Instant)> = None;
         let mut jobs_state = ListState::default();
@@ -2348,8 +2479,8 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
             timer: "unknown".into(),
             ..DashboardSnapshot::default()
         };
-        let mut dashboard_task =
-            Some(tokio::task::spawn_blocking(dashboard_snapshot));
+        let mut dashboard_task = Some(tokio::task::spawn_blocking(|| dashboard_snapshot(true)));
+        let mut timer_checked_at = Instant::now();
         let mut dashboard_refreshed_at = Instant::now();
         loop {
             terminal.autoresize()?;
@@ -2361,7 +2492,12 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     .take()
                     .expect("finished dashboard task exists");
                 match task.await {
-                    Ok(Ok(snapshot)) => dashboard = snapshot,
+                    Ok(Ok(mut snapshot)) => {
+                        if snapshot.timer.is_empty() {
+                            snapshot.timer = std::mem::take(&mut dashboard.timer);
+                        }
+                        dashboard = snapshot;
+                    }
                     Ok(Err(error)) => {
                         sync_notice = Some((format!("Could not refresh TUI status: {error:#}"), false));
                     }
@@ -2393,7 +2529,13 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
             if dashboard_task.is_none()
                 && dashboard_refreshed_at.elapsed() >= Duration::from_millis(500)
             {
-                dashboard_task = Some(tokio::task::spawn_blocking(dashboard_snapshot));
+                // The DB is cheap to poll; spawning systemctl twice a second is not.
+                let check_timer = timer_checked_at.elapsed() >= Duration::from_secs(10);
+                if check_timer {
+                    timer_checked_at = Instant::now();
+                }
+                dashboard_task =
+                    Some(tokio::task::spawn_blocking(move || dashboard_snapshot(check_timer)));
             }
             if ping_task.as_ref().is_some_and(|task| task.is_finished()) {
                 let task = ping_task.take().expect("finished ping task exists");
@@ -2403,6 +2545,12 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 online = Some(Some(reachable));
                 pinged_at = Some(Instant::now());
                 if reachable && !was_online {
+                    // Retry what failed while the connection was flaky.
+                    job_details_failed.clear();
+                    explore_poster_failed.clear();
+                    if sync_notice.as_ref().is_some_and(|(message, _)| message.starts_with("Offline:")) {
+                        sync_notice = None;
+                    }
                     if let Err(error) = resume_library_workers(&config_path) {
                         sync_notice =
                             Some((format!("Could not resume ad-hoc downloads: {error:#}"), false));
@@ -2542,6 +2690,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     .expect("finished job poster catalog task exists");
                 if let Ok(Ok((api, posters))) = task.await {
                     jellyfin_api = Some(api.clone());
+                    job_details_failed.clear();
                     for (job_name, item) in posters {
                         job_items.insert(job_name.clone(), item.clone());
                         if job_poster_protocols.contains_key(&job_name)
@@ -2622,16 +2771,22 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 let task = explore_poster_tasks
                     .remove(&item_id)
                     .expect("finished Explore poster task exists");
-                if let Ok((item_id, Ok(Some((data, protocol))))) = task.await {
-                    poster_cache.insert(item_id.clone(), data);
-                    poster_cache_order.retain(|id| id != &item_id);
-                    poster_cache_order.push_back(item_id.clone());
-                    while poster_cache_order.len() > 32 {
-                        if let Some(expired) = poster_cache_order.pop_front() {
-                            poster_cache.remove(&expired);
+                match task.await {
+                    Ok((item_id, Ok(Some((data, protocol))))) => {
+                        poster_cache.insert(item_id.clone(), data);
+                        poster_cache_order.retain(|id| id != &item_id);
+                        poster_cache_order.push_back(item_id.clone());
+                        while poster_cache_order.len() > 32 {
+                            if let Some(expired) = poster_cache_order.pop_front() {
+                                poster_cache.remove(&expired);
+                            }
                         }
+                        explore_poster_protocols.insert(item_id, protocol);
                     }
-                    explore_poster_protocols.insert(item_id, protocol);
+                    // No image or a failed request: do not ask again every frame.
+                    _ => {
+                        explore_poster_failed.insert(item_id);
+                    }
                 }
             }
             if poster_task.as_ref().is_some_and(|task| task.is_finished()) {
@@ -2696,6 +2851,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 }
                 for item in items {
                     if poster_cache.contains_key(&item.id)
+                        || explore_poster_failed.contains(&item.id)
                         || explore_poster_protocols.contains_key(&item.id)
                         || explore_poster_tasks.contains_key(&item.id)
                         || browser.poster_id.as_deref() == Some(item.id.as_str())
@@ -2787,6 +2943,14 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     });
                 }
             }
+            // Follow the selected job when jobs are added or removed around it, unless
+            // input moved the selection since the last frame.
+            if let (Some((index, name)), _) = &selection_anchor
+                && *index == selected
+                && let Some(position) = jobs.iter().position(|job| &job.name == name)
+            {
+                selected = position;
+            }
             if selected >= jobs.len() && !jobs.is_empty() {
                 selected = jobs.len() - 1;
             }
@@ -2817,6 +2981,13 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 .collect();
             let selected_details = selected_job.and_then(|job| job_details.get(&job.name));
             let rows = file_rows(&mut downloads, selected_details);
+            // Likewise keep the highlighted file when the list refreshes or re-sorts.
+            if let (_, Some((index, item_id))) = &selection_anchor
+                && *index == selected_download
+                && let Some(position) = downloads.iter().position(|entry| &entry.item_id == item_id)
+            {
+                selected_download = position;
+            }
             if let Some(job) = selected_job
                 && online != Some(Some(false))
                 && !job_details.contains_key(&job.name)
@@ -3323,10 +3494,16 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 let visible_lines = usize::from(downloads_area.height.saturating_sub(2));
                 let total_lines: usize = rows.iter().map(file_row_height).sum();
                 if total_lines > visible_lines {
-                    let mut scrollbar_state = ScrollbarState::new(
-                        rows.len().saturating_sub(visible_lines / 3),
-                    )
-                    .position(downloads_state.offset());
+                    // Measured in lines: rows differ in height (headings are one line).
+                    let scrolled: usize = rows
+                        .iter()
+                        .take(downloads_state.offset())
+                        .map(file_row_height)
+                        .sum();
+                    let mut scrollbar_state =
+                        ScrollbarState::new(total_lines.saturating_sub(visible_lines))
+                            .position(scrolled)
+                            .viewport_content_length(visible_lines);
                     frame.render_stateful_widget(
                         Scrollbar::new(ScrollbarOrientation::VerticalRight)
                             .begin_symbol(None)
@@ -3482,28 +3659,17 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     ])]
                 } else {
                     let mut shortcut_spans = Vec::new();
-                    let shortcuts = if area.width < 110 {
-                        vec![
-                            ("Tab", "focus"),
-                            ("s", "sync"),
-                            ("b", "browse"),
-                            ("p", "play"),
-                            ("i", "info"),
-                            ("?", "more"),
-                            ("q", "quit"),
-                        ]
+                    // Hints follow the focused panel so every key shown does something.
+                    let mut shortcuts = vec![("Tab", "focus")];
+                    if area.width >= 110 {
+                        shortcuts.push(("↑/↓", "move"));
+                    }
+                    if download_focus && !downloads.is_empty() {
+                        shortcuts.extend([("p", "play"), ("i", "info"), ("x", "clear")]);
                     } else {
-                        vec![
-                            ("Tab", "focus"),
-                            ("↑/↓", "move"),
-                            ("s", "sync"),
-                            ("b", "browse"),
-                            ("p", "play"),
-                            ("i", "config"),
-                            ("?", "more"),
-                            ("q", "quit"),
-                        ]
-                    };
+                        shortcuts.extend([("s", "sync"), ("i", "config")]);
+                    }
+                    shortcuts.extend([("b", "browse"), ("?", "more"), ("q", "quit")]);
                     for (index, (key, label)) in shortcuts.into_iter().enumerate() {
                         if index > 0 {
                             shortcut_spans.push(key_sep());
@@ -3539,8 +3705,8 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     ]
                 };
                 frame.render_widget(Paragraph::new(footer_lines), footer);
-                if confirm_clear.is_some() {
-                    let popup = centered_rect(54, 5, area);
+                if let Some(request) = confirm_clear.as_ref() {
+                    let popup = centered_rect(72, 6, area);
                     frame.render_widget(Clear, popup);
                     frame.render_widget(
                         Block::default()
@@ -3556,15 +3722,28 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         popup,
                     );
                     frame.render_widget(
-                        Paragraph::new("This removes the selected tracked media files.")
-                            .style(Style::default().fg(Color::White))
-                            .alignment(ratatui::layout::Alignment::Center),
+                        Paragraph::new(vec![
+                            Line::from(Span::styled(
+                                truncate_near_end(&request.label, usize::from(popup.width.saturating_sub(4))),
+                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                            )),
+                            Line::from(Span::styled(
+                                if request.targets.is_empty() {
+                                    "Removes this ad-hoc job from the list."
+                                } else {
+                                    "Deletes these files from disk.  y confirm · n / Esc cancel"
+                                },
+                                Style::default().fg(Color::Gray),
+                            )),
+                        ])
+                        .alignment(ratatui::layout::Alignment::Center),
                         Rect {
                             x: popup.x + 1,
                             y: popup.y + 2,
                             width: popup.width.saturating_sub(2),
-                            height: 1,
-                        },
+                            height: 2,
+                        }
+                        .intersection(popup),
                     );
                 }
                 if let Some(explore) = explore.as_mut() {
@@ -3784,30 +3963,32 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     );
                 }
                 if show_help {
-                    let help_popup = centered_rect(68, 58, area);
+                    let help_popup = centered_rect(84, 30, area);
                     let help_lines = vec![
                         Line::from(Span::styled(
                             "Main view",
                             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                         )),
                         Line::from("  ↑/↓ or click     select a job or download"),
+                        Line::from("  PgUp/PgDn Home/End  jump through the list"),
                         Line::from("  Tab / ← / →       switch focus"),
-                        Line::from("  Mouse drag        resize Jobs/Details split"),
+                        Line::from("  Mouse drag        resize Jobs/Files split (wide terminals)"),
                         Line::from("  s / S             sync selected / all jobs"),
                         Line::from("  b                 browse the Jellyfin library"),
-                        Line::from("  i / Enter         job configuration / file media info"),
+                        Line::from("  i                 job configuration (Jobs focused)"),
+                        Line::from("  i / Enter         file media info (Files focused)"),
                         Line::from("  p / double-click  play selected file"),
                         Line::from("  Space             pause / resume selected download"),
                         Line::from("  o                 open the file's or show's directory"),
                         Line::from("  x / X / c         clear file / season / show (x on ad-hoc job removes it)"),
-                        Line::from("  Ctrl-C, Ctrl-C    quit the TUI"),
+                        Line::from("  q or Ctrl-C twice quit the TUI (Esc closes dialogs)"),
                         Line::from(""),
                         Line::from(Span::styled(
                             "Explore",
                             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                         )),
                         Line::from("  ↑/↓               move through library or episodes"),
-                        Line::from("  /                 search library"),
+                        Line::from("  /                 clear the search"),
                         Line::from("  type / Backspace  search the library"),
                         Line::from("  Ctrl-F            cycle type filter"),
                         Line::from("  Tab / ← / → / Enter  switch library / details pane"),
@@ -3832,6 +4013,33 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
             if stale_layout {
                 continue;
             }
+            // Footer notices fade after a while; failures stay a little longer.
+            match (&sync_notice, &notice_seen) {
+                (None, _) => notice_seen = None,
+                (Some((message, _)), Some((seen, _))) if message == seen => {}
+                (Some((message, _)), _) => notice_seen = Some((message.clone(), Instant::now())),
+            }
+            if let (Some((message, success)), Some((_, at))) = (&sync_notice, &notice_seen) {
+                let ttl = if message == QUIT_HINT {
+                    // Only meaningful within the double-press window.
+                    Duration::from_secs(1)
+                } else if *success {
+                    NOTICE_TTL
+                } else {
+                    NOTICE_TTL * 2
+                };
+                if at.elapsed() >= ttl {
+                    sync_notice = None;
+                    notice_seen = None;
+                }
+            }
+            // Remember what is selected so the next frame can follow it by identity.
+            selection_anchor = (
+                jobs.get(selected).map(|job| (selected, job.name.clone())),
+                downloads
+                    .get(selected_download)
+                    .map(|entry| (selected_download, entry.item_id.clone())),
+            );
             if event::poll(Duration::from_millis(250))? {
                 let input = event::read()?;
                 if let Event::Resize(_, _) = input {
@@ -3915,7 +4123,11 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                             ) {
                             explore_notice = Some((format!("Could not load poster: {error:#}"), false));
                         }
-                    } else if confirm_clear.is_none() {
+                    } else if confirm_clear.is_none()
+                        && !show_help
+                        && !show_job_config
+                        && file_info.is_none()
+                    {
                         match mouse.kind {
                             MouseEventKind::Down(MouseButton::Left)
                                 if area.width >= 100
@@ -4019,13 +4231,17 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         }
                     }
                 } else if let Event::Key(key) = input {
-                if key.code == KeyCode::Char('?') {
+                // In the Explore library pane every printable key belongs to the search.
+                if key.code == KeyCode::Char('?')
+                    && explore.as_ref().is_none_or(|browser| browser.details_focus)
+                {
                     show_help = !show_help;
                     show_job_config = false;
                 } else if show_help && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     show_help = false;
                 } else if file_info.is_some() && key.code == KeyCode::Char('p') {
-                    if let Some(entry) = downloads.get(selected_download) {
+                    // Play the file the dialog describes, even if the list moved since.
+                    if let Some(entry) = file_info_entry.as_ref() {
                         sync_notice = match play_download(&config, entry) {
                             Ok(()) => Some((
                                 format!("Playing {} with {}", entry.path.display(), config.player),
@@ -4045,7 +4261,9 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     }
                     file_info = None;
                     file_meta = None;
-                } else if show_job_config && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                } else if show_job_config
+                    && matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i'))
+                {
                     show_job_config = false;
                 } else if key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -4086,8 +4304,10 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         break;
                     } else {
                         last_ctrl_c = Some(Instant::now());
-                        sync_notice = Some(("Press Ctrl-C again to quit".into(), false));
+                        sync_notice = Some((QUIT_HINT.into(), false));
                     }
+                } else if show_help || show_job_config || file_info.is_some() {
+                    // Dialogs are modal: other keys must not act on the view behind them.
                 } else if let Some(browser) = explore.as_mut() {
                     last_ctrl_c = None;
                     match key.code {
@@ -4238,43 +4458,32 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         ) {
                         explore_notice = Some((format!("Could not load poster: {error:#}"), false));
                     }
-                } else if let Some(scope) = confirm_clear {
+                } else if let Some(request) = confirm_clear.as_ref() {
                     last_ctrl_c = None;
                     match key.code {
                         KeyCode::Char('y') => {
-                            let (entry, scope) = if download_focus {
-                                (downloads.get(selected_download), scope)
+                            let result = if request.targets.is_empty() {
+                                // Only ad-hoc jobs are cleared without files.
+                                forget_job(&request.job).map(|()| 0)
                             } else {
-                                (
-                                    jobs.get(selected).and_then(|job| {
-                                        downloads.iter().find(|entry| entry.job == job.name)
-                                    }),
-                                    ClearScope::Show,
-                                )
-                            };
-                            let result = if let Some(entry) = entry {
-                                clear_tracked(&config, entry, scope).and_then(|removed| {
+                                clear_tracked(&config, &request.targets).and_then(|removed| {
                                     // Ad-hoc jobs are dropped by clear_tracked once empty;
                                     // recording a status here would resurrect them.
-                                    if matches!(scope, ClearScope::Show)
-                                        && !entry.job.starts_with("library:")
-                                    {
+                                    if request.scope == ClearScope::Show && !request.adhoc {
                                         update_job(
-                                            &entry.job,
+                                            &request.job,
                                             "cleared",
                                             &format!("cleared {removed} tracked files"),
                                         )?;
                                     }
-                                    Ok(())
+                                    Ok(removed)
                                 })
-                            } else if let Some(job) = jobs.get(selected).filter(|job| job.adhoc) {
-                                forget_job(&job.name)
-                            } else {
-                                Ok(())
                             };
-                            if let Err(error) = result {
-                                sync_notice = Some((format!("Could not clear: {error:#}"), false));
-                            }
+                            sync_notice = Some(match result {
+                                Ok(0) => (format!("Removed {}", request.job.trim_start_matches("library:")), true),
+                                Ok(_) => (format!("Cleared {}", request.label), true),
+                                Err(error) => (format!("Could not clear: {error:#}"), false),
+                            });
                             confirm_clear = None;
                         }
                         KeyCode::Char('n') | KeyCode::Esc => confirm_clear = None,
@@ -4283,7 +4492,8 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 } else {
                     last_ctrl_c = None;
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        // Esc closes dialogs; quitting from the main view takes q or Ctrl-C twice.
+                        KeyCode::Char('q') => break,
                         KeyCode::Char('i') | KeyCode::Enter if download_focus && !downloads.is_empty() => {
                             if let Some(entry) = downloads.get(selected_download) {
                                 let path = entry.path.clone();
@@ -4291,6 +4501,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                                     .get(&path)
                                     .and_then(|probe| probe.as_ref().ok())
                                     .map(|probe| Ok(probe.rows.clone()));
+                                file_info_entry = Some(entry.clone());
                                 file_info = Some((
                                     path.file_name()
                                         .unwrap_or_default()
@@ -4383,6 +4594,19 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                                 explore_notice = None;
                             }
                         }
+                        KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
+                            if download_focus {
+                                let page = usize::from(downloads_area.height.saturating_sub(2)) / 3;
+                                selected_download = list_jump(key.code, selected_download, downloads.len(), page);
+                            } else {
+                                let page = usize::from(jobs_area.height.saturating_sub(2)) / 4;
+                                let next = list_jump(key.code, selected, jobs.len(), page);
+                                if next != selected {
+                                    selected = next;
+                                    selected_download = 0;
+                                }
+                            }
+                        }
                         KeyCode::Tab => download_focus = !download_focus,
                         KeyCode::Left => download_focus = false,
                         KeyCode::Right => download_focus = !downloads.is_empty(),
@@ -4460,13 +4684,17 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                             }
                         }
                         KeyCode::Char('x') if download_focus && !downloads.is_empty() => {
-                            confirm_clear = Some(ClearScope::File)
+                            confirm_clear = selected_job.and_then(|job| {
+                                clear_request(ClearScope::File, job, &downloads, &rows, selected_download)
+                            });
                         }
                         KeyCode::Char('x')
                             if !download_focus
                                 && jobs.get(selected).is_some_and(|job| job.adhoc) =>
                         {
-                            confirm_clear = Some(ClearScope::Show)
+                            confirm_clear = selected_job.and_then(|job| {
+                                clear_request(ClearScope::Show, job, &downloads, &rows, selected_download)
+                            });
                         }
                         KeyCode::Char('p') if download_focus && !downloads.is_empty() => {
                             if let Some(entry) = downloads.get(selected_download) {
@@ -4503,14 +4731,17 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                             );
                         }
                         KeyCode::Char('X') if download_focus && !downloads.is_empty() => {
-                            confirm_clear = Some(ClearScope::Season)
-                        }
-                        KeyCode::Char('c') if download_focus && !downloads.is_empty() => {
-                            confirm_clear = Some(ClearScope::Show)
+                            confirm_clear = selected_job.and_then(|job| {
+                                clear_request(ClearScope::Season, job, &downloads, &rows, selected_download)
+                            });
                         }
                         KeyCode::Char('c') if !jobs.is_empty() => {
-                            download_focus = false;
-                            confirm_clear = Some(ClearScope::Show);
+                            confirm_clear = selected_job.and_then(|job| {
+                                clear_request(ClearScope::Show, job, &downloads, &rows, selected_download)
+                            });
+                            if confirm_clear.is_none() {
+                                sync_notice = Some(("Nothing to clear for this job".into(), false));
+                            }
                         }
                         _ => {}
                     }
@@ -5461,8 +5692,35 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
+/// New index after PgUp/PgDn/Home/End in a list of `len` items.
+fn list_jump(code: KeyCode, index: usize, len: usize, page: usize) -> usize {
+    let last = len.saturating_sub(1);
+    match code {
+        KeyCode::Home => 0,
+        KeyCode::End => last,
+        KeyCode::PageUp => index.saturating_sub(page.max(1)),
+        KeyCode::PageDown => (index + page.max(1)).min(last),
+        _ => index,
+    }
+}
+
 fn download_complete(status: &str) -> bool {
     matches!(status, "complete" | "completed" | "success")
+}
+
+/// Whether `path` lives strictly inside one of `roots` (compared via its
+/// canonical parent directory so symlinked files are judged by their location).
+fn path_within_roots(path: &Path, roots: &[PathBuf]) -> Result<bool> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(false);
+    };
+    if name == ".." {
+        return Ok(false);
+    }
+    let parent = parent
+        .canonicalize()
+        .with_context(|| format!("resolve {}", parent.display()))?;
+    Ok(roots.iter().any(|root| parent.starts_with(root)))
 }
 
 fn file_row_height(row: &FileRow) -> usize {
@@ -5787,5 +6045,95 @@ mod tests {
         assert_eq!(file_row_at(area, 5, 1, 2, &rows), Some(1));
         // Borders are not rows.
         assert_eq!(file_row_at(area, 5, 0, 0, &rows), None);
+    }
+
+    fn season_fixture() -> (Vec<DownloadEntry>, Vec<FileRow>) {
+        // One flat folder: seasons come from the SxxEyy tags only.
+        let mut files = vec![
+            entry("a", "/tv/Show/Show - S01E01.mkv"),
+            entry("b", "/tv/Show/Show - S01E02.mkv"),
+            entry("c", "/tv/Show/Show - S02E01.mkv"),
+        ];
+        let rows = file_rows(&mut files, None);
+        (files, rows)
+    }
+
+    #[test]
+    fn season_clear_matches_the_displayed_group() {
+        let (files, rows) = season_fixture();
+        let ids = |indices: Vec<usize>| -> Vec<String> {
+            indices
+                .into_iter()
+                .map(|i| files[i].item_id.clone())
+                .collect()
+        };
+        // Clearing a season must not take the other season from the same folder.
+        assert_eq!(ids(season_files(&rows, &files, 0)), ["a", "b"]);
+        assert_eq!(ids(season_files(&rows, &files, 2)), ["c"]);
+    }
+
+    #[test]
+    fn season_clear_without_headings_uses_the_folder() {
+        let files = vec![
+            entry("a", "/m/Heat/Heat.mkv"),
+            entry("b", "/m/Heat/Heat-extras.mkv"),
+        ];
+        // An ungrouped list, as for a movie folder.
+        let rows = vec![FileRow::File(0), FileRow::File(1)];
+        assert_eq!(season_files(&rows, &files, 1), [0, 1]);
+    }
+
+    #[test]
+    fn clear_requests_capture_their_targets() {
+        let (files, rows) = season_fixture();
+        let job = TuiJob {
+            name: "library:Show".into(),
+            adhoc: true,
+        };
+        let request = clear_request(ClearScope::Season, &job, &files, &rows, 1).unwrap();
+        assert_eq!(request.targets.len(), 2);
+        assert_eq!(request.label, "Show · Season 1 (2 files)");
+        let request = clear_request(ClearScope::File, &job, &files, &rows, 2).unwrap();
+        assert_eq!(request.targets[0].item_id, "c");
+        let request = clear_request(ClearScope::Show, &job, &files, &rows, 0).unwrap();
+        assert_eq!(request.label, "Show · all 3 files");
+        // An empty ad-hoc job can still be removed; an empty configured job cannot.
+        assert!(
+            clear_request(ClearScope::Show, &job, &[], &[], 0)
+                .is_some_and(|r| r.targets.is_empty())
+        );
+        let configured = TuiJob {
+            name: "Show".into(),
+            adhoc: false,
+        };
+        assert!(clear_request(ClearScope::Show, &configured, &[], &[], 0).is_none());
+        assert!(clear_request(ClearScope::File, &configured, &[], &[], 0).is_none());
+    }
+
+    #[test]
+    fn list_jumps_stay_in_bounds() {
+        assert_eq!(list_jump(KeyCode::Home, 5, 10, 3), 0);
+        assert_eq!(list_jump(KeyCode::End, 5, 10, 3), 9);
+        assert_eq!(list_jump(KeyCode::PageDown, 8, 10, 3), 9);
+        assert_eq!(list_jump(KeyCode::PageUp, 2, 10, 3), 0);
+        assert_eq!(list_jump(KeyCode::PageDown, 0, 10, 0), 1);
+        assert_eq!(list_jump(KeyCode::End, 0, 0, 3), 0);
+    }
+
+    #[test]
+    fn clearing_is_confined_to_the_roots() {
+        let base = env::temp_dir().join(format!("jellysync-test-{}", std::process::id()));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(root.join("Show")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let roots = vec![root.canonicalize().unwrap()];
+        assert!(path_within_roots(&root.join("Show/a.mkv"), &roots).unwrap());
+        assert!(!path_within_roots(&outside.join("a.mkv"), &roots).unwrap());
+        assert!(!path_within_roots(&root.join("Show/../../outside/a.mkv"), &roots).unwrap());
+        // A symlinked folder pointing outside does not count as inside.
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert!(!path_within_roots(&root.join("link/a.mkv"), &roots).unwrap());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

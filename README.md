@@ -151,9 +151,9 @@ schedule = "Mon *-*-* 02:00:00";
 ### Commands
 
 ```console
-jellysync sync [JOB]...       # Sync all jobs or selected jobs
+jellysync                     # Open the TUI (same as `jellysync tui`)
+jellysync download [JOB]...   # Download all jobs or selected ones (aliases: fetch, sync)
 jellysync status              # Show recent job status and timer state
-jellysync tui                 # Open the terminal status view
 jellysync prune [JOB]...      # Preview stale managed downloads
 jellysync prune --apply       # Apply the prune
 jellysync start               # Start the user systemd service
@@ -161,7 +161,11 @@ jellysync stop                # Stop the user systemd service
 jellysync config              # Print the parsed config
 ```
 
-The TUI keeps ad-hoc library downloads running when Explore is closed. Select a
+Ad-hoc library downloads started from Explore run in a detached background
+worker, so they keep going after the TUI exits. Interrupted ones (e.g. the
+worker died) are resumed automatically when the TUI starts and Jellyfin is
+reachable, and by every full `jellysync download` (such as the systemd timer).
+Select a
 file and press `p` (or double-click it) to launch the configured player
 (default: `mpv`); set `player` in the YAML or Home Manager settings to change
 it. `Ctrl-C` closes Explore, and pressing it twice in the main view quits the
@@ -181,7 +185,7 @@ pane of the selected show; there, `↑`/`↓` move through episodes, `Space`
 selects one, `a` selects all, and `d` downloads the selection. `Tab`, `←` or
 `Esc` returns to the library.
 
-Use `--config FILE` to select a config and `--parallelism N` to override the worker limit for a sync. Legacy positional invocation (`jellysync JOB...`) remains an alias for `jellysync sync JOB...`.
+Use `--config FILE` to select a config and `-j N` (`--parallelism`, `--parallel`) to override the worker limit for a download.
 
 ### Manual Installation
 
@@ -568,9 +572,9 @@ Combine season and episode filters for precise control:
 
 ```bash
 jellysync --help
-jellysync sync
-jellysync sync pluribus
-jellysync sync "Star Trek" "The Penguin"
+jellysync download
+jellysync download pluribus
+jellysync download "Star Trek" "The Penguin"
 jellysync status
 jellysync tui
 jellysync prune
@@ -651,7 +655,7 @@ jellysync prune
 
 ### Sync Multiple Specific Jobs
 ```bash
-jellysync sync pluribus "The Penguin"
+jellysync download pluribus "The Penguin"
 ```
 
 ## Requirements

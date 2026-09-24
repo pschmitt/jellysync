@@ -397,7 +397,7 @@
                         else
                           "";
                     in
-                    "${cfg.package}/bin/jellysync sync ${jobArgs}";
+                    "${cfg.package}/bin/jellysync download ${jobArgs}";
                 };
               };
 

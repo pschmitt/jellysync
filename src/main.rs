@@ -49,36 +49,85 @@ use std::{
 };
 use tokio::{process::Command, sync::Semaphore, task::JoinSet};
 
+/// Print a CLI line, stripping ANSI styling when stdout is not a TTY or NO_COLOR is set.
+macro_rules! say {
+    ($($arg:tt)*) => {
+        cli_print(format!($($arg)*))
+    };
+}
+
+const HELP_STYLES: clap::builder::Styles = {
+    use clap::builder::styling::{AnsiColor, Effects, Styles};
+    Styles::styled()
+        .header(AnsiColor::Magenta.on_default().effects(Effects::BOLD))
+        .usage(AnsiColor::Magenta.on_default().effects(Effects::BOLD))
+        .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+        .placeholder(AnsiColor::Yellow.on_default())
+        .valid(AnsiColor::Green.on_default())
+        .invalid(AnsiColor::Red.on_default().effects(Effects::BOLD))
+        .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
+};
+
 #[derive(Parser)]
-#[command(name = "jellysync", version, about = "Sync Jellyfin media")]
+#[command(
+    name = "jellysync",
+    version,
+    about = "◆ jellysync · keep a local copy of your Jellyfin shows and movies",
+    long_about = None,
+    styles = HELP_STYLES,
+    after_help = "Run without a command to open the TUI."
+)]
 struct Cli {
-    #[arg(short, long, global = true)]
+    /// Config file (default: $JELLYSYNC_CONFIG, ./jellysync.yaml, ~/.config/jellysync/config.yaml)
+    #[arg(short, long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
-    #[arg(long, global = true)]
+    /// Number of jobs downloaded concurrently (overrides the config)
+    #[arg(
+        short = 'j',
+        long,
+        visible_alias = "parallel",
+        global = true,
+        value_name = "N"
+    )]
     parallelism: Option<usize>,
+    /// Print machine-readable JSON
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
     command: Option<Commands>,
-    /// Legacy form: jellysync [JOB ...] is treated as jellysync sync [JOB ...].
-    targets: Vec<String>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    Sync {
+    /// Open the interactive terminal UI (default)
+    Tui,
+    /// Download all jobs, or only the given ones
+    #[command(visible_aliases = ["fetch", "sync"])]
+    Download {
+        /// Job names to download (default: all jobs)
+        #[arg(value_name = "JOB")]
         target: Vec<String>,
     },
+    /// Show recent job status and the timer state
     Status,
+    /// Remove managed files that no longer match their job filters
     Prune {
+        /// Actually delete files instead of previewing
         #[arg(long)]
         apply: bool,
+        /// Job names to prune (default: all jobs)
+        #[arg(value_name = "JOB")]
         target: Vec<String>,
     },
+    /// Print the parsed configuration
     Config,
+    /// Start the jellysync user service
     Start,
+    /// Stop the jellysync user service
     Stop,
-    Tui,
+    /// Download the pending transfers of an ad-hoc library job (spawned by the TUI)
+    #[command(hide = true)]
+    Worker { job: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -764,62 +813,174 @@ fn poster_protocol(picker: &Picker, data: &[u8]) -> Result<StatefulProtocol> {
     Ok(picker.new_resize_protocol(image))
 }
 
-async fn download_library_items(
-    config: Config,
-    items: Vec<MediaItem>,
-    title: String,
+/// Record ad-hoc library items as queued; a detached `jellysync fetch` worker downloads them.
+fn queue_library_items(
+    config: &Config,
+    items: &[MediaItem],
+    title: &str,
     movie: bool,
-) -> Result<usize> {
+) -> Result<(usize, String)> {
     if items.is_empty() {
         bail!("select at least one item to download");
     }
-    let credentials = config
-        .jellyfin
-        .as_ref()
-        .context("dynamic downloads require Jellyfin credentials")?;
-    let api = jellyfin_login(credentials).await?;
     let job = format!("library:{title}");
     let mut folder = PathBuf::from(&config.local.root);
     folder.push(if movie { "Movies" } else { "TV Shows" });
-    folder.push(safe_component(&title));
+    folder.push(safe_component(title));
     std::fs::create_dir_all(&folder)?;
-    update_job(
-        &job,
-        "running",
-        &format!("{} selected item(s)", items.len()),
-    )?;
-    let count = items.len();
-    let slots = Arc::new(Semaphore::new(config.parallelism.max(1)));
-    let mut tasks = JoinSet::new();
     for item in items {
-        let api = api.clone();
-        let job = job.clone();
-        let folder = folder.clone();
-        let title = title.clone();
-        let permit = slots.clone().acquire_owned().await?;
-        tasks.spawn(async move {
-            let _permit = permit;
-            let destination =
-                item_destination(&item, &folder, "Season $season_number", &title, movie)?;
-            jellyfin_download(&api, &job, &item, &destination, true).await
-        });
+        let destination = item_destination(item, &folder, "Season $season_number", title, movie)?;
+        mark_queued(&job, item, &destination)?;
     }
-    let mut failures = Vec::new();
-    while let Some(result) = tasks.join_next().await {
-        if let Err(error) = result.context("dynamic Jellyfin transfer worker failed")? {
-            failures.push(format!("{error:#}"));
+    update_job(&job, "queued", &format!("{} item(s) queued", items.len()))?;
+    Ok((items.len(), job))
+}
+
+fn pending_transfers(job: &str) -> Result<Vec<(String, PathBuf)>> {
+    let conn = db()?;
+    let mut statement = conn.prepare(
+        "SELECT item_id,path FROM transfers WHERE job=?1 AND status IN ('queued','downloading','interrupted') ORDER BY path",
+    )?;
+    let rows = statement.query_map(params![job], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            PathBuf::from(row.get::<_, String>(1)?),
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn pending_library_jobs() -> Result<Vec<String>> {
+    let conn = db()?;
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT job FROM transfers WHERE job LIKE 'library:%' AND status IN ('queued','downloading','interrupted')",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Download the pending transfers of an ad-hoc job. Only one worker runs per job (file
+/// lock); a second one exits immediately. Returns once nothing new is pending.
+async fn library_worker(config: &Config, job: &str) -> Result<()> {
+    let lock_dir = state_db()?
+        .parent()
+        .context("state directory has no parent")?
+        .join("locks");
+    std::fs::create_dir_all(&lock_dir)?;
+    let lock_path = lock_dir.join(format!("{}.lock", safe_component(job)));
+    let credentials = config
+        .jellyfin
+        .as_ref()
+        .context("ad-hoc downloads require Jellyfin credentials")?;
+    let mut attempted = HashSet::new();
+    loop {
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        // Items that already failed in this run stay pending; don't retry them in a loop.
+        let pending: Vec<_> = pending_transfers(job)?
+            .into_iter()
+            .filter(|(item_id, _)| !attempted.contains(item_id))
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let api = jellyfin_login(credentials).await?;
+        update_job(job, "running", &format!("{} item(s)", pending.len()))?;
+        let count = pending.len();
+        let slots = Arc::new(Semaphore::new(config.parallelism.max(1)));
+        let mut tasks = JoinSet::new();
+        for (item_id, destination) in pending {
+            attempted.insert(item_id.clone());
+            let api = api.clone();
+            let job = job.to_string();
+            let permit = slots.clone().acquire_owned().await?;
+            tasks.spawn(async move {
+                let _permit = permit;
+                let item = MediaItem {
+                    id: item_id,
+                    name: destination
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    item_type: None,
+                    production_year: None,
+                    path: None,
+                    parent_index_number: None,
+                    index_number: None,
+                    user_data: None,
+                };
+                jellyfin_download(&api, &job, &item, &destination, true).await
+            });
+        }
+        let mut failures = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result.context("ad-hoc transfer worker failed")? {
+                failures.push(format!("{error:#}"));
+            }
+        }
+        if failures.is_empty() {
+            update_job(job, "success", &format!("{count} item(s) downloaded"))?;
+        } else {
+            update_job(job, "failed", &failures.join("; "))?;
+        }
+        // Release the lock before re-checking so a worker spawned for newly queued items
+        // meanwhile either finds them itself or leaves them to this loop.
+        drop(lock);
+    }
+}
+
+/// Finish ad-hoc downloads inline during a full sync (e.g. from the systemd timer), in
+/// case their detached worker died. Jobs with a live worker are skipped via its lock.
+async fn finish_library_jobs(config: &Config) {
+    let jobs = match pending_library_jobs() {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            eprintln!("Could not list pending ad-hoc downloads: {error:#}");
+            return;
+        }
+    };
+    for job in jobs {
+        if let Err(error) = library_worker(config, &job).await {
+            eprintln!("Ad-hoc download {job} failed: {error:#}");
         }
     }
-    if !failures.is_empty() {
-        update_job(&job, "failed", &failures.join("; "))?;
-        bail!(
-            "{} dynamic download(s) failed: {}",
-            failures.len(),
-            failures.join("; ")
-        );
+}
+
+/// Start a detached worker that keeps downloading after the TUI exits.
+fn spawn_library_worker(config_path: &Path, job: &str) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    let mut child = std::process::Command::new(env::current_exe()?)
+        .arg("--config")
+        .arg(config_path)
+        .arg("worker")
+        .arg(job)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .context("start ad-hoc download worker")?;
+    // Reap the worker if it finishes while we are still running.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+/// Resume ad-hoc downloads left behind by a worker that died or never started.
+fn resume_library_workers(config_path: &Path) -> Result<usize> {
+    let jobs = pending_library_jobs()?;
+    for job in &jobs {
+        spawn_library_worker(config_path, job)?;
     }
-    update_job(&job, "success", &format!("{count} item(s) downloaded"))?;
-    Ok(count)
+    Ok(jobs.len())
 }
 
 fn safe_component(value: &str) -> String {
@@ -985,11 +1146,24 @@ async fn jellyfin_job(
         };
         update_job(&job.name, "skipped", &message)?;
         if !quiet {
-            eprintln!("{}", message);
+            say!(
+                "{} {}  {}",
+                "▸".with(TerminalColor::DarkGrey),
+                job.name.clone().with(TerminalColor::Grey).bold(),
+                message.with(TerminalColor::DarkGrey)
+            );
         }
         return Ok(());
     }
     let count = items.len();
+    if !quiet {
+        say!(
+            "{} {}  {}",
+            "▸".with(TerminalColor::Cyan),
+            job.name.clone().with(TerminalColor::Cyan).bold(),
+            format!("{count} item(s)").with(TerminalColor::DarkGrey)
+        );
+    }
     let destination = PathBuf::from(resolved_path(config, job, false)?);
     std::fs::create_dir_all(&destination)?;
     update_job(&job.name, "running", &format!("{count} item(s)"))?;
@@ -998,6 +1172,12 @@ async fn jellyfin_job(
         .as_ref()
         .map(|l| l.season_pattern.clone())
         .unwrap_or_else(default_season_pattern);
+    // Record every pending item up front so ones waiting for a worker slot show as queued.
+    for item in &items {
+        if let Ok(output) = item_destination(item, &destination, &pattern, &job.name, movie_mode) {
+            mark_queued(&job.name, item, &output)?;
+        }
+    }
     let mut tasks = JoinSet::new();
     for item in items {
         let api = api.clone();
@@ -1169,9 +1349,92 @@ async fn jellyfin_download(
                 bytes,
                 transfer_total(&item.id)?,
             )?;
+            RUN_STATS
+                .failed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !quiet {
+                say!(
+                    "  {} {}  {}",
+                    "✗".with(TerminalColor::Red).bold(),
+                    item.name.clone().with(TerminalColor::White),
+                    format!("{error:#}").with(TerminalColor::Red)
+                );
+            }
             Err(error)
         }
     }
+}
+
+fn cli_print(line: String) {
+    static COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let color = *COLOR.get_or_init(|| {
+        std::io::IsTerminal::is_terminal(&stdout())
+            && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+    });
+    if color {
+        println!("{line}");
+        return;
+    }
+    let mut plain = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Skip a CSI sequence: ESC [ parameters final-byte.
+            if chars.next() == Some('[') {
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            plain.push(ch);
+        }
+    }
+    println!("{plain}");
+}
+
+/// Totals for the CLI download summary.
+struct RunStats {
+    downloaded: std::sync::atomic::AtomicUsize,
+    bytes: std::sync::atomic::AtomicU64,
+    present: std::sync::atomic::AtomicUsize,
+    failed: std::sync::atomic::AtomicUsize,
+}
+static RUN_STATS: RunStats = RunStats {
+    downloaded: std::sync::atomic::AtomicUsize::new(0),
+    bytes: std::sync::atomic::AtomicU64::new(0),
+    present: std::sync::atomic::AtomicUsize::new(0),
+    failed: std::sync::atomic::AtomicUsize::new(0),
+};
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds >= 3600 {
+        format!("{}h{:02}m", seconds / 3600, seconds / 60 % 60)
+    } else if seconds >= 60 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    }
+}
+
+fn mark_queued(job: &str, item: &MediaItem, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        return Ok(());
+    }
+    let partial = PathBuf::from(format!("{}.partial", destination.to_string_lossy()));
+    let bytes = std::fs::metadata(&partial)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    update_transfer(
+        &item.id,
+        job,
+        destination,
+        "queued",
+        bytes,
+        transfer_total(&item.id)?,
+    )
 }
 
 async fn jellyfin_download_inner(
@@ -1184,8 +1447,12 @@ async fn jellyfin_download_inner(
     if destination.exists() {
         let size = destination.metadata()?.len();
         update_transfer(&item.id, job, destination, "complete", size, Some(size))?;
+        RUN_STATS
+            .present
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(());
     }
+    let started = Instant::now();
     if let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -1278,8 +1545,27 @@ async fn jellyfin_download_inner(
         bytes,
         total.or(Some(bytes)),
     )?;
+    let transferred = bytes.saturating_sub(start);
+    RUN_STATS
+        .downloaded
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RUN_STATS
+        .bytes
+        .fetch_add(transferred, std::sync::atomic::Ordering::Relaxed);
     if !quiet {
-        println!("downloaded {}", destination.display());
+        let rate = transferred as f64 / started.elapsed().as_secs_f64().max(0.001);
+        say!(
+            "  {} {}  {}  {}",
+            "✓".with(TerminalColor::Green).bold(),
+            destination
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+                .with(TerminalColor::White),
+            format_bytes(bytes).with(TerminalColor::Grey),
+            format!("{}/s", format_bytes(rate as u64)).with(TerminalColor::DarkGrey)
+        );
     }
     Ok(())
 }
@@ -1291,6 +1577,21 @@ async fn run_sync_mode(
     quiet: bool,
 ) -> Result<()> {
     let jobs = selected_jobs(&config, &target)?;
+    let started = Instant::now();
+    if !quiet {
+        say!(
+            "{} {}  {}",
+            "◆".with(TerminalColor::Cyan),
+            "jellysync download".bold(),
+            format!(
+                "{} job(s) · {} mode · {parallelism} worker(s)",
+                jobs.len(),
+                config.download.mode
+            )
+            .with(TerminalColor::DarkGrey)
+        );
+        say!("{}", "─".repeat(48).with(TerminalColor::DarkGrey));
+    }
     let slots = Arc::new(Semaphore::new(parallelism));
     let mut tasks = JoinSet::new();
     for job in jobs {
@@ -1304,6 +1605,40 @@ async fn run_sync_mode(
             Ok(()) => {}
             Err(error) => failures.push(format!("{error:#}")),
         }
+    }
+    if !quiet {
+        use std::sync::atomic::Ordering::Relaxed;
+        let downloaded = RUN_STATS.downloaded.load(Relaxed);
+        let present = RUN_STATS.present.load(Relaxed);
+        let failed = RUN_STATS.failed.load(Relaxed);
+        say!("{}", "─".repeat(48).with(TerminalColor::DarkGrey));
+        let mut summary = vec![
+            format!(
+                "{} {downloaded} downloaded ({})",
+                "✓".with(TerminalColor::Green).bold(),
+                format_bytes(RUN_STATS.bytes.load(Relaxed))
+            ),
+            format!("{present} already present")
+                .with(TerminalColor::Grey)
+                .to_string(),
+        ];
+        if failed > 0 || !failures.is_empty() {
+            summary.push(
+                format!("✗ {} failed", failed.max(failures.len()))
+                    .with(TerminalColor::Red)
+                    .bold()
+                    .to_string(),
+            );
+        }
+        summary.push(
+            format_elapsed(started.elapsed())
+                .with(TerminalColor::DarkGrey)
+                .to_string(),
+        );
+        say!(
+            "{}",
+            summary.join(&" · ".with(TerminalColor::DarkGrey).to_string())
+        );
     }
     if !failures.is_empty() {
         bail!(
@@ -1372,7 +1707,13 @@ async fn sync_job(config: Config, job: Job, slots: Arc<Semaphore>, quiet: bool) 
     }
     update_job(&job.name, "success", &destination)?;
     if !quiet {
-        println!("synced {} -> {}", job.name, destination);
+        say!(
+            "{} {}  {} {}",
+            "✓".with(TerminalColor::Green).bold(),
+            job.name.clone().with(TerminalColor::Cyan).bold(),
+            "rsync →".with(TerminalColor::DarkGrey),
+            destination.clone().with(TerminalColor::Grey)
+        );
     }
     Ok(())
 }
@@ -1761,7 +2102,7 @@ async fn reconcile_existing(config: &Config) -> Result<usize> {
     Ok(indexed)
 }
 
-async fn tui(config: Config) -> Result<()> {
+async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
     // Status messages used to read "downloaded N item(s)".
     db()?.execute(
         "UPDATE jobs SET message=substr(message,12)||' downloaded' WHERE message LIKE 'downloaded % item(s)'",
@@ -1811,7 +2152,6 @@ async fn tui(config: Config) -> Result<()> {
         let mut jellyfin_api: Option<JellyfinApi> = None;
         let mut explore: Option<ExploreState> = None;
         let mut explore_notice: Option<(String, bool)> = None;
-        let mut explore_task: Option<tokio::task::JoinHandle<Result<usize>>> = None;
         // None when Jellyfin is not configured; otherwise the latest ping result
         // (Some(None) while the first check is still running).
         let mut online: Option<Option<bool>> = config.jellyfin.as_ref().map(|_| None);
@@ -1896,6 +2236,10 @@ async fn tui(config: Config) -> Result<()> {
                 online = Some(Some(reachable));
                 pinged_at = Some(Instant::now());
                 if reachable && !was_online {
+                    if let Err(error) = resume_library_workers(&config_path) {
+                        sync_notice =
+                            Some((format!("Could not resume ad-hoc downloads: {error:#}"), false));
+                    }
                     if !reconciled && reconcile_task.is_none() {
                         let config = config.clone();
                         reconcile_task =
@@ -2208,22 +2552,6 @@ async fn tui(config: Config) -> Result<()> {
                     }
                 }
             }
-            if explore_task.as_ref().is_some_and(|task| task.is_finished()) {
-                let task = explore_task.take().expect("finished Explore task exists");
-                let result = task.await;
-                if let Some(task) = job_poster_catalog_task.take() {
-                    task.abort();
-                }
-                let config = config.clone();
-                job_poster_catalog_task = Some(tokio::spawn(async move {
-                    jellyfin_job_poster_catalog(&config).await
-                }));
-                explore_notice = Some(match result {
-                    Ok(Ok(count)) => (format!("Queued {count} library download(s)"), true),
-                    Ok(Err(error)) => (format!("Explore download failed: {error:#}"), false),
-                    Err(error) => (format!("Explore download stopped: {error}"), false),
-                });
-            }
             if sync_task.as_ref().is_some_and(|task| task.is_finished()) {
                 let task = sync_task.take().expect("finished sync task exists");
                 sync_notice = Some(match task.await {
@@ -2448,24 +2776,22 @@ async fn tui(config: Config) -> Result<()> {
                 } else {
                     "READY"
                 };
-                let header_text = Line::from(vec![
-                    Span::styled(
+                let mut header_segments: Vec<Vec<Span>> = vec![
+                    vec![Span::styled(
                         "  ◆ JELLYSYNC",
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
+                    )],
+                    vec![Span::styled(
                         format!("{} mode", config.download.mode),
                         Style::default().fg(Color::White),
-                    ),
-                    Span::styled(
-                        format!("  ·  {} workers", config.parallelism),
+                    )],
+                    vec![Span::styled(
+                        format!("{} workers", config.parallelism),
                         Style::default().fg(Color::Gray),
-                    ),
-                    Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
+                    )],
+                    vec![Span::styled(
                         sync_label,
                         state_style(if sync_task.is_some() {
                             "running"
@@ -2473,31 +2799,34 @@ async fn tui(config: Config) -> Result<()> {
                             "success"
                         })
                         .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        if online.is_some() { "  ·  " } else { "" },
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    match online {
-                        None => Span::raw(""),
-                        Some(None) => Span::styled("CHECKING", state_style("stopped")),
-                        Some(Some(true)) => Span::styled(
-                            "ONLINE",
-                            state_style("success").add_modifier(Modifier::BOLD),
-                        ),
-                        Some(Some(false)) => Span::styled(
-                            "OFFLINE",
-                            state_style("failed").add_modifier(Modifier::BOLD),
-                        ),
-                    },
-                    if reconcile_task.is_some() {
-                        Span::styled("  ·  indexing…", Style::default().fg(Color::Gray))
-                    } else if let Some(count) = indexed.filter(|count| *count > 0) {
-                        Span::styled(format!("  ·  {count} indexed"), Style::default().fg(Color::Gray))
-                    } else {
-                        Span::raw("")
-                    },
-                    Span::styled("  ·  timer ", Style::default().fg(Color::DarkGray)),
+                    )],
+                ];
+                match online {
+                    None => {}
+                    Some(None) => header_segments
+                        .push(vec![Span::styled("CHECKING", state_style("stopped"))]),
+                    Some(Some(true)) => header_segments.push(vec![Span::styled(
+                        "ONLINE",
+                        state_style("success").add_modifier(Modifier::BOLD),
+                    )]),
+                    Some(Some(false)) => header_segments.push(vec![Span::styled(
+                        "OFFLINE",
+                        state_style("failed").add_modifier(Modifier::BOLD),
+                    )]),
+                }
+                if reconcile_task.is_some() {
+                    header_segments.push(vec![Span::styled(
+                        "indexing…",
+                        Style::default().fg(Color::Gray),
+                    )]);
+                } else if let Some(count) = indexed.filter(|count| *count > 0) {
+                    header_segments.push(vec![Span::styled(
+                        format!("{count} indexed"),
+                        Style::default().fg(Color::Gray),
+                    )]);
+                }
+                header_segments.push(vec![
+                    Span::styled("timer ", Style::default().fg(Color::Gray)),
                     Span::styled(
                         dashboard.timer.clone(),
                         if dashboard.timer == "active" {
@@ -2507,6 +2836,15 @@ async fn tui(config: Config) -> Result<()> {
                         },
                     ),
                 ]);
+                // Every separator gets the same plain gray style.
+                let mut header_spans = Vec::new();
+                for (index, segment) in header_segments.into_iter().enumerate() {
+                    if index > 0 {
+                        header_spans.push(Span::styled("  ·  ", Style::default().fg(Color::Gray)));
+                    }
+                    header_spans.extend(segment);
+                }
+                let header_text = Line::from(header_spans);
                 frame.render_widget(Paragraph::new(header_text), header);
 
                 let jobs_title = format!("Jobs · {}", jobs.len());
@@ -3383,9 +3721,7 @@ async fn tui(config: Config) -> Result<()> {
                             explore_notice = None;
                         }
                         KeyCode::Char('d') => {
-                            if explore_task.is_some() {
-                                explore_notice = Some(("A library download is already running".into(), false));
-                            } else if browser.details_focus
+                            let queued = if browser.details_focus
                                 && let Some(title) = browser
                                     .filtered_items()
                                     .get(browser.selected)
@@ -3396,22 +3732,35 @@ async fn tui(config: Config) -> Result<()> {
                                     .collect();
                                 if items.is_empty() {
                                     explore_notice = Some(("Select episodes with Space or a first".into(), false));
+                                    None
                                 } else {
-                                    let config = config.clone();
-                                    explore_notice = Some((format!("Starting {} download(s) for {title}", items.len()), true));
-                                    explore_task = Some(tokio::spawn(async move {
-                                        download_library_items(config, items, title, false).await
-                                    }));
+                                    Some(queue_library_items(&config, &items, &title, false))
                                 }
                             } else if let Some(item) = browser.filtered_items().get(browser.selected).map(|item| (*item).clone())
                                 && item.item_type.as_deref() == Some("Movie")
                             {
-                                let title = item.name.clone();
-                                let config = config.clone();
-                                explore_notice = Some((format!("Starting download for {title}"), true));
-                                explore_task = Some(tokio::spawn(async move {
-                                    download_library_items(config, vec![item], title, true).await
-                                }));
+                                Some(queue_library_items(&config, std::slice::from_ref(&item), &item.name, true))
+                            } else {
+                                None
+                            };
+                            match queued {
+                                Some(Ok((count, job))) => {
+                                    explore_notice = Some(match spawn_library_worker(&config_path, &job) {
+                                        Ok(()) => (format!("Queued {count} download(s); they continue after the TUI exits"), true),
+                                        Err(error) => (format!("Queued {count} download(s) but could not start worker: {error:#}"), false),
+                                    });
+                                    if let Some(task) = job_poster_catalog_task.take() {
+                                        task.abort();
+                                    }
+                                    let config = config.clone();
+                                    job_poster_catalog_task = Some(tokio::spawn(async move {
+                                        jellyfin_job_poster_catalog(&config).await
+                                    }));
+                                }
+                                Some(Err(error)) => {
+                                    explore_notice = Some((format!("Could not queue download: {error:#}"), false));
+                                }
+                                None => {}
                             }
                         }
                         KeyCode::Char(character) if !browser.details_focus && !character.is_control() => {
@@ -3525,9 +3874,7 @@ async fn tui(config: Config) -> Result<()> {
                             ));
                         }
                         KeyCode::Char('b') => {
-                            if explore_task.is_some() {
-                                explore_notice = Some(("Wait for the current library download to finish".into(), false));
-                            } else if let Some((api, items)) = library_cache.clone() {
+                            if let Some((api, items)) = library_cache.clone() {
                                 explore = Some(ExploreState {
                                     api: Some(api),
                                     items,
@@ -4019,7 +4366,7 @@ fn key_hint(key: &'static str, label: &'static str) -> [Span<'static>; 2] {
 }
 
 fn key_sep() -> Span<'static> {
-    Span::styled("│", Style::default().fg(Color::DarkGray))
+    Span::raw("  ")
 }
 
 fn download_progress(bytes: u64, total: Option<u64>, width: usize) -> (String, String) {
@@ -4176,16 +4523,20 @@ fn list_index_at(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Plain output for pipes and journald; crossterm already honours NO_COLOR on a TTY.
+    if !std::io::IsTerminal::is_terminal(&stdout()) {
+        crossterm::style::force_color_output(false);
+    }
     match cli.command {
         Some(Commands::Status) => status(cli.json),
         Some(Commands::Start) => systemctl("start", cli.json),
         Some(Commands::Stop) => systemctl("stop", cli.json),
-        Some(Commands::Tui) if cli.json => bail!("--json is not supported with tui"),
-        Some(Commands::Tui) => {
+        None | Some(Commands::Tui) if cli.json => bail!("--json is not supported with tui"),
+        None | Some(Commands::Tui) => {
             let path = config_path(cli.config)?;
             let config =
                 load_config(&path).with_context(|| format!("load config {}", path.display()))?;
-            tui(config).await
+            tui(config, path).await
         }
         command => {
             let path = config_path(cli.config)?;
@@ -4196,13 +4547,17 @@ async fn main() -> Result<()> {
                 bail!("parallelism must be at least 1");
             }
             match command {
-                Some(Commands::Sync { target }) => {
-                    let result = run_sync_mode(config, target.clone(), parallelism, cli.json).await;
+                Some(Commands::Download { target }) => {
+                    let result =
+                        run_sync_mode(config.clone(), target.clone(), parallelism, cli.json).await;
+                    if target.is_empty() {
+                        finish_library_jobs(&config).await;
+                    }
                     if cli.json {
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&json!({
-                                "command": "sync",
+                                "command": "download",
                                 "targets": target,
                                 "ok": result.is_ok(),
                                 "error": result.as_ref().err().map(|error| format!("{error:#}")),
@@ -4235,24 +4590,9 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
-                None => {
-                    let targets = cli.targets;
-                    let result =
-                        run_sync_mode(config, targets.clone(), parallelism, cli.json).await;
-                    if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&json!({
-                                "command": "sync",
-                                "targets": targets,
-                                "ok": result.is_ok(),
-                                "error": result.as_ref().err().map(|error| format!("{error:#}")),
-                            }))?
-                        );
-                    }
-                    result
-                }
-                Some(Commands::Status | Commands::Start | Commands::Stop | Commands::Tui) => {
+                Some(Commands::Worker { job }) => library_worker(&config, &job).await,
+                None
+                | Some(Commands::Status | Commands::Start | Commands::Stop | Commands::Tui) => {
                     unreachable!()
                 }
             }

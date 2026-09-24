@@ -255,6 +255,12 @@
                 type = types.attrsOf (
                   types.submodule {
                     options = {
+                      jellyfin_name = mkOption {
+                        type = types.nullOr types.str;
+                        default = null;
+                        description = "Jellyfin library title when it differs from the job name.";
+                      };
+
                       remote_dir = mkOption {
                         type = types.nullOr types.str;
                         default = null;

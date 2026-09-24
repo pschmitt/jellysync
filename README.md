@@ -415,6 +415,7 @@ Each job defines a sync operation.
 | Option | Required | Type | Description |
 |--------|----------|------|-------------|
 | `name` | Yes | string | Name of the job (used in templates as `$name`) |
+| `jellyfin_name` | No | string | Jellyfin title to search when it differs from the job name |
 | `remote_dir` | No | string | Remote directory path (supports templates and wildcards) |
 | `local_dir` | No | string | Local directory path (supports templates) |
 | `directory` | No | string | Shorthand: expands to `$directory/$name` for both remote and local |
@@ -562,7 +563,7 @@ jellysync --config /path/to/config.yaml config
 - `sync [JOB...]`: Sync all jobs or selected jobs
 - `status`: Show latest job state and systemd timer state
 - `prune [--apply] [JOB...]`: Preview deletions, or apply them
-- `tui`: Review jobs/downloads and existing files; `r` syncs the selected job, `R` syncs all jobs, and `d` (file), `s` (season), `S` (show), then `y` clears media
+- `tui`: Select a job to see its tracked downloads; `s` syncs that job, `S` syncs all jobs, and `e` opens Jellyfin Explore. Explore searches the library, renders posters with `ratatui-image` (including Kitty graphics protocol support), opens series to select episodes (`Space`/`a`), and downloads movies or selected episodes with `d`. In the main view, `x` (file), `X` (season), `c` (show), then `y` clears media. Mouse clicks and scrolling select rows.
 - `-h, --help`: Show help message
 - `--version`: Show version
 

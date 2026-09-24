@@ -8,8 +8,9 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, MouseButton, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -22,6 +23,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
+use ratatui_image::{Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol};
 use reqwest::{Client as HttpClient, StatusCode};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -132,6 +134,8 @@ fn default_season_pattern() -> String {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Job {
     name: String,
+    #[serde(default)]
+    jellyfin_name: Option<String>,
     remote_dir: Option<String>,
     local_dir: Option<String>,
     directory: Option<String>,
@@ -305,10 +309,41 @@ struct ItemsResponse {
 struct MediaItem {
     id: String,
     name: String,
+    #[serde(default)]
+    item_type: Option<String>,
+    #[serde(default)]
+    production_year: Option<u32>,
     path: Option<String>,
     parent_index_number: Option<u32>,
     index_number: Option<u32>,
     user_data: Option<UserData>,
+}
+
+struct ExploreState {
+    items: Vec<MediaItem>,
+    episodes: Vec<MediaItem>,
+    selected: usize,
+    episode_cursor: usize,
+    selected_episodes: HashSet<usize>,
+    search: String,
+    series_title: Option<String>,
+    poster_id: Option<String>,
+    poster: Option<StatefulProtocol>,
+}
+
+impl ExploreState {
+    fn filtered_items(&self) -> Vec<&MediaItem> {
+        self.items
+            .iter()
+            .filter(|item| {
+                self.search.is_empty()
+                    || item
+                        .name
+                        .to_lowercase()
+                        .contains(&self.search.to_lowercase())
+            })
+            .collect()
+    }
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -417,6 +452,149 @@ async fn jellyfin_items(api: &JellyfinApi, query: &[(&str, &str)]) -> Result<Vec
         .items)
 }
 
+async fn jellyfin_catalog(config: &Config) -> Result<(JellyfinApi, Vec<MediaItem>)> {
+    let credentials = config
+        .jellyfin
+        .as_ref()
+        .context("Explore requires Jellyfin credentials")?;
+    let api = jellyfin_login(credentials).await?;
+    let mut items = jellyfin_items(
+        &api,
+        &[
+            ("Recursive", "true"),
+            ("IncludeItemTypes", "Series,Movie"),
+            ("Fields", "Path,ProductionYear"),
+            ("SortBy", "SortName"),
+            ("Limit", "1000"),
+        ],
+    )
+    .await?;
+    items.sort_by_key(|item| item.name.to_lowercase());
+    Ok((api, items))
+}
+
+async fn jellyfin_episodes(api: &JellyfinApi, series: &MediaItem) -> Result<Vec<MediaItem>> {
+    jellyfin_items(
+        api,
+        &[
+            ("ParentId", series.id.as_str()),
+            ("Recursive", "true"),
+            ("IncludeItemTypes", "Episode"),
+            ("Fields", "Path,ParentIndexNumber,IndexNumber"),
+            ("SortBy", "ParentIndexNumber,IndexNumber"),
+            ("Limit", "10000"),
+        ],
+    )
+    .await
+}
+
+async fn jellyfin_poster(api: &JellyfinApi, item: &MediaItem) -> Result<Option<Vec<u8>>> {
+    let response = api
+        .client
+        .get(format!(
+            "{}/Items/{}/Images/Primary?maxWidth=640",
+            api.base, item.id
+        ))
+        .header("Authorization", jellyfin_authorization(&api.token))
+        .send()
+        .await
+        .context("request Jellyfin poster")?;
+    if response.status() == StatusCode::NOT_FOUND || response.status() == StatusCode::NO_CONTENT {
+        return Ok(None);
+    }
+    Ok(Some(
+        response
+            .error_for_status()
+            .context("Jellyfin poster request failed")?
+            .bytes()
+            .await
+            .context("read Jellyfin poster")?
+            .to_vec(),
+    ))
+}
+
+fn poster_protocol(picker: &Picker, data: &[u8]) -> Result<StatefulProtocol> {
+    let image = image::load_from_memory(data).context("decode Jellyfin poster")?;
+    Ok(picker.new_resize_protocol(image))
+}
+
+async fn download_library_items(
+    config: Config,
+    items: Vec<MediaItem>,
+    title: String,
+    movie: bool,
+) -> Result<usize> {
+    if items.is_empty() {
+        bail!("select at least one item to download");
+    }
+    let credentials = config
+        .jellyfin
+        .as_ref()
+        .context("dynamic downloads require Jellyfin credentials")?;
+    let api = jellyfin_login(credentials).await?;
+    let job = format!("library:{title}");
+    let mut folder = PathBuf::from(&config.local.root);
+    folder.push(if movie { "Movies" } else { "TV Shows" });
+    folder.push(safe_component(&title));
+    std::fs::create_dir_all(&folder)?;
+    update_job(
+        &job,
+        "running",
+        &format!("{} selected item(s)", items.len()),
+    )?;
+    let count = items.len();
+    let slots = Arc::new(Semaphore::new(config.parallelism.max(1)));
+    let mut tasks = JoinSet::new();
+    for item in items {
+        let api = api.clone();
+        let job = job.clone();
+        let folder = folder.clone();
+        let title = title.clone();
+        let permit = slots.clone().acquire_owned().await?;
+        tasks.spawn(async move {
+            let _permit = permit;
+            let destination =
+                item_destination(&item, &folder, "Season $season_number", &title, movie)?;
+            jellyfin_download(&api, &job, &item, &destination, true).await
+        });
+    }
+    let mut failures = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result.context("dynamic Jellyfin transfer worker failed")? {
+            failures.push(format!("{error:#}"));
+        }
+    }
+    if !failures.is_empty() {
+        update_job(&job, "failed", &failures.join("; "))?;
+        bail!(
+            "{} dynamic download(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
+        );
+    }
+    update_job(&job, "success", &format!("downloaded {count} item(s)"))?;
+    Ok(count)
+}
+
+fn safe_component(value: &str) -> String {
+    let safe: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '/' | '\\') {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let safe = safe.trim().trim_matches('.').to_string();
+    if safe.is_empty() {
+        "Untitled".into()
+    } else {
+        safe
+    }
+}
+
 fn find_one(items: Vec<MediaItem>, name: &str) -> Result<Option<MediaItem>> {
     let exact: Vec<_> = items
         .iter()
@@ -499,18 +677,19 @@ fn number_filter(
 }
 
 async fn jellyfin_item_ids(api: &JellyfinApi, job: &Job) -> Result<HashSet<String>> {
+    let jellyfin_name = job.jellyfin_name.as_deref().unwrap_or(&job.name);
     let series = jellyfin_items(
         api,
         &[
             ("Recursive", "true"),
             ("IncludeItemTypes", "Series"),
-            ("SearchTerm", job.name.as_str()),
+            ("SearchTerm", jellyfin_name),
             ("Fields", "Path"),
             ("Limit", "100"),
         ],
     )
     .await?;
-    let items = if let Some(series) = find_one(series, &job.name)? {
+    let items = if let Some(series) = find_one(series, jellyfin_name)? {
         jellyfin_items(
             api,
             &[
@@ -528,13 +707,13 @@ async fn jellyfin_item_ids(api: &JellyfinApi, job: &Job) -> Result<HashSet<Strin
             &[
                 ("Recursive", "true"),
                 ("IncludeItemTypes", "Movie"),
-                ("SearchTerm", job.name.as_str()),
+                ("SearchTerm", jellyfin_name),
                 ("Fields", "Path"),
                 ("Limit", "100"),
             ],
         )
         .await?;
-        find_one(movies, &job.name)?.into_iter().collect()
+        find_one(movies, jellyfin_name)?.into_iter().collect()
     };
     if items.is_empty() {
         bail!(
@@ -553,7 +732,14 @@ async fn jellyfin_job(
 ) -> Result<()> {
     let (api, movie_mode, items) = jellyfin_job_items(config, job).await?;
     if items.is_empty() {
-        update_job(&job.name, "success", "no media matched filters")?;
+        let message = format!(
+            "No Jellyfin media matched '{}' or its filters",
+            job.jellyfin_name.as_deref().unwrap_or(&job.name)
+        );
+        update_job(&job.name, "skipped", &message)?;
+        if !quiet {
+            eprintln!("{}", message);
+        }
         return Ok(());
     }
     let count = items.len();
@@ -607,18 +793,19 @@ async fn jellyfin_job_items(
         .as_ref()
         .context("Jellyfin mode requires jellyfin credentials")?;
     let api = jellyfin_login(credentials).await?;
+    let jellyfin_name = job.jellyfin_name.as_deref().unwrap_or(&job.name);
     let found = jellyfin_items(
         &api,
         &[
             ("Recursive", "true"),
             ("IncludeItemTypes", "Series"),
-            ("SearchTerm", job.name.as_str()),
+            ("SearchTerm", jellyfin_name),
             ("Fields", "Path"),
             ("Limit", "100"),
         ],
     )
     .await?;
-    let series = find_one(found, &job.name)?;
+    let series = find_one(found, jellyfin_name)?;
     let movie_mode;
     let mut items = if let Some(series) = series {
         movie_mode = false;
@@ -640,17 +827,14 @@ async fn jellyfin_job_items(
             &[
                 ("Recursive", "true"),
                 ("IncludeItemTypes", "Movie"),
-                ("SearchTerm", job.name.as_str()),
+                ("SearchTerm", jellyfin_name),
                 ("Fields", "Path,UserData"),
                 ("Limit", "100"),
             ],
         )
         .await?;
-        find_one(found, &job.name)?.into_iter().collect()
+        find_one(found, jellyfin_name)?.into_iter().collect()
     };
-    if items.is_empty() {
-        bail!("no Jellyfin media matched '{}'", job.name);
-    }
     let max_season = items
         .iter()
         .filter_map(|item| item.parent_index_number)
@@ -1175,17 +1359,33 @@ async fn tui(config: Config) -> Result<()> {
     };
     let mut out = stdout();
     enable_raw_mode()?;
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let result = async move {
         let backend = CrosstermBackend::new(out);
         let mut terminal = Terminal::new(backend)?;
+        let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
         let mut selected = 0usize;
         let mut selected_download = 0usize;
         let mut download_focus = false;
         let mut confirm_clear = None;
+        let mut explore: Option<ExploreState> = None;
+        let mut explore_notice: Option<(String, bool)> = None;
+        let mut explore_task: Option<tokio::task::JoinHandle<Result<usize>>> = None;
         let mut sync_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
         let mut sync_notice = initial_notice;
+        let mut jobs_state = ListState::default();
+        let mut downloads_state = ListState::default();
+        let mut explore_state = ListState::default();
+        let mut episode_state = ListState::default();
         loop {
+            if explore_task.as_ref().is_some_and(|task| task.is_finished()) {
+                let task = explore_task.take().expect("finished Explore task exists");
+                explore_notice = Some(match task.await {
+                    Ok(Ok(count)) => (format!("Queued {count} library download(s)"), true),
+                    Ok(Err(error)) => (format!("Explore download failed: {error:#}"), false),
+                    Err(error) => (format!("Explore download stopped: {error}"), false),
+                });
+            }
             if sync_task.as_ref().is_some_and(|task| task.is_finished()) {
                 let task = sync_task.take().expect("finished sync task exists");
                 sync_notice = Some(match task.await {
@@ -1209,13 +1409,22 @@ async fn tui(config: Config) -> Result<()> {
                 let (name, state, message, time) = row?;
                 history.insert(name, (state, message.unwrap_or_default(), time));
             }
-            let downloads = tracked_downloads()?;
-            if selected_download >= downloads.len() && !downloads.is_empty() {
-                selected_download = downloads.len() - 1;
-            }
             let jobs = &config.jobs;
             if selected >= jobs.len() && !jobs.is_empty() {
                 selected = jobs.len() - 1;
+            }
+            let selected_job = jobs.get(selected);
+            let downloads: Vec<_> = tracked_downloads()?
+                .into_iter()
+                .filter(|entry| {
+                    entry.job.starts_with("library:")
+                        || selected_job.is_some_and(|job| entry.job == job.name)
+                })
+                .collect();
+            if downloads.is_empty() {
+                selected_download = 0;
+            } else if selected_download >= downloads.len() {
+                selected_download = downloads.len() - 1;
             }
             let entries: Vec<ListItem> = jobs
                 .iter()
@@ -1300,29 +1509,40 @@ async fn tui(config: Config) -> Result<()> {
                 .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
                 .filter(|state| !state.is_empty())
                 .unwrap_or_else(|| "unknown".into());
-            terminal.draw(|frame| {
-                let area = frame.area();
-                let [header, body, footer] = Layout::default()
+            let size = terminal.size()?;
+            let area = Rect::new(0, 0, size.width, size.height);
+            let explore_popup = centered_rect(90, 88, area);
+            let [explore_list_area, explore_poster_area] = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+                .areas(Rect {
+                    x: explore_popup.x + 1,
+                    y: explore_popup.y + 2,
+                    width: explore_popup.width.saturating_sub(2),
+                    height: explore_popup.height.saturating_sub(4),
+                });
+            let [header, body, footer] = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(4),
+                    Constraint::Length(2),
+                ])
+                .areas(area);
+            let (jobs_area, downloads_area) = if area.width >= 100 {
+                let [downloads_area, jobs_area] = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+                    .areas(body);
+                (jobs_area, downloads_area)
+            } else {
+                let [jobs_area, downloads_area] = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Min(4),
-                        Constraint::Length(2),
-                    ])
-                    .areas(area);
-                let (jobs_area, downloads_area) = if area.width >= 100 {
-                    let [jobs_area, downloads_area] = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
-                        .areas(body);
-                    (jobs_area, downloads_area)
-                } else {
-                    let [jobs_area, downloads_area] = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-                        .areas(body);
-                    (jobs_area, downloads_area)
-                };
+                    .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                    .areas(body);
+                (jobs_area, downloads_area)
+            };
+            terminal.draw(|frame| {
                 let sync_label = if sync_task.is_some() {
                     "SYNC RUNNING"
                 } else {
@@ -1373,15 +1593,17 @@ async fn tui(config: Config) -> Result<()> {
                     header,
                 );
 
-                let jobs_title = format!("Sync jobs · {}", jobs.len());
-                let downloads_title = format!("Downloads · {}", downloads.len());
+                let jobs_title = format!("Jobs · {}", jobs.len());
+                let downloads_title = format!(
+                    "Tracked downloads · {} · {}",
+                    selected_job.map_or("no job selected", |job| job.name.as_str()),
+                    downloads.len()
+                );
                 let jobs_block = panel_block(&jobs_title, !download_focus);
                 let downloads_block = panel_block(&downloads_title, download_focus);
-                let mut jobs_state = ListState::default();
                 if !jobs.is_empty() {
                     jobs_state.select(Some(selected));
                 }
-                let mut downloads_state = ListState::default();
                 if !downloads.is_empty() {
                     downloads_state.select(Some(selected_download));
                 }
@@ -1424,22 +1646,25 @@ async fn tui(config: Config) -> Result<()> {
                     let mut shortcut_spans = Vec::new();
                     let shortcuts = if area.width < 110 {
                         vec![
+                            ("click", "select"),
                             ("Tab", "focus"),
-                            ("↑/↓", "select"),
-                            ("r", "sync"),
-                            ("R", "all"),
-                            ("d/s/S", "clear"),
+                            ("s", "sync"),
+                            ("S", "all"),
+                            ("e", "explore"),
+                            ("x/X/c", "clear"),
                             ("q", "quit"),
                         ]
                     } else {
                         vec![
+                            ("click", "select"),
                             ("Tab", "focus"),
                             ("↑/↓", "select"),
-                            ("r", "sync job"),
-                            ("R", "sync all"),
-                            ("d", "clear file / show"),
-                            ("s", "season"),
-                            ("S", "show"),
+                            ("s", "sync job"),
+                            ("S", "sync all"),
+                            ("e", "explore library"),
+                            ("x", "clear file"),
+                            ("X", "clear season"),
+                            ("c", "clear show"),
                             ("q", "quit"),
                         ]
                     };
@@ -1461,7 +1686,7 @@ async fn tui(config: Config) -> Result<()> {
                                     )
                                 })
                                 .unwrap_or_else(|| {
-                                    "  Select a download to clear it, its season, or the full show."
+                                    "  Downloads follow the selected job; clear a file, season, or show."
                                         .into()
                                 }),
                             Style::default()
@@ -1506,11 +1731,350 @@ async fn tui(config: Config) -> Result<()> {
                         },
                     );
                 }
+                if let Some(explore) = explore.as_mut() {
+                    let filtered = explore.filtered_items();
+                    frame.render_widget(Clear, explore_popup);
+                    frame.render_widget(
+                        Block::default()
+                            .title(Span::styled(
+                                " Explore Jellyfin ",
+                                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                            ))
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::Magenta)),
+                        explore_popup,
+                    );
+                    if let Some(series_title) = &explore.series_title {
+                        let rows: Vec<_> = explore
+                            .episodes
+                            .iter()
+                            .enumerate()
+                            .map(|(index, episode)| {
+                                let season = episode.parent_index_number.unwrap_or(0);
+                                let number = episode.index_number.unwrap_or(0);
+                                let mark = if explore.selected_episodes.contains(&index) { "✓ " } else { "  " };
+                                ListItem::new(format!("{mark}S{season:02}E{number:02}  {}", episode.name))
+                            })
+                            .collect();
+                        episode_state.select((!rows.is_empty()).then_some(explore.episode_cursor));
+                        frame.render_widget(
+                            List::new(rows)
+                                .block(panel_block(&format!("{series_title} · episodes"), true))
+                                .highlight_style(Style::default().fg(Color::White).bg(Color::Rgb(50, 40, 70)).add_modifier(Modifier::BOLD))
+                                .highlight_symbol("▌ "),
+                            explore_list_area,
+                        );
+                        let details = vec![
+                            Line::from(Span::styled(series_title.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+                            Line::from(Span::styled(format!("{} episodes · {} selected", explore.episodes.len(), explore.selected_episodes.len()), Style::default().fg(Color::Gray))),
+                            Line::from(Span::styled("Space select · a select all · d download", Style::default().fg(Color::Cyan))),
+                        ];
+                        frame.render_widget(Paragraph::new(details).block(panel_block("Series", false)), explore_poster_area);
+                    } else {
+                        let rows: Vec<_> = filtered
+                            .iter()
+                            .map(|item| {
+                                let kind = item.item_type.as_deref().unwrap_or("Media");
+                                let year = item.production_year.map(|year| format!(" · {year}")).unwrap_or_default();
+                                ListItem::new(vec![
+                                    Line::from(Span::styled(item.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+                                    Line::from(Span::styled(format!("{kind}{year}"), Style::default().fg(Color::Gray))),
+                                ])
+                            })
+                            .collect();
+                        explore_state.select((!rows.is_empty()).then_some(explore.selected.min(rows.len().saturating_sub(1))));
+                        frame.render_widget(
+                            List::new(rows)
+                                .block(panel_block(&format!("Library · {} · / search", filtered.len()), true))
+                                .highlight_style(Style::default().fg(Color::White).bg(Color::Rgb(50, 40, 70)).add_modifier(Modifier::BOLD))
+                                .highlight_symbol("▌ "),
+                            explore_list_area,
+                        );
+                        if let Some(item) = filtered.get(explore.selected) {
+                            let details_area = Rect { x: explore_poster_area.x + 1, y: explore_poster_area.y + 1, width: explore_poster_area.width.saturating_sub(2), height: 3 };
+                            frame.render_widget(
+                                Paragraph::new(vec![
+                                    Line::from(Span::styled(item.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+                                    Line::from(Span::styled(format!("{}{}", item.item_type.as_deref().unwrap_or("Media"), item.production_year.map(|year| format!(" · {year}")).unwrap_or_default()), Style::default().fg(Color::Gray))),
+                                    Line::from(Span::styled("Enter open series · d download movie", Style::default().fg(Color::Cyan))),
+                                ]),
+                                details_area,
+                            );
+                            let poster_box = Rect { x: explore_poster_area.x + 2, y: explore_poster_area.y + 5, width: explore_poster_area.width.saturating_sub(4), height: explore_poster_area.height.saturating_sub(7) };
+                            if let Some(poster) = &mut explore.poster {
+                                frame.render_stateful_widget(
+                                    StatefulImage::default().resize(Resize::Fit(None)),
+                                    poster_box,
+                                    poster,
+                                );
+                            } else {
+                                frame.render_widget(Paragraph::new("Poster unavailable").style(Style::default().fg(Color::DarkGray)), poster_box);
+                            }
+                        }
+                    }
+                    let footer = Rect { x: explore_popup.x + 1, y: explore_popup.y + explore_popup.height.saturating_sub(2), width: explore_popup.width.saturating_sub(2), height: 1 };
+                    let text = if let Some((notice, _)) = &explore_notice {
+                        format!("{}  ·  {}  ·  Esc close", explore.search, notice)
+                    } else {
+                        format!("{}  ·  ↑/↓ navigate  ·  Enter open  ·  d download  ·  Esc close", if explore.series_title.is_some() { "episode selection".to_string() } else { format!("Search: {}", explore.search) })
+                    };
+                    frame.render_widget(Paragraph::new(text).style(Style::default().fg(Color::Gray)), footer);
+                }
             })?;
-            if event::poll(Duration::from_secs(1))?
-                && let Event::Key(key) = event::read()?
-            {
-                if let Some(scope) = confirm_clear {
+            if event::poll(Duration::from_secs(1))? {
+                let input = event::read()?;
+                if let Event::Mouse(mouse) = &input {
+                    if let Some(browser) = explore.as_mut() {
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) if browser.series_title.is_some() => {
+                                if mouse.column >= explore_list_area.x
+                                    && mouse.column < explore_list_area.x + explore_list_area.width
+                                    && mouse.row > explore_list_area.y
+                                    && mouse.row < explore_list_area.y + explore_list_area.height.saturating_sub(1)
+                                {
+                                    browser.episode_cursor = (usize::from(mouse.row - explore_list_area.y - 1)).min(browser.episodes.len().saturating_sub(1));
+                                    if !browser.episodes.is_empty()
+                                        && !browser
+                                            .selected_episodes
+                                            .remove(&browser.episode_cursor)
+                                    {
+                                        browser.selected_episodes.insert(browser.episode_cursor);
+                                    }
+                                }
+                            }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                if mouse.column >= explore_list_area.x
+                                    && mouse.column < explore_list_area.x + explore_list_area.width
+                                    && mouse.row > explore_list_area.y
+                                    && mouse.row < explore_list_area.y + explore_list_area.height.saturating_sub(1)
+                                {
+                                    let row = usize::from(mouse.row - explore_list_area.y - 1);
+                                    browser.selected = (row / 2).min(browser.filtered_items().len().saturating_sub(1));
+                                }
+                            }
+                            MouseEventKind::ScrollUp if browser.series_title.is_some() => {
+                                browser.episode_cursor = browser.episode_cursor.saturating_sub(1);
+                            }
+                            MouseEventKind::ScrollDown if browser.series_title.is_some() => {
+                                if browser.episode_cursor + 1 < browser.episodes.len() {
+                                    browser.episode_cursor += 1;
+                                }
+                            }
+                            MouseEventKind::ScrollUp => browser.selected = browser.selected.saturating_sub(1),
+                            MouseEventKind::ScrollDown => {
+                                let len = browser.filtered_items().len();
+                                if browser.selected + 1 < len {
+                                    browser.selected += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                        if browser.series_title.is_none()
+                            && let Some(item) = browser
+                                .filtered_items()
+                                .get(browser.selected)
+                                .map(|item| (*item).clone())
+                            && browser.poster_id.as_deref() != Some(&item.id)
+                        {
+                            browser.poster_id = Some(item.id.clone());
+                            browser.poster = None;
+                            if let Some(credentials) = config.jellyfin.as_ref()
+                                && let Ok(api) = jellyfin_login(credentials).await
+                            {
+                                browser.poster = match jellyfin_poster(&api, &item).await {
+                                    Ok(Some(data)) => poster_protocol(&picker, &data).ok(),
+                                    _ => None,
+                                };
+                            }
+                        }
+                    } else if confirm_clear.is_none() {
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                if let Some(index) = list_index_at(
+                                    jobs_area,
+                                    mouse.column,
+                                    mouse.row,
+                                    jobs_state.offset(),
+                                    jobs.len(),
+                                ) {
+                                    selected = index;
+                                    selected_download = 0;
+                                    download_focus = false;
+                                } else if let Some(index) = list_index_at(
+                                    downloads_area,
+                                    mouse.column,
+                                    mouse.row,
+                                    downloads_state.offset(),
+                                    downloads.len(),
+                                ) {
+                                    selected_download = index;
+                                    download_focus = true;
+                                }
+                            }
+                            MouseEventKind::ScrollUp
+                                if mouse.column >= jobs_area.x
+                                    && mouse.column < jobs_area.x + jobs_area.width
+                                    && mouse.row >= jobs_area.y
+                                    && mouse.row < jobs_area.y + jobs_area.height =>
+                            {
+                                selected = selected.saturating_sub(1);
+                                selected_download = 0;
+                                download_focus = false;
+                            }
+                            MouseEventKind::ScrollDown
+                                if mouse.column >= jobs_area.x
+                                    && mouse.column < jobs_area.x + jobs_area.width
+                                    && mouse.row >= jobs_area.y
+                                    && mouse.row < jobs_area.y + jobs_area.height
+                                    && selected + 1 < jobs.len() =>
+                            {
+                                selected += 1;
+                                selected_download = 0;
+                                download_focus = false;
+                            }
+                            MouseEventKind::ScrollUp
+                                if mouse.column >= downloads_area.x
+                                    && mouse.column < downloads_area.x + downloads_area.width
+                                    && mouse.row >= downloads_area.y
+                                    && mouse.row < downloads_area.y + downloads_area.height =>
+                            {
+                                selected_download = selected_download.saturating_sub(1);
+                                download_focus = true;
+                            }
+                            MouseEventKind::ScrollDown
+                                if mouse.column >= downloads_area.x
+                                    && mouse.column < downloads_area.x + downloads_area.width
+                                    && mouse.row >= downloads_area.y
+                                    && mouse.row < downloads_area.y + downloads_area.height
+                                    && selected_download + 1 < downloads.len() =>
+                            {
+                                selected_download += 1;
+                                download_focus = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if let Event::Key(key) = input {
+                if let Some(browser) = explore.as_mut() {
+                    match key.code {
+                        KeyCode::Esc => {
+                            if browser.series_title.take().is_some() {
+                                browser.selected_episodes.clear();
+                                browser.episodes.clear();
+                                browser.episode_cursor = 0;
+                            } else {
+                                explore = None;
+                                explore_notice = None;
+                            }
+                        }
+                        KeyCode::Up => {
+                            if browser.series_title.is_some() {
+                                browser.episode_cursor = browser.episode_cursor.saturating_sub(1);
+                            } else {
+                                browser.selected = browser.selected.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down => {
+                            if browser.series_title.is_some() {
+                                if browser.episode_cursor + 1 < browser.episodes.len() {
+                                    browser.episode_cursor += 1;
+                                }
+                            } else {
+                                let len = browser.filtered_items().len();
+                                if browser.selected + 1 < len {
+                                    browser.selected += 1;
+                                }
+                            }
+                        }
+                        KeyCode::Char('/') if browser.series_title.is_none() => {
+                            browser.search.clear();
+                            browser.selected = 0;
+                        }
+                        KeyCode::Backspace if browser.series_title.is_none() => {
+                            browser.search.pop();
+                            browser.selected = 0;
+                        }
+                        KeyCode::Char(' ') if browser.series_title.is_some() && !browser.episodes.is_empty() => {
+                            if !browser.selected_episodes.remove(&browser.episode_cursor) {
+                                browser.selected_episodes.insert(browser.episode_cursor);
+                            }
+                        }
+                        KeyCode::Char('a') if browser.series_title.is_some() => {
+                            browser.selected_episodes = (0..browser.episodes.len()).collect();
+                        }
+                        KeyCode::Enter if browser.series_title.is_none() => {
+                            if let Some(item) = browser.filtered_items().get(browser.selected).map(|item| (*item).clone())
+                                && item.item_type.as_deref() == Some("Series")
+                            {
+                                let credentials = config.jellyfin.as_ref().context("Explore requires Jellyfin credentials")?;
+                                let api = jellyfin_login(credentials).await?;
+                                match jellyfin_episodes(&api, &item).await {
+                                    Ok(episodes) => {
+                                        browser.episodes = episodes;
+                                        browser.episode_cursor = 0;
+                                        browser.selected_episodes.clear();
+                                        browser.series_title = Some(item.name);
+                                        explore_notice = None;
+                                    }
+                                    Err(error) => explore_notice = Some((format!("Could not load episodes: {error:#}"), false)),
+                                }
+                            }
+                        }
+                        KeyCode::Char('d') => {
+                            if explore_task.is_some() {
+                                explore_notice = Some(("A library download is already running".into(), false));
+                            } else if let Some(title) = browser.series_title.clone() {
+                                let items: Vec<_> = browser.selected_episodes.iter()
+                                    .filter_map(|index| browser.episodes.get(*index).cloned())
+                                    .collect();
+                                if items.is_empty() {
+                                    explore_notice = Some(("Select episodes with Space or a first".into(), false));
+                                } else {
+                                    let config = config.clone();
+                                    explore_notice = Some((format!("Starting {} download(s) for {title}", items.len()), true));
+                                    explore_task = Some(tokio::spawn(async move {
+                                        download_library_items(config, items, title, false).await
+                                    }));
+                                }
+                            } else if let Some(item) = browser.filtered_items().get(browser.selected).map(|item| (*item).clone())
+                                && item.item_type.as_deref() == Some("Movie")
+                            {
+                                let title = item.name.clone();
+                                let config = config.clone();
+                                explore_notice = Some((format!("Starting download for {title}"), true));
+                                explore_task = Some(tokio::spawn(async move {
+                                    download_library_items(config, vec![item], title, true).await
+                                }));
+                            }
+                        }
+                        KeyCode::Char(character) if browser.series_title.is_none() && !character.is_control() => {
+                            browser.search.push(character);
+                            browser.selected = 0;
+                        }
+                        _ => {}
+                    }
+                    if let Some(browser) = explore.as_mut()
+                        && browser.series_title.is_none()
+                            && let Some(item) = browser.filtered_items().get(browser.selected).map(|item| (*item).clone())
+                        && browser.poster_id.as_deref() != Some(&item.id)
+                    {
+                        browser.poster_id = Some(item.id.clone());
+                        browser.poster = None;
+                        if let Some(credentials) = config.jellyfin.as_ref() {
+                            match jellyfin_login(credentials).await {
+                                Ok(api) => match jellyfin_poster(&api, &item).await {
+                                    Ok(Some(data)) => {
+                                        browser.poster = poster_protocol(&picker, &data).ok()
+                                    }
+                                    Ok(None) => browser.poster = None,
+                                    Err(error) => explore_notice = Some((format!("Poster unavailable: {error:#}"), false)),
+                                },
+                                Err(error) => explore_notice = Some((format!("Jellyfin login failed: {error:#}"), false)),
+                            }
+                        }
+                    }
+                } else if let Some(scope) = confirm_clear {
                     match key.code {
                         KeyCode::Char('y') => {
                             if download_focus {
@@ -1543,6 +2107,37 @@ async fn tui(config: Config) -> Result<()> {
                 } else {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('e') => {
+                            if explore_task.is_some() {
+                                explore_notice = Some(("Wait for the current library download to finish".into(), false));
+                            } else {
+                                match jellyfin_catalog(&config).await {
+                                    Ok((api, items)) => {
+                                        let mut browser = ExploreState {
+                                            items,
+                                            episodes: Vec::new(),
+                                            selected: 0,
+                                            episode_cursor: 0,
+                                            selected_episodes: HashSet::new(),
+                                            search: String::new(),
+                                            series_title: None,
+                                            poster_id: None,
+                                            poster: None,
+                                        };
+                                        if let Some(item) = browser.items.first() {
+                                            browser.poster_id = Some(item.id.clone());
+                                            browser.poster = match jellyfin_poster(&api, item).await {
+                                                Ok(Some(data)) => poster_protocol(&picker, &data).ok(),
+                                                _ => None,
+                                            };
+                                        }
+                                        explore = Some(browser);
+                                        explore_notice = None;
+                                    }
+                                    Err(error) => sync_notice = Some((format!("Could not open Explore: {error:#}"), false)),
+                                }
+                            }
+                        }
                         KeyCode::Tab => download_focus = !download_focus,
                         KeyCode::Up if download_focus => {
                             selected_download = selected_download.saturating_sub(1)
@@ -1552,9 +2147,18 @@ async fn tui(config: Config) -> Result<()> {
                         {
                             selected_download += 1
                         }
-                        KeyCode::Up => selected = selected.saturating_sub(1),
-                        KeyCode::Down if selected + 1 < jobs.len() => selected += 1,
-                        KeyCode::Char('r') if !download_focus && !jobs.is_empty() => {
+                        KeyCode::Up => {
+                            let next = selected.saturating_sub(1);
+                            if next != selected {
+                                selected = next;
+                                selected_download = 0;
+                            }
+                        }
+                        KeyCode::Down if selected + 1 < jobs.len() => {
+                            selected += 1;
+                            selected_download = 0;
+                        }
+                        KeyCode::Char('s') if !jobs.is_empty() => {
                             if sync_task.is_some() {
                                 sync_notice = Some(("A sync is already running".into(), false));
                             } else {
@@ -1569,7 +2173,7 @@ async fn tui(config: Config) -> Result<()> {
                                 }));
                             }
                         }
-                        KeyCode::Char('R') if !download_focus => {
+                        KeyCode::Char('S') => {
                             if sync_task.is_some() {
                                 sync_notice = Some(("A sync is already running".into(), false));
                             } else {
@@ -1581,16 +2185,16 @@ async fn tui(config: Config) -> Result<()> {
                                 }));
                             }
                         }
-                        KeyCode::Char('d') if download_focus && !downloads.is_empty() => {
+                        KeyCode::Char('x') if download_focus && !downloads.is_empty() => {
                             confirm_clear = Some(ClearScope::File)
                         }
-                        KeyCode::Char('s') if download_focus && !downloads.is_empty() => {
+                        KeyCode::Char('X') if download_focus && !downloads.is_empty() => {
                             confirm_clear = Some(ClearScope::Season)
                         }
-                        KeyCode::Char('S') if download_focus && !downloads.is_empty() => {
+                        KeyCode::Char('c') if download_focus && !downloads.is_empty() => {
                             confirm_clear = Some(ClearScope::Show)
                         }
-                        KeyCode::Char('d') if !jobs.is_empty() => {
+                        KeyCode::Char('c') if !jobs.is_empty() => {
                             download_focus = false;
                             confirm_clear = Some(ClearScope::Show);
                         }
@@ -1598,12 +2202,13 @@ async fn tui(config: Config) -> Result<()> {
                     }
                 }
             }
+            }
         }
         Ok(())
     }
     .await;
     disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen)?;
+    execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
     result
 }
 
@@ -1705,6 +2310,19 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         height,
     }
 }
+
+fn list_index_at(area: Rect, column: u16, row: u16, offset: usize, len: usize) -> Option<usize> {
+    if column < area.x
+        || column >= area.x + area.width
+        || row < area.y + 1
+        || row >= area.y + area.height.saturating_sub(1)
+    {
+        return None;
+    }
+    let index = offset + usize::from(row - area.y - 1) / 3;
+    (index < len).then_some(index)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();

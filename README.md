@@ -183,7 +183,7 @@ loading start once Jellyfin becomes reachable.
 In Explore, `Tab`, `→` or `Enter` moves focus from the library to the details
 pane of the selected show; there, `↑`/`↓` move through episodes, `Space`
 selects one, `a` selects all, and `d` or `Enter` downloads the selection
-(`d`/`Enter` on a movie downloads it). `Tab`, `←` or `Esc` returns to the
+(`Enter` on a movie downloads it). In the library pane every printable key goes to the search; `Ctrl-F` cycles the type filter. `Tab`, `←` or `Esc` returns to the
 library and `q` closes Explore; after closing Explore, the main view selects the job and file you just
 queued.
 
@@ -192,6 +192,18 @@ partial file and freeing its worker slot for the next queued one) and resumes a
 paused one. Paused downloads are not resumed automatically.
 
 Use `--config FILE` to select a config and `-j N` (`--parallelism`, `--parallel`) to override the worker limit for a download.
+
+`Ctrl-C` closes the open dialog (help, job config, file info, clear
+confirmation, Explore) without counting towards quitting; two more `Ctrl-C`
+presses in the main view quit.
+
+### Development
+
+Run `just` to list the development recipes. Compiling and Nix builds run on a
+remote build host (`rofl-13` by default, override with `just <recipe> host`):
+`just build`, `just release`, `just test`, `just clippy`, `just nix-build`,
+`just nix-check`; `just lint` runs the format checks, `statix`/`deadnix` and
+clippy, and `just check` runs everything.
 
 ### Manual Installation
 

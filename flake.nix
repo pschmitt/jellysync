@@ -465,6 +465,10 @@
             clippy
             rsync
             openssh
+            just
+            nixfmt
+            statix
+            deadnix
           ];
         };
       }

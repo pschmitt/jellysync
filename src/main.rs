@@ -2923,7 +2923,39 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     ])
                 })
                 .collect();
+            // The layout above was computed from an earlier size query; if the terminal
+            // was resized since (tmux switching clients does this), drawing it would
+            // index outside the resized buffer. Skip the frame and lay out again.
+            let mut stale_layout = false;
             terminal.draw(|frame| {
+                if frame.area() != area {
+                    stale_layout = true;
+                    return;
+                }
+                // Several panels use fixed offsets; below this size they would not fit.
+                if area.width < 40 || area.height < 12 {
+                    frame.render_widget(
+                        Paragraph::new(vec![
+                            Line::from(Span::styled(
+                                "◆ jellysync",
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            )),
+                            Line::from(Span::styled(
+                                "terminal too small (min 40x12)",
+                                Style::default().fg(Color::Gray),
+                            )),
+                        ])
+                        .alignment(ratatui::layout::Alignment::Center)
+                        .wrap(Wrap { trim: true }),
+                        Rect {
+                            x: 0,
+                            y: area.height.saturating_sub(2) / 2,
+                            width: area.width,
+                            height: area.height.min(2),
+                        },
+                    );
+                    return;
+                }
                 let sync_label = if sync_task.is_some() {
                     "SYNC RUNNING"
                 } else {
@@ -3158,13 +3190,15 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         y: inner.y,
                         width: inner.width.saturating_sub(still_width),
                         height: inner.height.saturating_sub(overview_height),
-                    };
+                    }
+                    .intersection(inner);
                     if let Some(still) = still
                         && still_width > 0
                     {
                         frame.render_stateful_widget(
                             StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle))),
-                            Rect { x: inner.x, y: inner.y, width: still_width - 1, height: rows_area.height.min(9) },
+                            Rect { x: inner.x, y: inner.y, width: still_width - 1, height: rows_area.height.min(9) }
+                                .intersection(inner),
                             still,
                         );
                     }
@@ -3199,7 +3233,8 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                                 y: inner.y + inner.height.saturating_sub(overview_height) + 1,
                                 width: inner.width,
                                 height: overview_height - 1,
-                            },
+                            }
+                            .intersection(inner),
                         );
                     }
                 }
@@ -3343,7 +3378,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                                     Line::from(vec![
                                         Span::raw(POSTER_INDENT),
                                         Span::styled(
-                                            if item.item_type.as_deref() == Some("Series") { "Show contents · Enter open" } else { "Movie · d download" },
+                                            if item.item_type.as_deref() == Some("Series") { "Show contents · Enter open" } else { "Movie · Enter download" },
                                             Style::default().fg(Color::Cyan),
                                         ),
                                     ]),
@@ -3356,7 +3391,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                             List::new(rows)
                                 .block(panel_block(
                                     &format!(
-                                        "Library · {} · {} · / search · f type",
+                                        "Library · {} · {} · type to search · ^F type",
                                         filtered.len(),
                                         explore.type_filter.label()
                                     ),
@@ -3410,7 +3445,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                                         if explore.details_focus {
                                             "Space select · a select all · d download · Tab/←/Esc back"
                                         } else {
-                                            "Tab/→/Enter select episodes · d download movie"
+                                            "Tab/→/Enter select episodes · Enter download movie"
                                         },
                                         Style::default().fg(Color::Cyan),
                                     )),
@@ -3474,7 +3509,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                                             Style::default().fg(Color::Gray),
                                         )),
                                         Line::from(Span::styled(
-                                            "Press d to download it.",
+                                            "Press Enter to download it.",
                                             Style::default().fg(Color::Gray),
                                         )),
                                     ])
@@ -3505,7 +3540,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         ])
                     } else {
                         Line::from(format!(
-                            "{}  ·  ↑/↓ navigate  ·  Tab switch pane  ·  d download  ·  Esc {}",
+                            "{}  ·  ↑/↓ navigate  ·  Tab switch pane  ·  Enter download  ·  Esc {}",
                             if explore.details_focus {
                                 "episode selection".to_string()
                             } else {
@@ -3544,7 +3579,8 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         )),
                         Line::from("  ↑/↓               move through library or episodes"),
                         Line::from("  /                 search library"),
-                        Line::from("  f                 cycle type filter"),
+                        Line::from("  type / Backspace  search the library"),
+                        Line::from("  Ctrl-F            cycle type filter"),
                         Line::from("  Tab / ← / → / Enter  switch library / details pane"),
                         Line::from("  Space / a         select episode / select all"),
                         Line::from("  d                 download selected media"),
@@ -3564,6 +3600,9 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     );
                 }
             })?;
+            if stale_layout {
+                continue;
+            }
             if event::poll(Duration::from_millis(250))? {
                 let input = event::read()?;
                 if let Event::Resize(_, _) = input {
@@ -3783,7 +3822,23 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 } else if key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
-                    if explore.is_some() {
+                    // Ctrl-C closes the topmost dialog first. Closing one does not count
+                    // towards quitting: the next Ctrl-C is the first of the quitting pair.
+                    if show_help || show_job_config || confirm_clear.is_some() || file_info.is_some() {
+                        show_help = false;
+                        show_job_config = false;
+                        confirm_clear = None;
+                        if let Some(task) = file_info_task.take() {
+                            task.abort();
+                        }
+                        if let Some(task) = file_meta_task.take() {
+                            task.abort();
+                        }
+                        file_info = None;
+                        file_meta = None;
+                        last_ctrl_c = None;
+                    } else if explore.is_some() {
+                        last_ctrl_c = None;
                         if let Some(task) = catalog_task.take() {
                             task.abort();
                         }
@@ -3871,12 +3926,19 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                             browser.search.pop();
                             browser.selected = 0;
                         }
-                        KeyCode::Char('f') if !browser.details_focus => {
+                        // Ctrl-F, so that a plain f can be typed into the search.
+                        KeyCode::Char('f')
+                            if !browser.details_focus
+                                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
                             browser.type_filter = browser.type_filter.next();
                             browser.selected = 0;
                             explore_notice = None;
                         }
-                        KeyCode::Char('d') | KeyCode::Enter => {
+                        // In the library pane letters go to the search, so only Enter downloads.
+                        KeyCode::Char('d') | KeyCode::Enter
+                            if browser.details_focus || key.code == KeyCode::Enter =>
+                        {
                             let queued = if browser.details_focus
                                 && let Some(title) = browser
                                     .filtered_items()
@@ -3923,7 +3985,11 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                                 None => {}
                             }
                         }
-                        KeyCode::Char(character) if !browser.details_focus && !character.is_control() => {
+                        KeyCode::Char(character)
+                            if !browser.details_focus
+                                && !character.is_control()
+                                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
                             browser.search.push(character);
                             browser.selected = 0;
                         }

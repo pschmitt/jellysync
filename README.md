@@ -98,7 +98,7 @@ Jellysync includes a Home Manager module for automated synchronization with syst
       };
 
       # Sync schedule (systemd timer format)
-      schedule = "0 3 * * *";  # Daily at 3 AM
+      schedule = "*-*-* 03:00:00";  # Daily at 3 AM
       
       # Run missed jobs after system restart
       persistent = true;
@@ -117,24 +117,24 @@ Jellysync includes a Home Manager module for automated synchronization with syst
 | `enable` | bool | `false` | Enable the jellysync service |
 | `package` | package | *(auto)* | The jellysync package (automatically provided from flake) |
 | `settings` | attrs | - | Configuration settings (see Configuration section) |
-| `schedule` | string | `"0 3 * * *"` | Systemd timer schedule (OnCalendar format) |
+| `schedule` | string | `"hourly"` | Systemd timer schedule (OnCalendar format, not cron) |
 | `persistent` | bool | `true` | Run missed jobs after system restart |
 | `jobNames` | list of strings | `[]` | Specific jobs to sync (empty = all jobs) |
 
 **Schedule Examples:**
 
 ```nix
-# Daily at 3 AM (default)
-schedule = "0 3 * * *";
-
-# Every hour
+# Every hour (default)
 schedule = "hourly";
+
+# Daily at 3 AM
+schedule = "*-*-* 03:00:00";
 
 # Every 6 hours
 schedule = "*-*-* 0/6:00:00";
 
 # Twice daily (6 AM and 6 PM)
-schedule = "0 6,18 * * *";
+schedule = "*-*-* 06,18:00:00";
 
 # Every Monday at 2 AM
 schedule = "Mon *-*-* 02:00:00";

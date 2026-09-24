@@ -15,7 +15,8 @@ local:
     movies: Movies
     documentaries: ~/Documentaries
 
-# Required only for jobs with unwatched: true. Use a secret file for passwords.
+# Required for download.mode: jellyfin (the default) and for unwatched: true.
+# Use a secret file for passwords or API keys.
 jellyfin:
   base_url: https://jellyfin.example.com
   username: jelly

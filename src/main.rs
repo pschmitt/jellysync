@@ -110,7 +110,7 @@ enum Commands {
     },
     /// Show recent job status and the timer state
     Status,
-    /// Remove managed files that no longer match their job filters
+    /// Remove tracked files whose media no longer exists in Jellyfin (or remotely, in rsync mode)
     Prune {
         /// Actually delete files instead of previewing
         #[arg(long)]
@@ -266,8 +266,11 @@ fn load_config(path: &Path) -> Result<Config> {
 fn expand_home(value: &str) -> String {
     let home = env::var("HOME").unwrap_or_default();
     let value = value.replace("$HOME", &home);
-    if let Some(rest) = value.strip_prefix('~') {
-        format!("{home}{rest}")
+    // Only a bare `~` or `~/…`; `~user/…` names another user's home.
+    if value == "~" {
+        home
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        format!("{home}/{rest}")
     } else {
         value
     }
@@ -320,6 +323,21 @@ fn transfer_total(item_id: &str) -> Result<Option<u64>> {
         .optional()?
         .flatten())
 }
+/// Replace `$key` with the matching directory, longest keys first so `$tv_shows`
+/// is not mistaken for `$tv` followed by "_shows".
+fn substitute_directories<'a>(
+    value: &str,
+    directories: impl IntoIterator<Item = (&'a String, &'a String)>,
+) -> String {
+    let mut directories: Vec<_> = directories.into_iter().collect();
+    directories.sort_by_key(|(key, _)| std::cmp::Reverse(key.len()));
+    let mut value = value.to_string();
+    for (key, path) in directories {
+        value = value.replace(&format!("${key}"), path);
+    }
+    value
+}
+
 fn resolved_path(config: &Config, job: &Job, remote: bool) -> Result<String> {
     let (root, directories) = if remote {
         (&config.remote.root, &config.remote.directories)
@@ -342,9 +360,10 @@ fn resolved_path(config: &Config, job: &Job, remote: bool) -> Result<String> {
     } else {
         bail!("job '{}' needs remote_dir/local_dir or directory", job.name)
     };
-    let mut value = raw.replace("$name", &job.name);
-    for (key, path) in directories {
-        value = value.replace(&format!("{}{}", "$", key), path);
+    let mut value = substitute_directories(&raw.replace("$name", &job.name), directories);
+    // `~` and `$HOME` refer to this machine, so only local paths expand them.
+    if !remote {
+        value = expand_home(&value);
     }
     if Path::new(&value).is_absolute() {
         Ok(value)
@@ -1129,103 +1148,142 @@ fn find_one(items: Vec<MediaItem>, name: &str) -> Result<Option<MediaItem>> {
     }
 }
 
+/// Inclusive number ranges selected by a `seasons`/`episodes` filter.
+#[derive(Debug, PartialEq)]
+struct NumberFilter(Vec<(u32, u32)>);
+
+impl NumberFilter {
+    fn contains(&self, number: &u32) -> bool {
+        self.0
+            .iter()
+            .any(|(first, last)| (*first..=*last).contains(number))
+    }
+}
+
+/// Parse a filter against the numbers that actually exist. `latest` / `latest-N`
+/// pick the N highest existing numbers, skipping 0 (specials) unless nothing else
+/// exists. None means "no filter" (absent or `all`).
 fn number_filter(
     spec: Option<&serde_yaml::Value>,
-    latest: Option<u32>,
-) -> Result<Option<Vec<u32>>> {
+    available: &[u32],
+) -> Result<Option<NumberFilter>> {
     let Some(spec) = spec else {
         return Ok(None);
     };
-    if let Some(values) = spec.as_sequence() {
-        return Ok(Some(
-            values
-                .iter()
-                .filter_map(serde_yaml::Value::as_u64)
-                .map(|n| n as u32)
-                .collect(),
-        ));
-    }
-    if let Some(value) = spec.as_u64() {
-        return Ok(Some(vec![value as u32]));
-    }
-    let spec = spec
-        .as_str()
-        .context("filter must be a string or list of numbers")?;
-    if spec == "all" {
-        return Ok(None);
-    }
-    if let Some(count) = spec.strip_prefix("latest") {
-        let latest = latest.context("latest filter has no available media")?;
-        let count = count
-            .strip_prefix('-')
-            .map(str::parse::<u32>)
-            .transpose()?
-            .unwrap_or(1);
-        if count == 0 {
-            bail!("latest filter count must be positive");
+    let parts: Vec<String> = if let Some(values) = spec.as_sequence() {
+        if values.is_empty() {
+            bail!("filter list must not be empty");
         }
-        let selected = latest.saturating_sub(count - 1)..=latest;
-        return Ok(Some(selected.collect()));
-    }
-    if let Some((first, last)) = spec.split_once('-') {
-        let first = first.parse::<u32>().context("invalid filter range start")?;
-        let last = last.parse::<u32>().context("invalid filter range end")?;
-        if last < first {
-            bail!("filter range end must be greater than or equal to start");
+        values
+            .iter()
+            .map(|value| match value {
+                serde_yaml::Value::Number(number) => number
+                    .as_u64()
+                    .map(|number| number.to_string())
+                    .context("filter numbers must be non-negative integers"),
+                serde_yaml::Value::String(text) => Ok(text.clone()),
+                _ => bail!("filter list entries must be numbers or strings"),
+            })
+            .collect::<Result<_>>()?
+    } else if let Some(value) = spec.as_u64() {
+        vec![value.to_string()]
+    } else {
+        let spec = spec
+            .as_str()
+            .context("filter must be a string or list of numbers")?;
+        if spec.trim() == "all" {
+            return Ok(None);
         }
-        return Ok(Some((first..=last).collect()));
+        spec.split(',').map(str::to_string).collect()
+    };
+    let number = |text: &str| {
+        text.trim()
+            .parse::<u32>()
+            .with_context(|| format!("invalid filter number '{}'", text.trim()))
+    };
+    let mut ranges = Vec::new();
+    for part in &parts {
+        let part = part.trim();
+        if let Some(count) = part.strip_prefix("latest") {
+            let count = match count {
+                "" => 1,
+                _ => count
+                    .strip_prefix('-')
+                    .map(number)
+                    .transpose()?
+                    .with_context(|| format!("invalid latest filter '{part}'"))?,
+            };
+            if count == 0 {
+                bail!("latest filter count must be positive");
+            }
+            let mut existing: Vec<u32> = available.to_vec();
+            existing.sort_unstable();
+            existing.dedup();
+            if existing.iter().any(|number| *number > 0) {
+                existing.retain(|number| *number > 0);
+            }
+            if existing.is_empty() {
+                bail!("latest filter has no available media");
+            }
+            let skip = existing.len().saturating_sub(count as usize);
+            ranges.extend(existing[skip..].iter().map(|number| (*number, *number)));
+        } else if let Some((first, last)) = part.split_once('-') {
+            let (first, last) = (number(first)?, number(last)?);
+            if last < first {
+                bail!("filter range end must be greater than or equal to start");
+            }
+            ranges.push((first, last));
+        } else {
+            let number = number(part)?;
+            ranges.push((number, number));
+        }
     }
-    if spec.contains(',') {
-        return Ok(Some(
-            spec.split(',')
-                .map(|v| v.trim().parse::<u32>())
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-        ));
-    }
-    Ok(Some(vec![
-        spec.parse::<u32>().context("invalid filter number")?,
-    ]))
+    Ok(Some(NumberFilter(ranges)))
 }
 
-async fn jellyfin_item_ids(api: &JellyfinApi, job: &Job) -> Result<HashSet<String>> {
-    let jellyfin_name = job.jellyfin_name.as_deref().unwrap_or(&job.name);
-    let series = jellyfin_items(
+/// The series or movie a job name refers to. Both types are searched together so
+/// an exact movie title wins over a series that merely contains it (and the
+/// other way round); substring matches are only a fallback.
+async fn resolve_job_item(api: &JellyfinApi, name: &str) -> Result<Option<MediaItem>> {
+    let found = jellyfin_items(
         api,
         &[
             ("Recursive", "true"),
-            ("IncludeItemTypes", "Series"),
-            ("SearchTerm", jellyfin_name),
-            ("Fields", "Path"),
+            ("IncludeItemTypes", "Series,Movie"),
+            ("SearchTerm", name),
+            ("Fields", "Path,UserData"),
             ("Limit", "100"),
         ],
     )
     .await?;
-    let items = if let Some(series) = find_one(series, jellyfin_name)? {
-        jellyfin_items(
-            api,
-            &[
-                ("ParentId", series.id.as_str()),
-                ("Recursive", "true"),
-                ("IncludeItemTypes", "Episode"),
-                ("Fields", "Path"),
-                ("Limit", "10000"),
-            ],
-        )
-        .await?
-    } else {
-        let movies = jellyfin_items(
-            api,
-            &[
-                ("Recursive", "true"),
-                ("IncludeItemTypes", "Movie"),
-                ("SearchTerm", jellyfin_name),
-                ("Fields", "Path"),
-                ("Limit", "100"),
-            ],
-        )
-        .await?;
-        find_one(movies, jellyfin_name)?.into_iter().collect()
-    };
+    find_one(found, name)
+}
+
+/// Episodes of a series, or the movie itself, plus whether it is a movie.
+async fn resolve_job_media(api: &JellyfinApi, name: &str) -> Result<(bool, Vec<MediaItem>)> {
+    match resolve_job_item(api, name).await? {
+        Some(item) if item.item_type.as_deref() == Some("Series") => Ok((
+            false,
+            jellyfin_items(
+                api,
+                &[
+                    ("ParentId", item.id.as_str()),
+                    ("Recursive", "true"),
+                    ("IncludeItemTypes", "Episode"),
+                    ("Fields", "Path,UserData,ParentIndexNumber,IndexNumber"),
+                    ("Limit", "10000"),
+                ],
+            )
+            .await?,
+        )),
+        Some(item) => Ok((true, vec![item])),
+        None => Ok((true, Vec::new())),
+    }
+}
+
+async fn jellyfin_item_ids(api: &JellyfinApi, job: &Job) -> Result<HashSet<String>> {
+    let jellyfin_name = job.jellyfin_name.as_deref().unwrap_or(&job.name);
+    let (_, items) = resolve_job_media(api, jellyfin_name).await?;
     if items.is_empty() {
         bail!(
             "Jellyfin returned no media for '{}'; refusing to prune its downloads",
@@ -1325,52 +1383,12 @@ async fn jellyfin_job_items(
         .context("Jellyfin mode requires jellyfin credentials")?;
     let api = jellyfin_login(credentials).await?;
     let jellyfin_name = job.jellyfin_name.as_deref().unwrap_or(&job.name);
-    let found = jellyfin_items(
-        &api,
-        &[
-            ("Recursive", "true"),
-            ("IncludeItemTypes", "Series"),
-            ("SearchTerm", jellyfin_name),
-            ("Fields", "Path"),
-            ("Limit", "100"),
-        ],
-    )
-    .await?;
-    let series = find_one(found, jellyfin_name)?;
-    let movie_mode;
-    let mut items = if let Some(series) = series {
-        movie_mode = false;
-        jellyfin_items(
-            &api,
-            &[
-                ("ParentId", series.id.as_str()),
-                ("Recursive", "true"),
-                ("IncludeItemTypes", "Episode"),
-                ("Fields", "Path,UserData,ParentIndexNumber,IndexNumber"),
-                ("Limit", "10000"),
-            ],
-        )
-        .await?
-    } else {
-        movie_mode = true;
-        let found = jellyfin_items(
-            &api,
-            &[
-                ("Recursive", "true"),
-                ("IncludeItemTypes", "Movie"),
-                ("SearchTerm", jellyfin_name),
-                ("Fields", "Path,UserData"),
-                ("Limit", "100"),
-            ],
-        )
-        .await?;
-        find_one(found, jellyfin_name)?.into_iter().collect()
-    };
-    let max_season = items
+    let (movie_mode, mut items) = resolve_job_media(&api, jellyfin_name).await?;
+    let seasons: Vec<u32> = items
         .iter()
         .filter_map(|item| item.parent_index_number)
-        .max();
-    if let Some(selected) = number_filter(job.seasons.as_ref(), max_season)? {
+        .collect();
+    if let Some(selected) = number_filter(job.seasons.as_ref(), &seasons)? {
         items.retain(|item| {
             item.parent_index_number
                 .is_some_and(|n| selected.contains(&n))
@@ -1389,8 +1407,8 @@ async fn jellyfin_job_items(
         }
         items = Vec::new();
         for mut season in by_season.into_values() {
-            let max_episode = season.iter().filter_map(|item| item.index_number).max();
-            if let Some(selected) = number_filter(Some(filter), max_episode)? {
+            let episodes: Vec<u32> = season.iter().filter_map(|item| item.index_number).collect();
+            if let Some(selected) = number_filter(Some(filter), &episodes)? {
                 season.retain(|item| item.index_number.is_some_and(|n| selected.contains(&n)));
             }
             items.extend(season);
@@ -1410,24 +1428,31 @@ fn item_destination(
         .path
         .as_deref()
         .context("Jellyfin item omitted its media path")?;
-    let filename = Path::new(path)
-        .file_name()
+    // The path is the server's, which may be a Windows path with backslashes.
+    let filename = path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
         .context("Jellyfin media path has no filename")?;
     let mut folder = root.to_path_buf();
     if !movie && let Some(season) = item.parent_index_number {
         let season = pattern
             .replace("$season_number", &season.to_string())
             .replace("$name", show);
-        if season.contains('/') || season.contains('\\') || season == ".." {
+        if season.is_empty()
+            || season.contains('/')
+            || season.contains('\\')
+            || season == "."
+            || season == ".."
+        {
             bail!("season pattern must produce one directory name");
         }
         folder.push(season);
     }
-    let filename = filename.to_string_lossy();
     if filename == "." || filename == ".." || filename.contains('/') || filename.contains('\\') {
         bail!("Jellyfin returned an unsafe filename");
     }
-    Ok(folder.join(filename.as_ref()))
+    Ok(folder.join(filename))
 }
 
 async fn jellyfin_download(
@@ -1445,14 +1470,13 @@ async fn jellyfin_download(
                 .await
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
-            update_transfer(
-                &item.id,
-                job,
-                destination,
-                "interrupted",
-                bytes,
-                transfer_total(&item.id)?,
-            )?;
+            // Best effort: a busy state DB must not replace the download error.
+            let total = transfer_total(&item.id).unwrap_or(None);
+            if let Err(db_error) =
+                update_transfer(&item.id, job, destination, "interrupted", bytes, total)
+            {
+                eprintln!("jellysync: could not record interrupted transfer: {db_error:#}");
+            }
             RUN_STATS
                 .failed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1535,9 +1559,11 @@ fn transfer_status(item_id: &str) -> Result<Option<String>> {
 
 /// Record download progress unless the transfer was paused meanwhile; returns false
 /// when it was paused and the download should stop.
+/// Record progress; false when the transfer was paused or cleared meanwhile, in
+/// which case the download stops (a cleared one must not come back to life).
 fn update_progress(item_id: &str, bytes: u64, total: Option<u64>) -> Result<bool> {
     let updated = db()?.execute(
-        "UPDATE transfers SET status='downloading',bytes=?2,total=?3,updated_at=datetime('now') WHERE item_id=?1 AND status!='paused'",
+        "UPDATE transfers SET status='downloading',bytes=?2,total=?3,updated_at=datetime('now') WHERE item_id=?1 AND status NOT IN ('paused','cleared')",
         params![item_id, bytes as i64, total.map(|v| v as i64)],
     )?;
     Ok(updated > 0)
@@ -1584,6 +1610,34 @@ fn mark_queued(job: &str, item: &MediaItem, destination: &Path) -> Result<()> {
     )
 }
 
+/// Total size from a `Content-Range` header (`bytes 0-9/10` or `bytes */10`).
+fn content_range_total(response: &reqwest::Response) -> Option<u64> {
+    parse_content_range_total(response.headers().get("Content-Range")?.to_str().ok()?)
+}
+
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    value.rsplit('/').next()?.trim().parse().ok()
+}
+
+/// Non-blocking per-item lock; None when another process holds it.
+fn try_item_lock(item_id: &str) -> Result<Option<std::fs::File>> {
+    let lock_dir = state_db()?
+        .parent()
+        .context("state DB has no parent directory")?
+        .join("locks");
+    std::fs::create_dir_all(&lock_dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_dir.join(format!("item-{}.lock", safe_component(item_id))))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
 async fn jellyfin_download_inner(
     api: &JellyfinApi,
     job: &str,
@@ -1600,6 +1654,15 @@ async fn jellyfin_download_inner(
         return Ok(());
     }
     if transfer_status(&item.id)?.as_deref() == Some("paused") {
+        return Ok(());
+    }
+    // The TUI, the timer and ad-hoc workers may all reach the same item; only one
+    // may write its .partial file at a time.
+    let Some(_item_lock) = try_item_lock(&item.id)? else {
+        return Ok(());
+    };
+    if destination.exists() {
+        // Another process may have finished it just before we took the lock.
         return Ok(());
     }
     let started = Instant::now();
@@ -1623,6 +1686,18 @@ async fn jellyfin_download_inner(
         .send()
         .await
         .context("request Jellyfin media download")?;
+    if response.status() == StatusCode::RANGE_NOT_SATISFIABLE
+        && offset > 0
+        && content_range_total(&response) == Some(offset)
+    {
+        // The partial file already holds the whole item; nothing left to fetch.
+        tokio::fs::rename(&partial, destination).await?;
+        update_transfer(&item.id, job, destination, "complete", offset, Some(offset))?;
+        RUN_STATS
+            .downloaded
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(());
+    }
     let response = if response.status() == StatusCode::RANGE_NOT_SATISFIABLE && offset > 0 {
         tokio::fs::remove_file(&partial).await?;
         api.client
@@ -1655,12 +1730,7 @@ async fn jellyfin_download_inner(
         }
     }
     let start = if append { offset } else { 0 };
-    let total = response
-        .headers()
-        .get("Content-Range")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit('/').next())
-        .and_then(|v| v.parse::<u64>().ok())
+    let total = content_range_total(&response)
         .or_else(|| response.content_length().map(|length| start + length));
     let mut file = if append {
         tokio::fs::OpenOptions::new()
@@ -1692,6 +1762,21 @@ async fn jellyfin_download_inner(
     tokio::io::AsyncWriteExt::flush(&mut file).await?;
     file.sync_all().await?;
     drop(file);
+    // A stream that ends early (e.g. a proxy cutting a chunked body) must not be
+    // promoted to the final name; keep the partial data for the next resume.
+    if let Some(total) = total
+        && bytes != total
+    {
+        if bytes > total {
+            tokio::fs::remove_file(&partial).await?;
+        }
+        bail!(
+            "download of '{}' ended at {} of {} bytes",
+            item.name,
+            bytes,
+            total
+        );
+    }
     tokio::fs::rename(&partial, destination).await?;
     update_transfer(
         &item.id,
@@ -6135,5 +6220,155 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         assert!(!path_within_roots(&root.join("link/a.mkv"), &roots).unwrap());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn filter(spec: &str, available: &[u32]) -> Option<Vec<u32>> {
+        let value = serde_yaml::from_str::<serde_yaml::Value>(spec).unwrap();
+        number_filter(Some(&value), available)
+            .unwrap()
+            .map(|filter| (0..30).filter(|n| filter.contains(n)).collect())
+    }
+
+    #[test]
+    fn number_filters() {
+        let seasons = [0, 1, 2, 5];
+        assert_eq!(filter("all", &seasons), None);
+        assert_eq!(filter("latest", &seasons), Some(vec![5]));
+        // Counts existing seasons and never picks specials.
+        assert_eq!(filter("latest-2", &seasons), Some(vec![2, 5]));
+        assert_eq!(filter("latest-9", &seasons), Some(vec![1, 2, 5]));
+        assert_eq!(filter("latest", &[0]), Some(vec![0]));
+        assert_eq!(filter("3-5", &seasons), Some(vec![3, 4, 5]));
+        assert_eq!(filter("1, 3-4", &seasons), Some(vec![1, 3, 4]));
+        assert_eq!(filter("[1, \"3-4\"]", &seasons), Some(vec![1, 3, 4]));
+        assert_eq!(filter("7", &seasons), Some(vec![7]));
+        // Huge ranges are matched, not materialized.
+        let value = serde_yaml::Value::from("1-4294967295");
+        assert!(
+            number_filter(Some(&value), &[])
+                .unwrap()
+                .unwrap()
+                .contains(&4_000_000_000)
+        );
+    }
+
+    #[test]
+    fn invalid_number_filters_are_errors() {
+        for spec in ["latestX", "latest-0", "5-3", "one", "[]", "[true]", "[-1]"] {
+            let value = serde_yaml::from_str::<serde_yaml::Value>(spec).unwrap();
+            assert!(number_filter(Some(&value), &[1, 2]).is_err(), "{spec}");
+        }
+        let value = serde_yaml::Value::from("latest");
+        assert!(number_filter(Some(&value), &[]).is_err());
+    }
+
+    #[test]
+    fn directory_substitution_prefers_longer_keys() {
+        let mut directories = BTreeMap::new();
+        directories.insert("tv".to_string(), "TV".to_string());
+        directories.insert("tv_shows".to_string(), "TV Shows".to_string());
+        assert_eq!(
+            substitute_directories("$tv_shows/X", &directories),
+            "TV Shows/X"
+        );
+        assert_eq!(substitute_directories("$tv/X", &directories), "TV/X");
+    }
+
+    #[test]
+    fn home_expansion() {
+        let home = env::var("HOME").unwrap_or_default();
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("~/Videos"), format!("{home}/Videos"));
+        assert_eq!(expand_home("$HOME/Videos"), format!("{home}/Videos"));
+        assert_eq!(expand_home("~other/Videos"), "~other/Videos");
+        assert_eq!(expand_home("/abs/path"), "/abs/path");
+    }
+
+    fn config(yaml: &str) -> Config {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn local_job_directories_expand_home() {
+        let home = env::var("HOME").unwrap_or_default();
+        let config = config(
+            "remote: {hostname: h, username: u, root: /srv}
+local: {root: /media, directories: {docs: ~/Documentaries, tv: TV}}
+download: {mode: jellyfin}
+jobs: []",
+        );
+        let job: Job = serde_yaml::from_str("{name: Planet, directory: docs}").unwrap();
+        assert_eq!(
+            resolved_path(&config, &job, false).unwrap(),
+            format!("{home}/Documentaries/Planet")
+        );
+        let job: Job = serde_yaml::from_str("{name: Show, directory: tv}").unwrap();
+        assert_eq!(
+            resolved_path(&config, &job, false).unwrap(),
+            "/media/TV/Show"
+        );
+        assert_eq!(resolved_path(&config, &job, true).unwrap(), "/srv/tv/Show");
+    }
+
+    fn media(name: &str, kind: &str, path: Option<&str>) -> MediaItem {
+        MediaItem {
+            id: name.to_lowercase(),
+            name: name.into(),
+            item_type: Some(kind.into()),
+            production_year: None,
+            path: path.map(str::to_string),
+            parent_index_number: Some(2),
+            index_number: Some(3),
+            user_data: None,
+        }
+    }
+
+    #[test]
+    fn exact_titles_win_over_substrings() {
+        let items = vec![
+            media("Heat Wave", "Series", None),
+            media("Heat", "Movie", None),
+        ];
+        assert_eq!(find_one(items, "heat").unwrap().unwrap().name, "Heat");
+        let items = vec![media("Heat Wave", "Series", None)];
+        assert_eq!(find_one(items, "Heat").unwrap().unwrap().name, "Heat Wave");
+        let items = vec![
+            media("Heat Wave", "Series", None),
+            media("Heat 2", "Movie", None),
+        ];
+        assert!(find_one(items, "Heat").is_err());
+    }
+
+    #[test]
+    fn destinations_handle_server_paths() {
+        let root = Path::new("/local/Show");
+        let item = media("Ep", "Episode", Some("D:\\TV\\Show\\Show - S02E03.mkv"));
+        assert_eq!(
+            item_destination(&item, root, "Season $season_number", "Show", false).unwrap(),
+            PathBuf::from("/local/Show/Season 2/Show - S02E03.mkv")
+        );
+        let item = media("Movie", "Movie", Some("/movies/Heat/Heat.mkv"));
+        assert_eq!(
+            item_destination(
+                &item,
+                Path::new("/local/Heat"),
+                "Season $season_number",
+                "Heat",
+                true
+            )
+            .unwrap(),
+            PathBuf::from("/local/Heat/Heat.mkv")
+        );
+        let item = media("Bad", "Episode", Some("/tv/.."));
+        assert!(item_destination(&item, root, "Season $season_number", "Show", false).is_err());
+        let item = media("Bad", "Episode", Some("/tv/x.mkv"));
+        assert!(item_destination(&item, root, "../escape", "Show", false).is_err());
+    }
+
+    #[test]
+    fn content_range_totals() {
+        assert_eq!(parse_content_range_total("bytes 0-9/10"), Some(10));
+        assert_eq!(parse_content_range_total("bytes */1234"), Some(1234));
+        assert_eq!(parse_content_range_total("bytes 0-9/*"), None);
     }
 }

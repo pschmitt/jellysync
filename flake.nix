@@ -376,6 +376,12 @@
           };
 
           config = mkIf cfg.enable {
+            assertions = [
+              {
+                assertion = cfg.settings.downloadMode != "jellyfin" || cfg.settings.jellyfin != null;
+                message = "services.jellysync.settings.jellyfin must be set when downloadMode is \"jellyfin\" (the default).";
+              }
+            ];
             home.packages = [ cfg.package ];
 
             xdg.configFile."jellysync/config.yaml".source = configFile;

@@ -182,8 +182,14 @@ loading start once Jellyfin becomes reachable.
 
 In Explore, `Tab`, `→` or `Enter` moves focus from the library to the details
 pane of the selected show; there, `↑`/`↓` move through episodes, `Space`
-selects one, `a` selects all, and `d` downloads the selection. `Tab`, `←` or
-`Esc` returns to the library.
+selects one, `a` selects all, and `d` or `Enter` downloads the selection
+(`d`/`Enter` on a movie downloads it). `Tab`, `←` or `Esc` returns to the
+library; after closing Explore, the main view selects the job and file you just
+queued.
+
+In the Files list, `Space` pauses a queued or running download (keeping its
+partial file and freeing its worker slot for the next queued one) and resumes a
+paused one. Paused downloads are not resumed automatically.
 
 Use `--config FILE` to select a config and `-j N` (`--parallelism`, `--parallel`) to override the worker limit for a download.
 

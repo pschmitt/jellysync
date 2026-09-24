@@ -819,7 +819,7 @@ fn queue_library_items(
     items: &[MediaItem],
     title: &str,
     movie: bool,
-) -> Result<(usize, String)> {
+) -> Result<(usize, String, String)> {
     if items.is_empty() {
         bail!("select at least one item to download");
     }
@@ -833,7 +833,7 @@ fn queue_library_items(
         mark_queued(&job, item, &destination)?;
     }
     update_job(&job, "queued", &format!("{} item(s) queued", items.len()))?;
-    Ok((items.len(), job))
+    Ok((items.len(), job, items[0].id.clone()))
 }
 
 fn pending_transfers(job: &str) -> Result<Vec<(String, PathBuf)>> {
@@ -885,6 +885,7 @@ async fn library_worker(config: &Config, job: &str) -> Result<()> {
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
         // Items that already failed in this run stay pending; don't retry them in a loop.
+        // (Paused items are skipped by status, so resuming one lets this loop pick it up.)
         let pending: Vec<_> = pending_transfers(job)?
             .into_iter()
             .filter(|(item_id, _)| !attempted.contains(item_id))
@@ -898,7 +899,6 @@ async fn library_worker(config: &Config, job: &str) -> Result<()> {
         let slots = Arc::new(Semaphore::new(config.parallelism.max(1)));
         let mut tasks = JoinSet::new();
         for (item_id, destination) in pending {
-            attempted.insert(item_id.clone());
             let api = api.clone();
             let job = job.to_string();
             let permit = slots.clone().acquire_owned().await?;
@@ -918,12 +918,18 @@ async fn library_worker(config: &Config, job: &str) -> Result<()> {
                     index_number: None,
                     user_data: None,
                 };
-                jellyfin_download(&api, &job, &item, &destination, true).await
+                let id = item.id.clone();
+                (
+                    id,
+                    jellyfin_download(&api, &job, &item, &destination, true).await,
+                )
             });
         }
         let mut failures = Vec::new();
         while let Some(result) = tasks.join_next().await {
-            if let Err(error) = result.context("ad-hoc transfer worker failed")? {
+            let (item_id, result) = result.context("ad-hoc transfer worker failed")?;
+            if let Err(error) = result {
+                attempted.insert(item_id);
                 failures.push(format!("{error:#}"));
             }
         }
@@ -953,6 +959,68 @@ async fn finish_library_jobs(config: &Config) {
             eprintln!("Ad-hoc download {job} failed: {error:#}");
         }
     }
+}
+
+/// The attached tmux client that most recently used our window, i.e. the one that
+/// launched jellysync. None outside tmux or when only one client views the window.
+fn tmux_active_client() -> Option<String> {
+    let pane = env::var("TMUX_PANE").ok()?;
+    env::var_os("TMUX")?;
+    let tmux = |args: &[&str]| {
+        std::process::Command::new("tmux")
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let window = tmux(&["display-message", "-p", "-t", &pane, "#{window_id}"])?;
+    let window = window.trim();
+    let clients = tmux(&[
+        "list-clients",
+        "-F",
+        "#{client_activity}\t#{window_id}\t#{client_name}",
+    ])?;
+    let viewers: Vec<(u64, String)> = clients
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let activity = fields.next()?.parse().ok()?;
+            let window_id = fields.next()?;
+            let name = fields.next()?;
+            (window_id == window).then(|| (activity, name.to_string()))
+        })
+        .collect();
+    // With a single viewer there is no other client to steal the window size.
+    if viewers.len() < 2 {
+        return None;
+    }
+    viewers.into_iter().max().map(|(_, name)| name)
+}
+
+/// The image-capability query is passed through to every tmux client viewing this
+/// window. Their terminals' replies count as input, so with `window-size latest` another
+/// (smaller) client becomes the latest and the window shrinks until the user presses a
+/// key. Make the launching client the latest again, now and once more for late replies.
+fn reclaim_tmux_window(client: String) {
+    let reclaim = move || {
+        let Ok(pane) = env::var("TMUX_PANE") else {
+            return;
+        };
+        let _ = std::process::Command::new("tmux")
+            .args(["switch-client", "-c", &client, "-t", &pane])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    };
+    reclaim();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        reclaim();
+    });
 }
 
 /// Start a detached worker that keeps downloading after the TUI exits.
@@ -1419,8 +1487,51 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
+fn transfer_status(item_id: &str) -> Result<Option<String>> {
+    Ok(db()?
+        .query_row(
+            "SELECT status FROM transfers WHERE item_id=?1",
+            params![item_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
+/// Record download progress unless the transfer was paused meanwhile; returns false
+/// when it was paused and the download should stop.
+fn update_progress(item_id: &str, bytes: u64, total: Option<u64>) -> Result<bool> {
+    let updated = db()?.execute(
+        "UPDATE transfers SET status='downloading',bytes=?2,total=?3,updated_at=datetime('now') WHERE item_id=?1 AND status!='paused'",
+        params![item_id, bytes as i64, total.map(|v| v as i64)],
+    )?;
+    Ok(updated > 0)
+}
+
+/// Pause a queued/running transfer or resume a paused one; returns the new status.
+fn toggle_pause(entry: &DownloadEntry) -> Result<&'static str> {
+    let conn = db()?;
+    if entry.status == "paused" {
+        conn.execute(
+            "UPDATE transfers SET status='queued',updated_at=datetime('now') WHERE item_id=?1 AND status='paused'",
+            params![entry.item_id],
+        )?;
+        Ok("queued")
+    } else if matches!(
+        entry.status.as_str(),
+        "queued" | "downloading" | "interrupted"
+    ) {
+        conn.execute(
+            "UPDATE transfers SET status='paused',updated_at=datetime('now') WHERE item_id=?1",
+            params![entry.item_id],
+        )?;
+        Ok("paused")
+    } else {
+        bail!("only queued, downloading or interrupted files can be paused")
+    }
+}
+
 fn mark_queued(job: &str, item: &MediaItem, destination: &Path) -> Result<()> {
-    if destination.exists() {
+    if destination.exists() || transfer_status(&item.id)?.as_deref() == Some("paused") {
         return Ok(());
     }
     let partial = PathBuf::from(format!("{}.partial", destination.to_string_lossy()));
@@ -1450,6 +1561,9 @@ async fn jellyfin_download_inner(
         RUN_STATS
             .present
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(());
+    }
+    if transfer_status(&item.id)?.as_deref() == Some("paused") {
         return Ok(());
     }
     let started = Instant::now();
@@ -1520,7 +1634,9 @@ async fn jellyfin_download_inner(
     } else {
         tokio::fs::File::create(&partial).await?
     };
-    update_transfer(&item.id, job, destination, "downloading", start, total)?;
+    if !update_progress(&item.id, start, total)? {
+        return Ok(());
+    }
     let mut stream = response.bytes_stream();
     let mut bytes = start;
     let mut checkpoint = start;
@@ -1529,7 +1645,11 @@ async fn jellyfin_download_inner(
         tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
         bytes += chunk.len() as u64;
         if bytes - checkpoint >= 4 * 1024 * 1024 {
-            update_transfer(&item.id, job, destination, "downloading", bytes, total)?;
+            if !update_progress(&item.id, bytes, total)? {
+                // Paused: keep the .partial file and free this worker slot.
+                tokio::io::AsyncWriteExt::flush(&mut file).await?;
+                return Ok(());
+            }
             checkpoint = bytes;
         }
     }
@@ -1741,7 +1861,9 @@ fn status(json_output: bool) -> Result<()> {
         job_count += 1;
         let (icon, color) = match state.to_ascii_lowercase().as_str() {
             "success" | "complete" | "completed" => ("●", TerminalColor::Green),
-            "running" | "downloading" | "queued" => ("◐", TerminalColor::Yellow),
+            "running" | "downloading" => ("◐", TerminalColor::Yellow),
+            "queued" => ("◌", TerminalColor::Blue),
+            "paused" => ("⏸", TerminalColor::DarkGrey),
             "failed" | "error" | "skipped" => ("✕", TerminalColor::Red),
             "interrupted" | "cleared" => ("◆", TerminalColor::Magenta),
             _ => ("○", TerminalColor::DarkGrey),
@@ -1771,7 +1893,7 @@ fn status(json_output: bool) -> Result<()> {
         "\n{}",
         "ACTIVE DOWNLOADS".with(TerminalColor::Magenta).bold()
     );
-    let mut statement = conn.prepare("SELECT job,path,status,bytes,total FROM transfers WHERE status IN ('queued','downloading','interrupted') ORDER BY job,path")?;
+    let mut statement = conn.prepare("SELECT job,path,status,bytes,total FROM transfers WHERE status IN ('queued','downloading','interrupted','paused') ORDER BY job,path")?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -1792,7 +1914,8 @@ fn status(json_output: bool) -> Result<()> {
             .to_string_lossy();
         let state_color = match state.as_str() {
             "downloading" => TerminalColor::Cyan,
-            "queued" => TerminalColor::Yellow,
+            "queued" => TerminalColor::Blue,
+            "paused" => TerminalColor::DarkGrey,
             "interrupted" => TerminalColor::Red,
             _ => TerminalColor::DarkGrey,
         };
@@ -1846,7 +1969,7 @@ fn status_json(conn: &Connection) -> Result<()> {
             }))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut statement = conn.prepare("SELECT job,path,status,bytes,total FROM transfers WHERE status IN ('queued','downloading','interrupted') ORDER BY job,path")?;
+    let mut statement = conn.prepare("SELECT job,path,status,bytes,total FROM transfers WHERE status IN ('queued','downloading','interrupted','paused') ORDER BY job,path")?;
     let downloads = statement
         .query_map([], |row| {
             Ok(json!({
@@ -2114,8 +2237,12 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
     let result = async move {
         let backend = CrosstermBackend::new(out);
         let mut terminal = Terminal::new(backend)?;
+        let tmux_client = tmux_active_client();
         let query_started = Instant::now();
         let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
+        if let Some(client) = tmux_client {
+            reclaim_tmux_window(client);
+        }
         if query_started.elapsed() >= Duration::from_millis(900) {
             // ratatui-image gives up after 1s but leaves its query thread blocked on stdin,
             // where it swallows keystrokes until it reads a Device Status Report. Request one
@@ -2148,6 +2275,8 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
         let mut file_info: Option<FileInfo> = None;
         let mut file_info_task: Option<FileInfoTask> = None;
         let mut file_meta: Option<FileMeta> = None;
+        // Job and item to select in the main view once Explore closes (after a download).
+        let mut focus_request: Option<(String, String, Instant)> = None;
         let mut file_meta_task: Option<FileMetaTask> = None;
         let mut jellyfin_api: Option<JellyfinApi> = None;
         let mut explore: Option<ExploreState> = None;
@@ -2592,6 +2721,24 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
             if selected >= jobs.len() && !jobs.is_empty() {
                 selected = jobs.len() - 1;
             }
+            // The new job shows up once the dashboard refreshes; give up after a while.
+            if focus_request
+                .as_ref()
+                .is_some_and(|(_, _, at)| at.elapsed() > Duration::from_secs(10))
+                && explore.is_none()
+            {
+                focus_request = None;
+            }
+            let mut focus_item = None;
+            if explore.is_none()
+                && let Some((job, item_id, _)) = &focus_request
+                && let Some(index) = jobs.iter().position(|entry| &entry.name == job)
+                && dashboard.downloads.iter().any(|entry| &entry.item_id == item_id)
+            {
+                selected = index;
+                focus_item = Some(item_id.clone());
+                focus_request = None;
+            }
             let selected_job = jobs.get(selected);
             let downloads: Vec<_> = dashboard
                 .downloads
@@ -2599,6 +2746,12 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 .filter(|entry| selected_job.is_some_and(|job| entry.job == job.name))
                 .cloned()
                 .collect();
+            if let Some(item_id) = focus_item
+                && let Some(index) = downloads.iter().position(|entry| entry.item_id == item_id)
+            {
+                selected_download = index;
+                download_focus = true;
+            }
             if downloads.is_empty() {
                 selected_download = 0;
             } else if selected_download >= downloads.len() {
@@ -2836,11 +2989,11 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         },
                     ),
                 ]);
-                // Every separator gets the same plain gray style.
+                // Segments are separated by whitespace only.
                 let mut header_spans = Vec::new();
                 for (index, segment) in header_segments.into_iter().enumerate() {
                     if index > 0 {
-                        header_spans.push(Span::styled("  ·  ", Style::default().fg(Color::Gray)));
+                        header_spans.push(Span::raw("   "));
                     }
                     header_spans.extend(segment);
                 }
@@ -3380,6 +3533,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         Line::from("  b                 browse the Jellyfin library"),
                         Line::from("  i / Enter         job configuration / file media info"),
                         Line::from("  p / double-click  play selected file"),
+                        Line::from("  Space             pause / resume selected download"),
                         Line::from("  o                 open the file's or show's directory"),
                         Line::from("  x / X / c         clear file / season / show (x on ad-hoc job removes it)"),
                         Line::from("  Ctrl-C, Ctrl-C    quit the TUI"),
@@ -3601,7 +3755,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 if key.code == KeyCode::Char('?') {
                     show_help = !show_help;
                     show_job_config = false;
-                } else if show_help && key.code == KeyCode::Esc {
+                } else if show_help && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     show_help = false;
                 } else if file_info.is_some() && key.code == KeyCode::Char('p') {
                     if let Some(entry) = downloads.get(selected_download) {
@@ -3624,9 +3778,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     }
                     file_info = None;
                     file_meta = None;
-                } else if show_job_config && key.code == KeyCode::Esc {
-                    show_job_config = false;
-                } else if show_job_config && key.code == KeyCode::Char('q') {
+                } else if show_job_config && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     show_job_config = false;
                 } else if key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -3720,18 +3872,21 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                             browser.selected = 0;
                             explore_notice = None;
                         }
-                        KeyCode::Char('d') => {
+                        KeyCode::Char('d') | KeyCode::Enter => {
                             let queued = if browser.details_focus
                                 && let Some(title) = browser
                                     .filtered_items()
                                     .get(browser.selected)
                                     .map(|item| item.name.clone())
                             {
-                                let items: Vec<_> = browser.selected_episodes.iter()
-                                    .filter_map(|index| browser.episodes.get(*index).cloned())
+                                let mut indices: Vec<_> = browser.selected_episodes.iter().copied().collect();
+                                indices.sort_unstable();
+                                let items: Vec<_> = indices
+                                    .into_iter()
+                                    .filter_map(|index| browser.episodes.get(index).cloned())
                                     .collect();
                                 if items.is_empty() {
-                                    explore_notice = Some(("Select episodes with Space or a first".into(), false));
+                                    explore_notice = Some(("Select episodes with Space or a first, then press d or Enter".into(), false));
                                     None
                                 } else {
                                     Some(queue_library_items(&config, &items, &title, false))
@@ -3744,7 +3899,8 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                                 None
                             };
                             match queued {
-                                Some(Ok((count, job))) => {
+                                Some(Ok((count, job, first_item))) => {
+                                    focus_request = Some((job.clone(), first_item, Instant::now()));
                                     explore_notice = Some(match spawn_library_worker(&config_path, &job) {
                                         Ok(()) => (format!("Queued {count} download(s); they continue after the TUI exits"), true),
                                         Err(error) => (format!("Queued {count} download(s) but could not start worker: {error:#}"), false),
@@ -3982,6 +4138,18 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                                 }));
                             }
                         }
+                        KeyCode::Char(' ') if download_focus && !downloads.is_empty() => {
+                            if let Some(entry) = downloads.get(selected_download) {
+                                sync_notice = Some(match toggle_pause(entry) {
+                                    Ok("paused") => (format!("Paused {}", entry.path.file_name().unwrap_or_default().to_string_lossy()), true),
+                                    Ok(_) => match spawn_library_worker(&config_path, &entry.job) {
+                                        Ok(()) => (format!("Resumed {}", entry.path.file_name().unwrap_or_default().to_string_lossy()), true),
+                                        Err(error) => (format!("Queued again but could not start worker: {error:#}"), false),
+                                    },
+                                    Err(error) => (format!("Could not pause: {error:#}"), false),
+                                });
+                            }
+                        }
                         KeyCode::Char('x') if download_focus && !downloads.is_empty() => {
                             confirm_clear = Some(ClearScope::File)
                         }
@@ -4052,7 +4220,10 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
 fn state_style(state: &str) -> Style {
     let color = match state.to_ascii_lowercase().as_str() {
         "success" | "complete" | "completed" => Color::Green,
-        "running" | "downloading" | "queued" => Color::Yellow,
+        "running" => Color::Yellow,
+        "downloading" => Color::Cyan,
+        "queued" => Color::Blue,
+        "paused" => Color::DarkGray,
         "failed" | "error" | "skipped" => Color::Red,
         "interrupted" | "cleared" => Color::Magenta,
         "not run" | "stopped" => Color::DarkGray,
@@ -4354,14 +4525,15 @@ fn panel_block(title: &str, focused: bool) -> Block<'_> {
 
 fn key_hint(key: &'static str, label: &'static str) -> [Span<'static>; 2] {
     [
+        // Pad the key on both sides so its background block is centred.
         Span::styled(
-            format!("{key} "),
+            format!(" {key} "),
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(label, Style::default().fg(Color::Gray)),
+        Span::styled(format!(" {label}"), Style::default().fg(Color::Gray)),
     ]
 }
 

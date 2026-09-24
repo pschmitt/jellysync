@@ -15,6 +15,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures_util::StreamExt;
+use image::imageops::FilterType;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -564,7 +565,7 @@ async fn jellyfin_poster(api: &JellyfinApi, item: &MediaItem) -> Result<Option<V
     let response = api
         .client
         .get(format!(
-            "{}/Items/{}/Images/Primary?maxWidth=640",
+            "{}/Items/{}/Images/Primary?maxWidth=480",
             api.base, item.id
         ))
         .header("Authorization", jellyfin_authorization(&api.token))
@@ -1322,6 +1323,7 @@ enum ClearScope {
     Season,
     Show,
 }
+#[derive(Clone)]
 struct DownloadEntry {
     item_id: String,
     job: String,
@@ -1329,6 +1331,44 @@ struct DownloadEntry {
     status: String,
     bytes: u64,
     total: Option<u64>,
+}
+
+#[derive(Default)]
+struct DashboardSnapshot {
+    history: BTreeMap<String, (String, String, String)>,
+    downloads: Vec<DownloadEntry>,
+    timer: String,
+}
+
+fn dashboard_snapshot() -> Result<DashboardSnapshot> {
+    let conn = db()?;
+    let mut history = BTreeMap::new();
+    let mut statement = conn.prepare("SELECT name,status,message,updated_at FROM jobs")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (name, state, message, time) = row?;
+        history.insert(name, (state, message.unwrap_or_default(), time));
+    }
+    let downloads = tracked_downloads()?;
+    let timer = std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "jellysync.timer"])
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|state| !state.is_empty())
+        .unwrap_or_else(|| "unknown".into());
+    Ok(DashboardSnapshot {
+        history,
+        downloads,
+        timer,
+    })
 }
 
 fn tracked_downloads() -> Result<Vec<DownloadEntry>> {
@@ -1460,9 +1500,37 @@ async fn tui(config: Config) -> Result<()> {
         let mut downloads_state = ListState::default();
         let mut explore_state = ListState::default();
         let mut episode_state = ListState::default();
-        let mut timer_state = "unknown".to_string();
-        let mut timer_checked_at = Instant::now() - Duration::from_secs(5);
+        let mut dashboard = DashboardSnapshot {
+            timer: "unknown".into(),
+            ..DashboardSnapshot::default()
+        };
+        let mut dashboard_task =
+            Some(tokio::task::spawn_blocking(dashboard_snapshot));
+        let mut dashboard_refreshed_at = Instant::now();
         loop {
+            if dashboard_task
+                .as_ref()
+                .is_some_and(|task| task.is_finished())
+            {
+                let task = dashboard_task
+                    .take()
+                    .expect("finished dashboard task exists");
+                match task.await {
+                    Ok(Ok(snapshot)) => dashboard = snapshot,
+                    Ok(Err(error)) => {
+                        sync_notice = Some((format!("Could not refresh TUI status: {error:#}"), false));
+                    }
+                    Err(error) => {
+                        sync_notice = Some((format!("Status refresh stopped: {error}"), false));
+                    }
+                }
+                dashboard_refreshed_at = Instant::now();
+            }
+            if dashboard_task.is_none()
+                && dashboard_refreshed_at.elapsed() >= Duration::from_millis(500)
+            {
+                dashboard_task = Some(tokio::task::spawn_blocking(dashboard_snapshot));
+            }
             if reconcile_task
                 .as_ref()
                 .is_some_and(|task| task.is_finished())
@@ -1597,32 +1665,20 @@ async fn tui(config: Config) -> Result<()> {
                     Err(error) => (format!("Sync task stopped: {error}"), false),
                 });
             }
-            let conn = db()?;
-            let mut history = BTreeMap::new();
-            let mut statement = conn.prepare("SELECT name,status,message,updated_at FROM jobs")?;
-            let rows = statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
-            for row in rows {
-                let (name, state, message, time) = row?;
-                history.insert(name, (state, message.unwrap_or_default(), time));
-            }
+            let history = &dashboard.history;
             let jobs = &config.jobs;
             if selected >= jobs.len() && !jobs.is_empty() {
                 selected = jobs.len() - 1;
             }
             let selected_job = jobs.get(selected);
-            let downloads: Vec<_> = tracked_downloads()?
-                .into_iter()
+            let downloads: Vec<_> = dashboard
+                .downloads
+                .iter()
                 .filter(|entry| {
                     entry.job.starts_with("library:")
                         || selected_job.is_some_and(|job| entry.job == job.name)
                 })
+                .cloned()
                 .collect();
             if downloads.is_empty() {
                 selected_download = 0;
@@ -1705,16 +1761,6 @@ async fn tui(config: Config) -> Result<()> {
                     ])
                 })
                 .collect();
-            if timer_checked_at.elapsed() >= Duration::from_secs(5) {
-                timer_state = std::process::Command::new("systemctl")
-                    .args(["--user", "is-active", "jellysync.timer"])
-                    .output()
-                    .ok()
-                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-                    .filter(|state| !state.is_empty())
-                    .unwrap_or_else(|| "unknown".into());
-                timer_checked_at = Instant::now();
-            }
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
             let explore_popup = centered_rect(90, 88, area);
@@ -1782,8 +1828,8 @@ async fn tui(config: Config) -> Result<()> {
                     ),
                     Span::styled("  ·  timer ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
-                        timer_state.clone(),
-                        if timer_state == "active" {
+                        dashboard.timer.clone(),
+                        if dashboard.timer == "active" {
                             state_style("success")
                         } else {
                             state_style("stopped")
@@ -2030,7 +2076,8 @@ async fn tui(config: Config) -> Result<()> {
                             let poster_box = Rect { x: explore_poster_area.x + 2, y: explore_poster_area.y + 5, width: explore_poster_area.width.saturating_sub(4), height: explore_poster_area.height.saturating_sub(7) };
                             if explore.poster_loaded {
                                 frame.render_stateful_widget(
-                                    StatefulImage::default().resize(Resize::Fit(None)),
+                                    StatefulImage::default()
+                                        .resize(Resize::Fit(Some(FilterType::Lanczos3))),
                                     poster_box,
                                     &mut poster_protocol,
                                 );

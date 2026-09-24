@@ -11,3 +11,6 @@ jellysync.yaml
 *~
 *.swp
 *.swo
+
+# Cargo build output
+target/

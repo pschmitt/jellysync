@@ -403,6 +403,37 @@ type FileInfoTask = tokio::task::JoinHandle<Result<MediaSummary>>;
 /// Jellyfin rows, overview and (optional) still image for the file info popup.
 type FileMeta = (MediaSummary, String, Option<StatefulProtocol>);
 type FileMetaTask = tokio::task::JoinHandle<Result<FileMeta>>;
+/// ffprobe result for a local file: detail rows plus short badges for list rows.
+#[derive(Clone)]
+struct MediaProbe {
+    rows: MediaSummary,
+    badges: Vec<String>,
+}
+type ProbeTask = tokio::task::JoinHandle<Result<MediaProbe>>;
+/// Files probed in the background at once for the Files list badges.
+const PROBE_CONCURRENCY: usize = 4;
+struct EpisodeInfo {
+    season: Option<u32>,
+    episode: Option<u32>,
+    name: String,
+}
+/// Jellyfin metadata shown above the Files list for the selected job.
+struct JobDetails {
+    series: bool,
+    title: String,
+    years: Option<String>,
+    facts: Vec<String>,
+    tagline: Option<String>,
+    overview: String,
+    episodes: HashMap<String, EpisodeInfo>,
+    poster: Option<StatefulProtocol>,
+}
+type JobDetailsTask = tokio::task::JoinHandle<Result<JobDetails>>;
+/// A row in the Files list: a season heading or an index into the file list.
+enum FileRow {
+    Season(String),
+    File(usize),
+}
 type PreviewEpisodeTask = tokio::task::JoinHandle<(String, Result<Vec<MediaItem>>)>;
 type JobPosterCatalogTask =
     tokio::task::JoinHandle<Result<(JellyfinApi, Vec<(String, MediaItem)>)>>;
@@ -2294,6 +2325,13 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
         let mut job_poster_catalog_task: Option<JobPosterCatalogTask> = None;
         let mut job_poster_tasks = HashMap::<String, PosterTask>::new();
         let mut job_poster_protocols = HashMap::<String, StatefulProtocol>::new();
+        // Jellyfin item per job (from the poster catalog) and its detailed metadata.
+        let mut job_items = HashMap::<String, MediaItem>::new();
+        let mut job_details = HashMap::<String, JobDetails>::new();
+        let mut job_details_tasks = HashMap::<String, JobDetailsTask>::new();
+        let mut job_details_failed = HashSet::<String>::new();
+        let mut probe_cache = HashMap::<PathBuf, std::result::Result<MediaProbe, String>>::new();
+        let mut probe_tasks = HashMap::<PathBuf, ProbeTask>::new();
         let mut explore_poster_tasks = HashMap::<String, PosterTask>::new();
         let mut explore_poster_protocols = HashMap::<String, StatefulProtocol>::new();
         let mut preview_episode_task: Option<PreviewEpisodeTask> = None;
@@ -2505,6 +2543,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 if let Ok(Ok((api, posters))) = task.await {
                     jellyfin_api = Some(api.clone());
                     for (job_name, item) in posters {
+                        job_items.insert(job_name.clone(), item.clone());
                         if job_poster_protocols.contains_key(&job_name)
                             || job_poster_tasks.contains_key(&job_name)
                         {
@@ -2544,6 +2583,36 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     }
                     job_poster_protocols.insert(job_name, protocol);
                 }
+            }
+            let finished_details: Vec<_> = job_details_tasks
+                .iter()
+                .filter_map(|(job_name, task)| task.is_finished().then_some(job_name.clone()))
+                .collect();
+            for job_name in finished_details {
+                let task = job_details_tasks
+                    .remove(&job_name)
+                    .expect("finished job details task exists");
+                match task.await {
+                    Ok(Ok(details)) => {
+                        job_details.insert(job_name, details);
+                    }
+                    // Do not retry every frame; a new catalog or reconnect resets this.
+                    _ => {
+                        job_details_failed.insert(job_name);
+                    }
+                }
+            }
+            let finished_probes: Vec<_> = probe_tasks
+                .iter()
+                .filter_map(|(path, task)| task.is_finished().then_some(path.clone()))
+                .collect();
+            for path in finished_probes {
+                let task = probe_tasks.remove(&path).expect("finished probe task exists");
+                let result = match task.await {
+                    Ok(result) => result.map_err(|error| format!("{error:#}")),
+                    Err(error) => Err(format!("probe stopped: {error}")),
+                };
+                probe_cache.insert(path, result);
             }
             let finished_explore_posters: Vec<_> = explore_poster_tasks
                 .iter()
@@ -2740,12 +2809,31 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 focus_request = None;
             }
             let selected_job = jobs.get(selected);
-            let downloads: Vec<_> = dashboard
+            let mut downloads: Vec<_> = dashboard
                 .downloads
                 .iter()
                 .filter(|entry| selected_job.is_some_and(|job| entry.job == job.name))
                 .cloned()
                 .collect();
+            let selected_details = selected_job.and_then(|job| job_details.get(&job.name));
+            let rows = file_rows(&mut downloads, selected_details);
+            if let Some(job) = selected_job
+                && online != Some(Some(false))
+                && !job_details.contains_key(&job.name)
+                && !job_details_tasks.contains_key(&job.name)
+                && !job_details_failed.contains(&job.name)
+                && let (Some(api), Some(item)) = (jellyfin_api.clone(), job_items.get(&job.name))
+            {
+                job_details_tasks.insert(
+                    job.name.clone(),
+                    tokio::spawn(jellyfin_job_details(
+                        api,
+                        item.clone(),
+                        picker.clone(),
+                        poster_cache.get(&item.id).cloned(),
+                    )),
+                );
+            }
             if let Some(item_id) = focus_item
                 && let Some(index) = downloads.iter().position(|entry| entry.item_id == item_id)
             {
@@ -2756,6 +2844,20 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 selected_download = 0;
             } else if selected_download >= downloads.len() {
                 selected_download = downloads.len() - 1;
+            }
+            // Probe finished files for the list badges, the selected one first.
+            for entry in downloads.get(selected_download).into_iter().chain(&downloads) {
+                if !download_complete(&entry.status) {
+                    // A file being (re)downloaded must be probed again afterwards.
+                    probe_cache.remove(&entry.path);
+                    continue;
+                }
+                if probe_tasks.len() >= PROBE_CONCURRENCY {
+                    break;
+                }
+                if !probe_cache.contains_key(&entry.path) && !probe_tasks.contains_key(&entry.path) {
+                    probe_tasks.insert(entry.path.clone(), tokio::spawn(probe_media(entry.path.clone())));
+                }
             }
             let entries: Vec<ListItem> = jobs
                 .iter()
@@ -2865,19 +2967,72 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     .areas(body);
                 (jobs_area, downloads_area)
             };
+            // Metadata for the selected job sits above its files when there is room.
+            let (details_area, downloads_area) = if selected_job.is_some() && downloads_area.height >= 22 {
+                let height = (downloads_area.height * 2 / 5).clamp(10, 16);
+                let [details_area, downloads_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(height), Constraint::Min(6)])
+                    .areas(downloads_area);
+                (Some(details_area), downloads_area)
+            } else {
+                (None, downloads_area)
+            };
             // Borders, the "▌ " highlight symbol and the "● " bullet.
             let download_text_width = usize::from(downloads_area.width.saturating_sub(6)).max(8);
             // Leading indent plus the " 100%" suffix.
             let download_bar_width = download_text_width.saturating_sub(7).clamp(8, 60);
-            let download_rows: Vec<ListItem> = downloads
+            let season_stats = |row: usize| {
+                // Files and size from this heading up to the next one.
+                let files: Vec<&DownloadEntry> = rows[row + 1..]
+                    .iter()
+                    .map_while(|row| match row {
+                        FileRow::File(index) => downloads.get(*index),
+                        FileRow::Season(_) => None,
+                    })
+                    .collect();
+                let done = files.iter().filter(|entry| download_complete(&entry.status)).count();
+                let size = files
+                    .iter()
+                    .fold(0u64, |total, entry| total.saturating_add(entry.total.unwrap_or(entry.bytes)));
+                (files.len(), done, size)
+            };
+            let download_rows: Vec<ListItem> = rows
                 .iter()
-                .map(|entry| {
+                .enumerate()
+                .map(|(row, file_row)| {
+                    let entry = match file_row {
+                        FileRow::Season(label) => {
+                            let (count, done, size) = season_stats(row);
+                            let mut stats = format!(
+                                "{count} {}",
+                                if count == 1 { "file" } else { "files" }
+                            );
+                            if done < count {
+                                stats.push_str(&format!(", {done} done"));
+                            }
+                            stats.push_str(&format!(" · {}", format_bytes(size)));
+                            let used = label.chars().count() + stats.chars().count() + 6;
+                            return ListItem::new(Line::from(vec![
+                                Span::styled(
+                                    format!("{label} "),
+                                    Style::default()
+                                        .fg(Color::Magenta)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "─".repeat(download_text_width.saturating_sub(used).max(2)),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                                Span::styled(format!(" {stats}"), Style::default().fg(Color::Gray)),
+                            ]));
+                        }
+                        FileRow::File(index) => &downloads[*index],
+                    };
                     let filename = entry.path.file_name().unwrap_or_default().to_string_lossy();
+                    let episode = file_title(selected_details, entry, downloads.len() == 1);
                     let (bar, percent) = download_progress(entry.bytes, entry.total, download_bar_width);
-                    let completed = matches!(
-                        entry.status.as_str(),
-                        "complete" | "completed" | "success"
-                    );
+                    let completed = download_complete(&entry.status);
                     let size = if completed {
                         format_bytes(entry.bytes)
                     } else {
@@ -2888,41 +3043,64 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                             })
                             .unwrap_or_else(|| format!("{} downloaded", format_bytes(entry.bytes)))
                     };
-                    let subtitle_line = if completed {
-                        Line::from(vec![
+                    let mut subtitle = if completed {
+                        vec![
                             Span::styled("  ✓ downloaded", Style::default().fg(Color::Green)),
                             Span::styled(format!("  {size}"), Style::default().fg(Color::Gray)),
-                        ])
+                        ]
                     } else {
-                        Line::from(vec![
+                        vec![
                             Span::styled(format!("  {}", entry.status), state_style(&entry.status)),
                             Span::styled(format!("  {size}"), Style::default().fg(Color::Gray)),
-                        ])
+                        ]
                     };
-                    let progress_line = if completed {
-                        Line::from("")
-                    } else {
+                    if completed && let Some(Ok(probe)) = probe_cache.get(&entry.path) {
+                        let used: usize = subtitle.iter().map(|span| span.content.chars().count()).sum();
+                        let badges = probe.badges.join(" · ");
+                        subtitle.push(Span::styled(
+                            format!("  {}", truncate(&badges, download_text_width.saturating_sub(used + 2))),
+                            Style::default().fg(Color::Blue),
+                        ));
+                    }
+                    let third_line = if !completed {
                         Line::from(vec![
                             Span::styled("  ", Style::default()),
                             Span::styled(bar, Style::default().fg(Color::Cyan)),
                             Span::styled(format!(" {percent}"), Style::default().fg(Color::DarkGray)),
                         ])
+                    } else if episode.is_some() {
+                        // The title replaced the file name on the first line.
+                        Line::from(Span::styled(
+                            format!("  {}", truncate_near_end(&filename, download_text_width.saturating_sub(2))),
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                    } else {
+                        Line::from("")
                     };
-                    ListItem::new(vec![
-                        Line::from(vec![
-                            Span::styled("● ", state_style(&entry.status)),
-                            Span::styled(
-                                truncate_near_end(&filename, download_text_width),
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]),
-                        subtitle_line,
-                        progress_line,
-                    ])
+                    let title_line = match episode {
+                        Some((tag, name)) => {
+                            let tag = if tag.is_empty() { tag } else { format!("{tag}  ") };
+                            vec![
+                                Span::styled(tag.clone(), Style::default().fg(Color::Cyan)),
+                                Span::styled(
+                                    truncate(&name, download_text_width.saturating_sub(tag.chars().count())),
+                                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                                ),
+                            ]
+                        }
+                        None => vec![Span::styled(
+                            truncate_near_end(&filename, download_text_width),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        )],
+                    };
+                    let mut first = vec![Span::styled("● ", state_style(&entry.status))];
+                    first.extend(title_line);
+                    ListItem::new(vec![Line::from(first), Line::from(subtitle), third_line])
                 })
                 .collect();
+            let selected_row = rows
+                .iter()
+                .position(|row| matches!(row, FileRow::File(index) if *index == selected_download));
             // The layout above was computed from an earlier size query; if the terminal
             // was resized since (tmux switching clients does this), drawing it would
             // index outside the resized buffer. Skip the frame and lay out again.
@@ -3033,19 +3211,41 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 frame.render_widget(Paragraph::new(header_text), header);
 
                 let jobs_title = format!("Jobs · {}", jobs.len());
-                let downloads_title = format!(
-                    "Files: {} ({} {})",
-                    selected_job.map_or("no job selected", |job| job.name.as_str()),
-                    downloads.len(),
-                    if downloads.len() == 1 { "file" } else { "files" }
-                );
+                let seasons = rows.iter().filter(|row| matches!(row, FileRow::Season(_))).count();
+                let files_size = downloads
+                    .iter()
+                    .fold(0u64, |total, entry| total.saturating_add(entry.total.unwrap_or(entry.bytes)));
+                let downloads_title = match selected_job {
+                    None => "Files · no job selected".to_string(),
+                    Some(job) => {
+                        let mut title = format!(
+                            "Files: {} · {} {}",
+                            job.name.trim_start_matches("library:"),
+                            downloads.len(),
+                            if downloads.len() == 1 { "file" } else { "files" }
+                        );
+                        if seasons > 1 {
+                            title.push_str(&format!(" · {seasons} seasons"));
+                        }
+                        if !downloads.is_empty() {
+                            title.push_str(&format!(" · {}", format_bytes(files_size)));
+                        }
+                        title
+                    }
+                };
                 let jobs_block = panel_block(&jobs_title, !download_focus);
                 let downloads_block = panel_block(&downloads_title, download_focus);
                 if !jobs.is_empty() {
                     jobs_state.select(Some(selected));
                 }
-                if !downloads.is_empty() {
-                    downloads_state.select(Some(selected_download));
+                downloads_state.select(selected_row);
+                // Keep a file's season heading visible when scrolling up to it.
+                if let Some(row) = selected_row
+                    && row > 0
+                    && downloads_state.offset() == row
+                    && matches!(rows[row - 1], FileRow::Season(_))
+                {
+                    *downloads_state.offset_mut() = row - 1;
                 }
                 let list_style = Style::default()
                     .fg(Color::White)
@@ -3090,12 +3290,41 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         }
                     }
                 }
+                if let (Some(details_area), Some(job)) = (details_area, selected_job) {
+                    let selected_entry = downloads.get(selected_download);
+                    let file_label = selected_entry.map(|entry| {
+                        match file_title(job_details.get(&job.name), entry, downloads.len() == 1) {
+                            Some((tag, name)) if !tag.is_empty() => format!("{tag} · {name}"),
+                            // A movie's title is already the heading; name the file instead.
+                            _ => entry.path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                        }
+                    });
+                    let probe = selected_entry.and_then(|entry| {
+                        if download_complete(&entry.status) {
+                            probe_cache.get(&entry.path)
+                        } else {
+                            None
+                        }
+                    });
+                    let still_downloading = selected_entry.is_some_and(|entry| !download_complete(&entry.status));
+                    let loading = job_details_tasks.contains_key(&job.name)
+                        || job_poster_catalog_task.is_some();
+                    render_job_details(
+                        frame,
+                        details_area,
+                        &job.name,
+                        job_details.get_mut(&job.name),
+                        loading,
+                        file_label.filter(|_| !still_downloading),
+                        probe,
+                    );
+                }
                 frame.render_stateful_widget(download_list, downloads_area, &mut downloads_state);
-                // Each file row is 3 lines tall.
-                let visible_files = usize::from(downloads_area.height.saturating_sub(2)) / 3;
-                if downloads.len() > visible_files {
+                let visible_lines = usize::from(downloads_area.height.saturating_sub(2));
+                let total_lines: usize = rows.iter().map(file_row_height).sum();
+                if total_lines > visible_lines {
                     let mut scrollbar_state = ScrollbarState::new(
-                        downloads.len().saturating_sub(visible_files),
+                        rows.len().saturating_sub(visible_lines / 3),
                     )
                     .position(downloads_state.offset());
                     frame.render_stateful_widget(
@@ -3716,13 +3945,12 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                                     selected = index;
                                     selected_download = 0;
                                     download_focus = false;
-                                } else if let Some(index) = list_index_at(
+                                } else if let Some(index) = file_row_at(
                                     downloads_area,
                                     mouse.column,
                                     mouse.row,
                                     downloads_state.offset(),
-                                    downloads.len(),
-                                    3,
+                                    &rows,
                                 ) {
                                     selected_download = index;
                                     download_focus = true;
@@ -4059,14 +4287,25 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         KeyCode::Char('i') | KeyCode::Enter if download_focus && !downloads.is_empty() => {
                             if let Some(entry) = downloads.get(selected_download) {
                                 let path = entry.path.clone();
+                                let cached = probe_cache
+                                    .get(&path)
+                                    .and_then(|probe| probe.as_ref().ok())
+                                    .map(|probe| Ok(probe.rows.clone()));
                                 file_info = Some((
                                     path.file_name()
                                         .unwrap_or_default()
                                         .to_string_lossy()
                                         .into_owned(),
-                                    None,
+                                    cached.clone(),
                                 ));
-                                file_info_task = Some(tokio::spawn(probe_media(path)));
+                                if let Some(task) = file_info_task.take() {
+                                    task.abort();
+                                }
+                                if cached.is_none() {
+                                    file_info_task = Some(tokio::spawn(async move {
+                                        probe_media(path).await.map(|probe| probe.rows)
+                                    }));
+                                }
                                 file_meta = None;
                                 if let Some(task) = file_meta_task.take() {
                                     task.abort();
@@ -4409,7 +4648,390 @@ async fn jellyfin_file_meta(api: JellyfinApi, item_id: String, picker: Picker) -
     Ok((rows, overview, still))
 }
 
-async fn probe_media(path: PathBuf) -> Result<MediaSummary> {
+async fn jellyfin_job_details(
+    api: JellyfinApi,
+    item: MediaItem,
+    picker: Picker,
+    cached_poster: Option<Vec<u8>>,
+) -> Result<JobDetails> {
+    let details: serde_json::Value = api
+        .client
+        .get(format!(
+            "{}/Users/{}/Items/{}",
+            api.base, api.user_id, item.id
+        ))
+        .header("Authorization", jellyfin_authorization(&api.token))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .context("query Jellyfin item")?
+        .error_for_status()
+        .context("Jellyfin item query failed")?
+        .json()
+        .await
+        .context("parse Jellyfin item")?;
+    let text = |key: &str| {
+        details
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let number = |key: &str| details.get(key).and_then(|v| v.as_f64());
+    let series = text("Type").as_deref() == Some("Series");
+    let years = number("ProductionYear").map(|year| {
+        let year = year as u32;
+        if !series {
+            return year.to_string();
+        }
+        match (text("Status").as_deref(), text("EndDate")) {
+            (Some("Continuing"), _) => format!("{year}–"),
+            (_, Some(end)) if !end.starts_with(&year.to_string()) => {
+                format!("{year}–{}", end.chars().take(4).collect::<String>())
+            }
+            _ => year.to_string(),
+        }
+    });
+    let mut facts = Vec::new();
+    if let Some(score) = number("CommunityRating") {
+        facts.push(format!("★ {score:.1}"));
+    }
+    if let Some(rating) = text("OfficialRating") {
+        facts.push(rating);
+    }
+    if let Some(minutes) = number("RunTimeTicks")
+        .map(|ticks| (ticks / 600_000_000.0).round() as u64)
+        .filter(|minutes| *minutes > 0)
+    {
+        facts.push(if series {
+            format!("{minutes} min/ep")
+        } else if minutes >= 60 {
+            format!("{}h {:02}m", minutes / 60, minutes % 60)
+        } else {
+            format!("{minutes} min")
+        });
+    }
+    if series && let Some(seasons) = number("ChildCount") {
+        let seasons = seasons as u64;
+        facts.push(format!(
+            "{seasons} {}",
+            if seasons == 1 { "season" } else { "seasons" }
+        ));
+    }
+    let genres: Vec<&str> = details
+        .get("Genres")
+        .and_then(|v| v.as_array())
+        .map(|genres| genres.iter().filter_map(|g| g.as_str()).take(3).collect())
+        .unwrap_or_default();
+    if !genres.is_empty() {
+        facts.push(genres.join(", "));
+    }
+    let tagline = details
+        .get("Taglines")
+        .and_then(|v| v.as_array())
+        .and_then(|taglines| taglines.first())
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let mut episodes = HashMap::new();
+    if series {
+        // Episode names are a nicety; the Files list falls back to file names.
+        for episode in jellyfin_episodes(&api, &item).await.unwrap_or_default() {
+            episodes.insert(
+                episode.id,
+                EpisodeInfo {
+                    season: episode.parent_index_number,
+                    episode: episode.index_number,
+                    name: episode.name,
+                },
+            );
+        }
+    }
+    let poster = fetch_poster_protocol(api, item.clone(), picker, cached_poster)
+        .await
+        .ok()
+        .flatten()
+        .map(|(_, protocol)| protocol);
+    Ok(JobDetails {
+        series,
+        title: text("Name").unwrap_or(item.name),
+        years,
+        facts,
+        tagline,
+        overview: text("Overview").unwrap_or_default(),
+        episodes,
+        poster,
+    })
+}
+
+/// Season number from a "Season 3"-style folder or an "S03E07" file name tag.
+fn parse_season(path: &Path) -> Option<u32> {
+    let folder = path.parent()?.file_name()?.to_string_lossy().to_lowercase();
+    if folder == "specials" {
+        return Some(0);
+    }
+    if let Some(number) = folder.strip_prefix("season") {
+        return number.trim().parse().ok();
+    }
+    let name = path.file_name()?.to_string_lossy().to_uppercase();
+    let bytes = name.as_bytes();
+    (0..bytes.len()).find_map(|start| {
+        if bytes[start] != b'S' || (start > 0 && bytes[start - 1].is_ascii_alphanumeric()) {
+            return None;
+        }
+        let digits: String = name[start + 1..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let rest = &name[start + 1 + digits.len()..];
+        (!digits.is_empty() && digits.len() <= 3 && rest.starts_with('E'))
+            .then(|| digits.parse().ok())
+            .flatten()
+    })
+}
+
+/// Display title for a file: an episode tag and name, or a lone movie's title.
+fn file_title(
+    details: Option<&JobDetails>,
+    entry: &DownloadEntry,
+    single: bool,
+) -> Option<(String, String)> {
+    let details = details?;
+    if let Some(info) = details.episodes.get(&entry.item_id) {
+        let tag = match (info.season, info.episode) {
+            (Some(season), Some(number)) => format!("S{season:02}E{number:02}"),
+            (None, Some(number)) => format!("E{number:02}"),
+            _ => String::new(),
+        };
+        return Some((tag, info.name.clone()));
+    }
+    (!details.series && single).then(|| {
+        let title = match &details.years {
+            Some(years) => format!("{} ({years})", details.title),
+            None => details.title.clone(),
+        };
+        (String::new(), title)
+    })
+}
+
+fn season_label(season: Option<u32>, folder: &str) -> String {
+    match season {
+        Some(0) => "Specials".into(),
+        Some(number) => format!("Season {number}"),
+        None if folder.is_empty() => "Other files".into(),
+        None => folder.to_string(),
+    }
+}
+
+/// Order files by season and episode and interleave season headings. Headings
+/// are only added when the files look like a show (seasons or several folders).
+fn file_rows(downloads: &mut [DownloadEntry], details: Option<&JobDetails>) -> Vec<FileRow> {
+    let season_of = |entry: &DownloadEntry| {
+        details
+            .and_then(|details| details.episodes.get(&entry.item_id))
+            .and_then(|info| info.season)
+            .or_else(|| parse_season(&entry.path))
+    };
+    let episode_of = |entry: &DownloadEntry| {
+        details
+            .and_then(|details| details.episodes.get(&entry.item_id))
+            .and_then(|info| info.episode)
+    };
+    let folders: HashSet<_> = downloads.iter().map(|entry| entry.path.parent()).collect();
+    let grouped = details.is_some_and(|details| details.series)
+        || folders.len() > 1
+        || downloads.iter().any(|entry| season_of(entry).is_some());
+    if !grouped {
+        return (0..downloads.len()).map(FileRow::File).collect();
+    }
+    downloads.sort_by_cached_key(|entry| {
+        (
+            season_of(entry).unwrap_or(u32::MAX),
+            entry.path.parent().map(Path::to_path_buf),
+            episode_of(entry).unwrap_or(u32::MAX),
+            entry.path.clone(),
+        )
+    });
+    let mut rows = Vec::new();
+    let mut current = None;
+    for (index, entry) in downloads.iter().enumerate() {
+        let key = (season_of(entry), entry.path.parent().map(Path::to_path_buf));
+        if current.as_ref() != Some(&key) {
+            let folder = entry
+                .path
+                .parent()
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            rows.push(FileRow::Season(season_label(key.0, &folder)));
+            current = Some(key);
+        }
+        rows.push(FileRow::File(index));
+    }
+    rows
+}
+
+/// Poster, title, facts, the selected file's media info and the overview.
+#[allow(clippy::too_many_arguments)]
+fn render_job_details(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    job_name: &str,
+    details: Option<&mut JobDetails>,
+    loading: bool,
+    file_label: Option<String>,
+    probe: Option<&std::result::Result<MediaProbe, String>>,
+) {
+    let block = panel_block("Details", false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 10 || inner.height < 2 {
+        return;
+    }
+    let (title, years, facts, tagline, overview, series, poster) = match details {
+        Some(details) => (
+            details.title.clone(),
+            details.years.clone(),
+            details.facts.clone(),
+            details.tagline.clone(),
+            details.overview.clone(),
+            Some(details.series),
+            details.poster.as_mut(),
+        ),
+        None => (
+            job_name.trim_start_matches("library:").to_string(),
+            None,
+            Vec::new(),
+            None,
+            String::new(),
+            None,
+            None,
+        ),
+    };
+    // A 2:3 poster at 1:2 cells is about 4/3 as wide as it is tall.
+    let poster_width = if inner.width >= 56 && poster.is_some() {
+        (inner.height * 4 / 3 + 1).min(inner.width / 3)
+    } else {
+        0
+    };
+    if let Some(poster) = poster
+        && poster_width > 0
+    {
+        frame.render_stateful_widget(
+            StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle))),
+            Rect {
+                width: poster_width.saturating_sub(1),
+                ..inner
+            },
+            poster,
+        );
+    }
+    let text_area = Rect {
+        x: inner.x + poster_width + u16::from(poster_width > 0),
+        width: inner
+            .width
+            .saturating_sub(poster_width + u16::from(poster_width > 0)),
+        ..inner
+    };
+    let width = usize::from(text_area.width);
+    let mut lines = Vec::new();
+    let mut title_spans = vec![Span::styled(
+        title,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(years) = years {
+        title_spans.push(Span::styled(
+            format!("  {years}"),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    lines.push(Line::from(title_spans));
+    let mut fact_spans = Vec::new();
+    match series {
+        Some(true) => fact_spans.push(Span::styled("SERIES", Style::default().fg(Color::Magenta))),
+        Some(false) => fact_spans.push(Span::styled("MOVIE", Style::default().fg(Color::Magenta))),
+        None if loading => fact_spans.push(Span::styled(
+            "loading details…",
+            Style::default().fg(Color::DarkGray),
+        )),
+        None => {}
+    }
+    for fact in facts {
+        if !fact_spans.is_empty() {
+            fact_spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
+        fact_spans.push(Span::styled(
+            fact.clone(),
+            if fact.starts_with('★') {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        ));
+    }
+    if !fact_spans.is_empty() {
+        lines.push(Line::from(fact_spans));
+    }
+    if let Some(tagline) = tagline {
+        lines.push(Line::from(Span::styled(
+            truncate(&tagline, width),
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+    if let Some(label) = file_label {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("▸ ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                truncate_near_end(&label, width.saturating_sub(2)),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        match probe {
+            Some(Ok(probe)) => {
+                // Streams first; the container line matters least.
+                let order = ["Video", "Audio", "Subtitles", "File"];
+                for label in order {
+                    for (name, value) in probe.rows.iter().filter(|(name, _)| name == label) {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("  {name:<11}"), Style::default().fg(Color::Cyan)),
+                            Span::raw(truncate(value, width.saturating_sub(13))),
+                        ]));
+                    }
+                }
+            }
+            Some(Err(error)) => lines.push(Line::from(Span::styled(
+                format!("  {}", truncate(error, width.saturating_sub(2))),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            None => lines.push(Line::from(Span::styled(
+                "  probing…",
+                Style::default().fg(Color::DarkGray),
+            ))),
+        }
+    }
+    let used = lines.len() as u16;
+    frame.render_widget(Paragraph::new(lines), text_area);
+    // The overview fills whatever space is left below.
+    if !overview.is_empty() && text_area.height > used + 1 {
+        frame.render_widget(
+            Paragraph::new(overview)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(Color::Gray)),
+            Rect {
+                y: text_area.y + used + 1,
+                height: text_area.height - used - 1,
+                ..text_area
+            },
+        );
+    }
+}
+
+async fn probe_media(path: PathBuf) -> Result<MediaProbe> {
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -4432,7 +5054,110 @@ async fn probe_media(path: PathBuf) -> Result<MediaSummary> {
     }
     let probe: serde_json::Value =
         serde_json::from_slice(&output.stdout).context("parse ffprobe output")?;
-    Ok(media_summary(&probe))
+    Ok(MediaProbe {
+        rows: media_summary(&probe),
+        badges: media_badges(&probe),
+    })
+}
+
+/// Common name for a video resolution, e.g. "1080p" or "4K".
+fn resolution_label(width: u64, height: u64) -> String {
+    // Widescreen encodes crop the height, so also look at the width.
+    if width >= 3800 || height >= 2100 {
+        "4K".into()
+    } else if width >= 2500 || height >= 1400 {
+        "1440p".into()
+    } else if width >= 1900 || height >= 1000 {
+        "1080p".into()
+    } else if width >= 1200 || height >= 700 {
+        "720p".into()
+    } else if height > 0 {
+        format!("{height}p")
+    } else {
+        "SD".into()
+    }
+}
+
+fn channel_label(channels: Option<u64>) -> String {
+    match channels {
+        Some(1) => "mono".into(),
+        Some(2) => "2.0".into(),
+        Some(6) => "5.1".into(),
+        Some(8) => "7.1".into(),
+        Some(n) => format!("{n}ch"),
+        None => "?".into(),
+    }
+}
+
+/// Short tags for a Files row: resolution, video codec, HDR, main audio track.
+fn media_badges(probe: &serde_json::Value) -> Vec<String> {
+    let streams = probe
+        .get("streams")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let text = |value: &serde_json::Value, key: &str| {
+        value.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    };
+    let number = |value: &serde_json::Value, key: &str| value.get(key).and_then(|v| v.as_u64());
+    let disposition = |stream: &serde_json::Value, key: &str| {
+        stream
+            .get("disposition")
+            .and_then(|d| d.get(key))
+            .and_then(|v| v.as_i64())
+            == Some(1)
+    };
+    let of_type = |kind: &str| -> Vec<&serde_json::Value> {
+        streams
+            .iter()
+            .filter(|stream| text(stream, "codec_type").as_deref() == Some(kind))
+            .filter(|stream| !disposition(stream, "attached_pic"))
+            .collect()
+    };
+    let mut badges = Vec::new();
+    if let Some(video) = of_type("video").first() {
+        badges.push(resolution_label(
+            number(video, "width").unwrap_or(0),
+            number(video, "height").unwrap_or(0),
+        ));
+        if let Some(codec) = text(video, "codec_name") {
+            badges.push(match codec.as_str() {
+                "hevc" => "HEVC".to_string(),
+                "h264" => "H.264".to_string(),
+                other => other.to_uppercase(),
+            });
+        }
+        match text(video, "color_transfer").as_deref() {
+            Some("smpte2084") => badges.push("HDR10".into()),
+            Some("arib-std-b67") => badges.push("HLG".into()),
+            _ => {}
+        }
+    }
+    let audio = of_type("audio");
+    if let Some(track) = audio
+        .iter()
+        .find(|stream| disposition(stream, "default"))
+        .or(audio.first())
+    {
+        badges.push(format!(
+            "{} {}",
+            text(track, "codec_name")
+                .unwrap_or_else(|| "?".into())
+                .to_uppercase(),
+            channel_label(number(track, "channels"))
+        ));
+    }
+    if audio.len() > 1 {
+        badges.push(format!("{} audio", audio.len()));
+    }
+    let subtitles = of_type("subtitle").len();
+    if subtitles > 0 {
+        badges.push(format!(
+            "{subtitles} {}",
+            if subtitles == 1 { "sub" } else { "subs" }
+        ));
+    }
+    badges
 }
 
 fn media_summary(probe: &serde_json::Value) -> MediaSummary {
@@ -4523,14 +5248,7 @@ fn media_summary(probe: &serde_json::Value) -> MediaSummary {
     let audio: Vec<String> = of_type("audio")
         .into_iter()
         .map(|stream| {
-            let channels = match number(stream, "channels").map(|c| c as u64) {
-                Some(1) => "mono".to_string(),
-                Some(2) => "2.0".to_string(),
-                Some(6) => "5.1".to_string(),
-                Some(8) => "7.1".to_string(),
-                Some(n) => format!("{n}ch"),
-                None => "?".to_string(),
-            };
+            let channels = channel_label(number(stream, "channels").map(|c| c as u64));
             format!(
                 "{} {} {}{}",
                 language(stream),
@@ -4743,6 +5461,46 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
+fn download_complete(status: &str) -> bool {
+    matches!(status, "complete" | "completed" | "success")
+}
+
+fn file_row_height(row: &FileRow) -> usize {
+    match row {
+        FileRow::Season(_) => 1,
+        FileRow::File(_) => 3,
+    }
+}
+
+/// The file under a mouse position in the Files list, skipping season headings.
+fn file_row_at(
+    area: Rect,
+    column: u16,
+    row: u16,
+    offset: usize,
+    rows: &[FileRow],
+) -> Option<usize> {
+    if column < area.x
+        || column >= area.x + area.width
+        || row < area.y + 1
+        || row >= area.y + area.height.saturating_sub(1)
+    {
+        return None;
+    }
+    let mut line = usize::from(row - area.y - 1);
+    for file_row in rows.iter().skip(offset) {
+        let height = file_row_height(file_row);
+        if line < height {
+            return match file_row {
+                FileRow::File(index) => Some(*index),
+                FileRow::Season(_) => None,
+            };
+        }
+        line -= height;
+    }
+    None
+}
+
 fn list_index_at(
     area: Rect,
     column: u16,
@@ -4859,4 +5617,175 @@ fn systemctl(action: &str, json_output: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(item_id: &str, path: &str) -> DownloadEntry {
+        DownloadEntry {
+            item_id: item_id.into(),
+            job: "Show".into(),
+            path: PathBuf::from(path),
+            status: "complete".into(),
+            bytes: 1,
+            total: Some(1),
+        }
+    }
+
+    #[test]
+    fn season_from_folder_or_tag() {
+        assert_eq!(parse_season(Path::new("/tv/Show/Season 3/x.mkv")), Some(3));
+        assert_eq!(parse_season(Path::new("/tv/Show/Specials/x.mkv")), Some(0));
+        assert_eq!(
+            parse_season(Path::new("/tv/Show/Show - S02E05 - Title.mkv")),
+            Some(2)
+        );
+        assert_eq!(
+            parse_season(Path::new("/tv/Show/show.s10e01.mkv")),
+            Some(10)
+        );
+        assert_eq!(
+            parse_season(Path::new("/movies/Heat (1995)/Heat.mkv")),
+            None
+        );
+        // "S" inside a word is not a season tag.
+        assert_eq!(parse_season(Path::new("/movies/X/Bosses2Ever.mkv")), None);
+    }
+
+    #[test]
+    fn resolution_labels() {
+        assert_eq!(resolution_label(3840, 1600), "4K");
+        assert_eq!(resolution_label(1920, 800), "1080p");
+        assert_eq!(resolution_label(1280, 720), "720p");
+        assert_eq!(resolution_label(720, 576), "576p");
+        assert_eq!(resolution_label(0, 0), "SD");
+    }
+
+    #[test]
+    fn badges_from_ffprobe() {
+        let probe = json!({
+            "streams": [
+                {"codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}},
+                {"codec_type": "video", "codec_name": "hevc", "width": 3840, "height": 2160,
+                 "color_transfer": "smpte2084"},
+                {"codec_type": "audio", "codec_name": "aac", "channels": 2},
+                {"codec_type": "audio", "codec_name": "eac3", "channels": 6,
+                 "disposition": {"default": 1}},
+                {"codec_type": "subtitle", "codec_name": "subrip"}
+            ]
+        });
+        assert_eq!(
+            media_badges(&probe),
+            ["4K", "HEVC", "HDR10", "EAC3 5.1", "2 audio", "1 sub"]
+        );
+        let rows = media_summary(&probe);
+        assert!(
+            rows.iter()
+                .any(|(label, value)| label == "Video" && value.contains("HDR10"))
+        );
+        assert_eq!(rows.iter().filter(|(label, _)| label == "Video").count(), 1);
+    }
+
+    #[test]
+    fn movies_are_not_grouped() {
+        let mut files = vec![entry("a", "/m/Heat (1995)/Heat.mkv")];
+        let rows = file_rows(&mut files, None);
+        assert!(matches!(rows.as_slice(), [FileRow::File(0)]));
+    }
+
+    #[test]
+    fn shows_are_grouped_by_season_in_order() {
+        let mut files = vec![
+            entry("c", "/tv/Show/Season 10/Show - S10E01.mkv"),
+            entry("b", "/tv/Show/Season 2/Show - S02E02.mkv"),
+            entry("a", "/tv/Show/Season 2/Show - S02E01.mkv"),
+        ];
+        let rows = file_rows(&mut files, None);
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|row| match row {
+                FileRow::Season(label) => label.clone(),
+                FileRow::File(index) => files[*index].item_id.clone(),
+            })
+            .collect();
+        // Season 10 sorts numerically after season 2, not lexically before it.
+        assert_eq!(labels, ["Season 2", "a", "b", "Season 10", "c"]);
+    }
+
+    #[test]
+    fn jellyfin_episode_numbers_win() {
+        let mut episodes = HashMap::new();
+        for (id, number) in [("x", 2), ("y", 1)] {
+            episodes.insert(
+                id.to_string(),
+                EpisodeInfo {
+                    season: Some(1),
+                    episode: Some(number),
+                    name: format!("Episode {number}"),
+                },
+            );
+        }
+        let details = JobDetails {
+            series: true,
+            title: "Show".into(),
+            years: None,
+            facts: Vec::new(),
+            tagline: None,
+            overview: String::new(),
+            episodes,
+            poster: None,
+        };
+        let mut files = vec![
+            entry("x", "/tv/Show/Season 1/a.mkv"),
+            entry("y", "/tv/Show/Season 1/b.mkv"),
+        ];
+        file_rows(&mut files, Some(&details));
+        assert_eq!(files[0].item_id, "y");
+        assert_eq!(
+            file_title(Some(&details), &files[0], false),
+            Some(("S01E01".into(), "Episode 1".into()))
+        );
+    }
+
+    #[test]
+    fn movie_title_only_for_a_lone_file() {
+        let details = JobDetails {
+            series: false,
+            title: "Heat".into(),
+            years: Some("1995".into()),
+            facts: Vec::new(),
+            tagline: None,
+            overview: String::new(),
+            episodes: HashMap::new(),
+            poster: None,
+        };
+        let file = entry("m", "/m/Heat/Heat.mkv");
+        assert_eq!(
+            file_title(Some(&details), &file, true),
+            Some((String::new(), "Heat (1995)".into()))
+        );
+        assert_eq!(file_title(Some(&details), &file, false), None);
+        assert_eq!(file_title(None, &file, true), None);
+    }
+
+    #[test]
+    fn clicks_skip_season_headings() {
+        let rows = vec![
+            FileRow::Season("Season 1".into()),
+            FileRow::File(0),
+            FileRow::File(1),
+        ];
+        let area = Rect::new(0, 0, 40, 20);
+        // Line 1 is the heading, lines 2-4 the first file, 5-7 the second.
+        assert_eq!(file_row_at(area, 5, 1, 0, &rows), None);
+        assert_eq!(file_row_at(area, 5, 2, 0, &rows), Some(0));
+        assert_eq!(file_row_at(area, 5, 4, 0, &rows), Some(0));
+        assert_eq!(file_row_at(area, 5, 5, 0, &rows), Some(1));
+        assert_eq!(file_row_at(area, 5, 8, 0, &rows), None);
+        assert_eq!(file_row_at(area, 5, 1, 2, &rows), Some(1));
+        // Borders are not rows.
+        assert_eq!(file_row_at(area, 5, 0, 0, &rows), None);
+    }
 }

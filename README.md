@@ -187,6 +187,15 @@ selects one, `a` selects all, and `d` or `Enter` downloads the selection
 library and `q` closes Explore; after closing Explore, the main view selects the job and file you just
 queued.
 
+When the terminal is tall enough, a Details panel sits above the Files list:
+the show's or movie's poster, title, years, rating, runtime, genres, tagline and
+overview from Jellyfin, plus the `ffprobe` streams (video, audio, subtitles,
+container) of the selected file. Show files are grouped under season headings
+(with file count, progress and size) and ordered by episode, and their rows use
+the Jellyfin episode title; each downloaded file shows short badges such as
+`1080p · HEVC · EAC3 5.1`. Files are probed locally in the background, so this
+also works offline (without the Jellyfin metadata).
+
 In the Files list, `Space` pauses a queued or running download (keeping its
 partial file and freeing its worker slot for the next queued one) and resumes a
 paused one. Paused downloads are not resumed automatically.

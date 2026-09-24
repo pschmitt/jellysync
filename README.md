@@ -184,7 +184,7 @@ In Explore, `Tab`, `→` or `Enter` moves focus from the library to the details
 pane of the selected show; there, `↑`/`↓` move through episodes, `Space`
 selects one, `a` selects all, and `d` or `Enter` downloads the selection
 (`d`/`Enter` on a movie downloads it). `Tab`, `←` or `Esc` returns to the
-library; after closing Explore, the main view selects the job and file you just
+library and `q` closes Explore; after closing Explore, the main view selects the job and file you just
 queued.
 
 In the Files list, `Space` pauses a queued or running download (keeping its

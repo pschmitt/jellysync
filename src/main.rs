@@ -3548,7 +3548,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         Line::from("  Tab / ← / → / Enter  switch library / details pane"),
                         Line::from("  Space / a         select episode / select all"),
                         Line::from("  d                 download selected media"),
-                        Line::from("  Ctrl-C or Esc     close Explore"),
+                        Line::from("  Ctrl-C or Esc     close Explore (q too in the details pane)"),
                         Line::from(""),
                         Line::from(Span::styled(
                             "Ad-hoc downloads continue after Explore closes.",
@@ -3817,7 +3817,11 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                             browser.details_focus = true;
                             explore_notice = None;
                         }
-                        KeyCode::Esc => {
+                        // Esc in the details pane goes back (handled above); q there closes
+                        // Explore, while in the library pane it is typed into the search.
+                        KeyCode::Esc | KeyCode::Char('q')
+                            if key.code == KeyCode::Esc || browser.details_focus =>
+                        {
                             if let Some(task) = catalog_task.take() {
                                 task.abort();
                             }

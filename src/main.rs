@@ -23,19 +23,24 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
-use ratatui_image::{Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol};
+use ratatui_image::{
+    Resize, StatefulImage,
+    picker::Picker,
+    protocol::StatefulProtocol,
+    thread::{ResizeRequest, ThreadProtocol},
+};
 use reqwest::{Client as HttpClient, StatusCode};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
     io::stdout,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{process::Command, sync::Semaphore, task::JoinSet};
 
@@ -309,6 +314,7 @@ struct ItemsResponse {
 struct MediaItem {
     id: String,
     name: String,
+    #[serde(rename = "Type")]
     #[serde(default)]
     item_type: Option<String>,
     #[serde(default)]
@@ -319,7 +325,12 @@ struct MediaItem {
     user_data: Option<UserData>,
 }
 
+type PosterFetch = Result<Option<(Vec<u8>, StatefulProtocol)>>;
+type PosterTask = tokio::task::JoinHandle<(String, PosterFetch)>;
+type CatalogTask = tokio::task::JoinHandle<Result<(JellyfinApi, Vec<MediaItem>)>>;
+
 struct ExploreState {
+    api: Option<JellyfinApi>,
     items: Vec<MediaItem>,
     episodes: Vec<MediaItem>,
     selected: usize,
@@ -328,7 +339,10 @@ struct ExploreState {
     search: String,
     series_title: Option<String>,
     poster_id: Option<String>,
-    poster: Option<StatefulProtocol>,
+    poster_loading: bool,
+    poster_loaded: bool,
+    catalog_loading: bool,
+    episode_loading: bool,
 }
 
 impl ExploreState {
@@ -473,6 +487,60 @@ async fn jellyfin_catalog(config: &Config) -> Result<(JellyfinApi, Vec<MediaItem
     Ok((api, items))
 }
 
+async fn fetch_poster_protocol(
+    api: JellyfinApi,
+    item: MediaItem,
+    picker: Picker,
+    cached_data: Option<Vec<u8>>,
+) -> Result<Option<(Vec<u8>, StatefulProtocol)>> {
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let data = if let Some(data) = cached_data {
+        data
+    } else {
+        let Some(data) = jellyfin_poster(&api, &item).await? else {
+            return Ok(None);
+        };
+        data
+    };
+    let cached_data = data.clone();
+    let protocol = tokio::task::spawn_blocking(move || poster_protocol(&picker, &data))
+        .await
+        .context("poster decoder worker stopped")??;
+    Ok(Some((cached_data, protocol)))
+}
+
+fn request_poster(
+    browser: &mut ExploreState,
+    item: MediaItem,
+    picker: &Picker,
+    cache: &HashMap<String, Vec<u8>>,
+    image: &mut ThreadProtocol,
+    image_task: &mut Option<PosterTask>,
+) -> Result<()> {
+    if browser.poster_id.as_deref() == Some(item.id.as_str()) {
+        return Ok(());
+    }
+    let api = browser
+        .api
+        .clone()
+        .context("Explore Jellyfin session is not ready")?;
+    browser.poster_id = Some(item.id.clone());
+    browser.poster_loading = true;
+    browser.poster_loaded = false;
+    image.empty_protocol();
+    if let Some(task) = image_task.take() {
+        task.abort();
+    }
+    let picker = picker.clone();
+    let item_id = item.id.clone();
+    let cached_data = cache.get(&item.id).cloned();
+    *image_task = Some(tokio::spawn(async move {
+        let result = fetch_poster_protocol(api, item, picker, cached_data).await;
+        (item_id, result)
+    }));
+    Ok(())
+}
+
 async fn jellyfin_episodes(api: &JellyfinApi, series: &MediaItem) -> Result<Vec<MediaItem>> {
     jellyfin_items(
         api,
@@ -486,6 +554,10 @@ async fn jellyfin_episodes(api: &JellyfinApi, series: &MediaItem) -> Result<Vec<
         ],
     )
     .await
+}
+
+async fn fetch_episodes(api: JellyfinApi, series: MediaItem) -> Result<Vec<MediaItem>> {
+    jellyfin_episodes(&api, &series).await
 }
 
 async fn jellyfin_poster(api: &JellyfinApi, item: &MediaItem) -> Result<Option<Vec<u8>>> {
@@ -1349,14 +1421,8 @@ async fn reconcile_existing(config: &Config) -> Result<usize> {
 }
 
 async fn tui(config: Config) -> Result<()> {
-    let initial_notice = match reconcile_existing(&config).await {
-        Ok(0) => None,
-        Ok(count) => Some((format!("Indexed {count} existing media files"), true)),
-        Err(error) => Some((
-            format!("Could not reconcile existing files: {error:#}"),
-            false,
-        )),
-    };
+    let reconcile_config = config.clone();
+    let reconcile_task = tokio::spawn(async move { reconcile_existing(&reconcile_config).await });
     let mut out = stdout();
     enable_raw_mode()?;
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1364,6 +1430,18 @@ async fn tui(config: Config) -> Result<()> {
         let backend = CrosstermBackend::new(out);
         let mut terminal = Terminal::new(backend)?;
         let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
+        let mut poster_cache = HashMap::<String, Vec<u8>>::new();
+        let mut poster_cache_order = VecDeque::<String>::new();
+        let (resize_request_tx, resize_request_rx) = std::sync::mpsc::channel::<ResizeRequest>();
+        let (resize_response_tx, resize_response_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(request) = resize_request_rx.recv() {
+                if resize_response_tx.send(request.resize_encode()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut poster_protocol = ThreadProtocol::new(resize_request_tx, None);
         let mut selected = 0usize;
         let mut selected_download = 0usize;
         let mut download_focus = false;
@@ -1371,13 +1449,138 @@ async fn tui(config: Config) -> Result<()> {
         let mut explore: Option<ExploreState> = None;
         let mut explore_notice: Option<(String, bool)> = None;
         let mut explore_task: Option<tokio::task::JoinHandle<Result<usize>>> = None;
+        let mut reconcile_task = Some(reconcile_task);
+        let mut catalog_task: Option<CatalogTask> = None;
+        let mut episode_task: Option<tokio::task::JoinHandle<(String, Result<Vec<MediaItem>>) >> =
+            None;
+        let mut poster_task: Option<PosterTask> = None;
         let mut sync_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
-        let mut sync_notice = initial_notice;
+        let mut sync_notice = None;
         let mut jobs_state = ListState::default();
         let mut downloads_state = ListState::default();
         let mut explore_state = ListState::default();
         let mut episode_state = ListState::default();
+        let mut timer_state = "unknown".to_string();
+        let mut timer_checked_at = Instant::now() - Duration::from_secs(5);
         loop {
+            if reconcile_task
+                .as_ref()
+                .is_some_and(|task| task.is_finished())
+            {
+                let task = reconcile_task.take().expect("finished reconcile task exists");
+                sync_notice = Some(match task.await {
+                    Ok(Ok(0)) => ("Finished scanning existing media".into(), true),
+                    Ok(Ok(count)) => (format!("Indexed {count} existing media files"), true),
+                    Ok(Err(error)) => (format!("Could not reconcile existing files: {error:#}"), false),
+                    Err(error) => (format!("Reconciliation stopped: {error}"), false),
+                });
+            }
+            if episode_task.as_ref().is_some_and(|task| task.is_finished()) {
+                let task = episode_task.take().expect("finished episode task exists");
+                match task.await {
+                    Ok((series_title, Ok(episodes))) => {
+                        if let Some(browser) = explore.as_mut()
+                            && browser.series_title.as_deref() == Some(series_title.as_str())
+                        {
+                            browser.episodes = episodes;
+                            browser.episode_loading = false;
+                        }
+                    }
+                    Ok((series_title, Err(error))) => {
+                        if let Some(browser) = explore.as_mut()
+                            && browser.series_title.as_deref() == Some(series_title.as_str())
+                        {
+                            browser.episode_loading = false;
+                            explore_notice = Some((format!("Could not load episodes: {error:#}"), false));
+                        }
+                    }
+                    Err(error) => {
+                        explore_notice = Some((format!("Episode request stopped: {error}"), false));
+                    }
+                }
+            }
+            while let Ok(result) = resize_response_rx.try_recv() {
+                match result {
+                    Ok(response) => {
+                        poster_protocol.update_resized_protocol(response);
+                    }
+                    Err(error) => {
+                        explore_notice = Some((format!("Poster rendering failed: {error}"), false));
+                    }
+                }
+            }
+            if catalog_task.as_ref().is_some_and(|task| task.is_finished()) {
+                let task = catalog_task.take().expect("finished catalog task exists");
+                match task.await {
+                    Ok(Ok((api, items))) => {
+                        if let Some(browser) = explore.as_mut() {
+                            browser.api = Some(api);
+                            browser.items = items;
+                            browser.catalog_loading = false;
+                            if let Some(item) = browser.items.first().cloned()
+                                && let Err(error) = request_poster(
+                                    browser,
+                                    item,
+                                    &picker,
+                                    &poster_cache,
+                                    &mut poster_protocol,
+                                    &mut poster_task,
+                                )
+                            {
+                                browser.poster_loading = false;
+                                explore_notice = Some((format!("Could not load poster: {error:#}"), false));
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        explore = None;
+                        explore_notice = Some((format!("Could not open Explore: {error:#}"), false));
+                    }
+                    Err(error) => {
+                        explore = None;
+                        explore_notice = Some((format!("Explore request stopped: {error}"), false));
+                    }
+                }
+            }
+            if poster_task.as_ref().is_some_and(|task| task.is_finished()) {
+                let task = poster_task.take().expect("finished poster task exists");
+                match task.await {
+                    Ok((item_id, result)) => {
+                        if let Some(browser) = explore.as_mut()
+                            && browser.poster_id.as_deref() == Some(item_id.as_str())
+                        {
+                            browser.poster_loading = false;
+                            match result {
+                                Ok(Some((data, protocol))) => {
+                                    poster_cache.insert(item_id.clone(), data);
+                                    poster_cache_order.retain(|id| id != &item_id);
+                                    poster_cache_order.push_back(item_id.clone());
+                                    while poster_cache_order.len() > 32 {
+                                        if let Some(expired) = poster_cache_order.pop_front() {
+                                            poster_cache.remove(&expired);
+                                        }
+                                    }
+                                    poster_protocol.replace_protocol(protocol);
+                                    browser.poster_loaded = true;
+                                }
+                                Ok(None) => {
+                                    poster_protocol.empty_protocol();
+                                    browser.poster_loaded = false;
+                                }
+                                Err(error) => {
+                                    poster_protocol.empty_protocol();
+                                    browser.poster_loaded = false;
+                                    explore_notice = Some((format!("Poster unavailable: {error:#}"), false));
+                                }
+                            }
+                        }
+                    }
+                    Err(error) if !error.is_cancelled() => {
+                        explore_notice = Some((format!("Poster request stopped: {error}"), false));
+                    }
+                    Err(_) => {}
+                }
+            }
             if explore_task.as_ref().is_some_and(|task| task.is_finished()) {
                 let task = explore_task.take().expect("finished Explore task exists");
                 explore_notice = Some(match task.await {
@@ -1502,13 +1705,16 @@ async fn tui(config: Config) -> Result<()> {
                     ])
                 })
                 .collect();
-            let timer = std::process::Command::new("systemctl")
-                .args(["--user", "is-active", "jellysync.timer"])
-                .output()
-                .ok()
-                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-                .filter(|state| !state.is_empty())
-                .unwrap_or_else(|| "unknown".into());
+            if timer_checked_at.elapsed() >= Duration::from_secs(5) {
+                timer_state = std::process::Command::new("systemctl")
+                    .args(["--user", "is-active", "jellysync.timer"])
+                    .output()
+                    .ok()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                    .filter(|state| !state.is_empty())
+                    .unwrap_or_else(|| "unknown".into());
+                timer_checked_at = Instant::now();
+            }
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
             let explore_popup = centered_rect(90, 88, area);
@@ -1576,8 +1782,8 @@ async fn tui(config: Config) -> Result<()> {
                     ),
                     Span::styled("  ·  timer ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
-                        timer.clone(),
-                        if timer == "active" {
+                        timer_state.clone(),
+                        if timer_state == "active" {
                             state_style("success")
                         } else {
                             state_style("stopped")
@@ -1745,7 +1951,24 @@ async fn tui(config: Config) -> Result<()> {
                             .border_style(Style::default().fg(Color::Magenta)),
                         explore_popup,
                     );
-                    if let Some(series_title) = &explore.series_title {
+                    if explore.catalog_loading {
+                        frame.render_widget(
+                            Paragraph::new("Loading Jellyfin library…")
+                                .style(Style::default().fg(Color::Gray))
+                                .alignment(ratatui::layout::Alignment::Center)
+                                .block(panel_block("Library", true)),
+                            explore_list_area,
+                        );
+                    } else if let Some(series_title) = &explore.series_title {
+                        if explore.episode_loading {
+                            frame.render_widget(
+                                Paragraph::new("Loading episodes…")
+                                    .style(Style::default().fg(Color::Gray))
+                                    .alignment(ratatui::layout::Alignment::Center)
+                                    .block(panel_block("Episodes", true)),
+                                explore_list_area,
+                            );
+                        } else {
                         let rows: Vec<_> = explore
                             .episodes
                             .iter()
@@ -1758,12 +1981,13 @@ async fn tui(config: Config) -> Result<()> {
                             })
                             .collect();
                         episode_state.select((!rows.is_empty()).then_some(explore.episode_cursor));
-                        frame.render_widget(
+                        frame.render_stateful_widget(
                             List::new(rows)
                                 .block(panel_block(&format!("{series_title} · episodes"), true))
-                                .highlight_style(Style::default().fg(Color::White).bg(Color::Rgb(50, 40, 70)).add_modifier(Modifier::BOLD))
+                                .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
                                 .highlight_symbol("▌ "),
                             explore_list_area,
+                            &mut episode_state,
                         );
                         let details = vec![
                             Line::from(Span::styled(series_title.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
@@ -1771,6 +1995,7 @@ async fn tui(config: Config) -> Result<()> {
                             Line::from(Span::styled("Space select · a select all · d download", Style::default().fg(Color::Cyan))),
                         ];
                         frame.render_widget(Paragraph::new(details).block(panel_block("Series", false)), explore_poster_area);
+                        }
                     } else {
                         let rows: Vec<_> = filtered
                             .iter()
@@ -1784,12 +2009,13 @@ async fn tui(config: Config) -> Result<()> {
                             })
                             .collect();
                         explore_state.select((!rows.is_empty()).then_some(explore.selected.min(rows.len().saturating_sub(1))));
-                        frame.render_widget(
+                        frame.render_stateful_widget(
                             List::new(rows)
                                 .block(panel_block(&format!("Library · {} · / search", filtered.len()), true))
-                                .highlight_style(Style::default().fg(Color::White).bg(Color::Rgb(50, 40, 70)).add_modifier(Modifier::BOLD))
+                                .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
                                 .highlight_symbol("▌ "),
                             explore_list_area,
+                            &mut explore_state,
                         );
                         if let Some(item) = filtered.get(explore.selected) {
                             let details_area = Rect { x: explore_poster_area.x + 1, y: explore_poster_area.y + 1, width: explore_poster_area.width.saturating_sub(2), height: 3 };
@@ -1802,14 +2028,19 @@ async fn tui(config: Config) -> Result<()> {
                                 details_area,
                             );
                             let poster_box = Rect { x: explore_poster_area.x + 2, y: explore_poster_area.y + 5, width: explore_poster_area.width.saturating_sub(4), height: explore_poster_area.height.saturating_sub(7) };
-                            if let Some(poster) = &mut explore.poster {
+                            if explore.poster_loaded {
                                 frame.render_stateful_widget(
                                     StatefulImage::default().resize(Resize::Fit(None)),
                                     poster_box,
-                                    poster,
+                                    &mut poster_protocol,
                                 );
                             } else {
-                                frame.render_widget(Paragraph::new("Poster unavailable").style(Style::default().fg(Color::DarkGray)), poster_box);
+                                let status = if explore.poster_loading {
+                                    "Loading poster…"
+                                } else {
+                                    "Poster unavailable"
+                                };
+                                frame.render_widget(Paragraph::new(status).style(Style::default().fg(Color::DarkGray)), poster_box);
                             }
                         }
                     }
@@ -1822,7 +2053,7 @@ async fn tui(config: Config) -> Result<()> {
                     frame.render_widget(Paragraph::new(text).style(Style::default().fg(Color::Gray)), footer);
                 }
             })?;
-            if event::poll(Duration::from_secs(1))? {
+            if event::poll(Duration::from_millis(250))? {
                 let input = event::read()?;
                 if let Event::Mouse(mouse) = &input {
                     if let Some(browser) = explore.as_mut() {
@@ -1875,18 +2106,15 @@ async fn tui(config: Config) -> Result<()> {
                                 .filtered_items()
                                 .get(browser.selected)
                                 .map(|item| (*item).clone())
-                            && browser.poster_id.as_deref() != Some(&item.id)
-                        {
-                            browser.poster_id = Some(item.id.clone());
-                            browser.poster = None;
-                            if let Some(credentials) = config.jellyfin.as_ref()
-                                && let Ok(api) = jellyfin_login(credentials).await
-                            {
-                                browser.poster = match jellyfin_poster(&api, &item).await {
-                                    Ok(Some(data)) => poster_protocol(&picker, &data).ok(),
-                                    _ => None,
-                                };
-                            }
+                            && let Err(error) = request_poster(
+                                browser,
+                                item,
+                                &picker,
+                                &poster_cache,
+                                &mut poster_protocol,
+                                &mut poster_task,
+                            ) {
+                            explore_notice = Some((format!("Could not load poster: {error:#}"), false));
                         }
                     } else if confirm_clear.is_none() {
                         match mouse.kind {
@@ -1960,10 +2188,24 @@ async fn tui(config: Config) -> Result<()> {
                     match key.code {
                         KeyCode::Esc => {
                             if browser.series_title.take().is_some() {
+                                if let Some(task) = episode_task.take() {
+                                    task.abort();
+                                }
                                 browser.selected_episodes.clear();
                                 browser.episodes.clear();
                                 browser.episode_cursor = 0;
+                                browser.episode_loading = false;
                             } else {
+                                if let Some(task) = catalog_task.take() {
+                                    task.abort();
+                                }
+                                if let Some(task) = poster_task.take() {
+                                    task.abort();
+                                }
+                                if let Some(task) = episode_task.take() {
+                                    task.abort();
+                                }
+                                poster_protocol.empty_protocol();
                                 explore = None;
                                 explore_notice = None;
                             }
@@ -2007,18 +2249,21 @@ async fn tui(config: Config) -> Result<()> {
                             if let Some(item) = browser.filtered_items().get(browser.selected).map(|item| (*item).clone())
                                 && item.item_type.as_deref() == Some("Series")
                             {
-                                let credentials = config.jellyfin.as_ref().context("Explore requires Jellyfin credentials")?;
-                                let api = jellyfin_login(credentials).await?;
-                                match jellyfin_episodes(&api, &item).await {
-                                    Ok(episodes) => {
-                                        browser.episodes = episodes;
-                                        browser.episode_cursor = 0;
-                                        browser.selected_episodes.clear();
-                                        browser.series_title = Some(item.name);
-                                        explore_notice = None;
-                                    }
-                                    Err(error) => explore_notice = Some((format!("Could not load episodes: {error:#}"), false)),
-                                }
+                                browser.episodes.clear();
+                                browser.episode_cursor = 0;
+                                browser.selected_episodes.clear();
+                                browser.episode_loading = true;
+                                browser.series_title = Some(item.name.clone());
+                                let api = browser.api.clone();
+                                episode_task = Some(tokio::spawn(async move {
+                                    let title = item.name.clone();
+                                    let result = match api {
+                                        Some(api) => fetch_episodes(api, item).await,
+                                        None => Err(anyhow::anyhow!("Explore Jellyfin session is not ready")),
+                                    };
+                                    (title, result)
+                                }));
+                                explore_notice = None;
                             }
                         }
                         KeyCode::Char('d') => {
@@ -2056,23 +2301,19 @@ async fn tui(config: Config) -> Result<()> {
                     }
                     if let Some(browser) = explore.as_mut()
                         && browser.series_title.is_none()
-                            && let Some(item) = browser.filtered_items().get(browser.selected).map(|item| (*item).clone())
-                        && browser.poster_id.as_deref() != Some(&item.id)
-                    {
-                        browser.poster_id = Some(item.id.clone());
-                        browser.poster = None;
-                        if let Some(credentials) = config.jellyfin.as_ref() {
-                            match jellyfin_login(credentials).await {
-                                Ok(api) => match jellyfin_poster(&api, &item).await {
-                                    Ok(Some(data)) => {
-                                        browser.poster = poster_protocol(&picker, &data).ok()
-                                    }
-                                    Ok(None) => browser.poster = None,
-                                    Err(error) => explore_notice = Some((format!("Poster unavailable: {error:#}"), false)),
-                                },
-                                Err(error) => explore_notice = Some((format!("Jellyfin login failed: {error:#}"), false)),
-                            }
-                        }
+                        && let Some(item) = browser
+                            .filtered_items()
+                            .get(browser.selected)
+                            .map(|item| (*item).clone())
+                        && let Err(error) = request_poster(
+                            browser,
+                            item,
+                            &picker,
+                            &poster_cache,
+                            &mut poster_protocol,
+                            &mut poster_task,
+                        ) {
+                        explore_notice = Some((format!("Could not load poster: {error:#}"), false));
                     }
                 } else if let Some(scope) = confirm_clear {
                     match key.code {
@@ -2111,31 +2352,26 @@ async fn tui(config: Config) -> Result<()> {
                             if explore_task.is_some() {
                                 explore_notice = Some(("Wait for the current library download to finish".into(), false));
                             } else {
-                                match jellyfin_catalog(&config).await {
-                                    Ok((api, items)) => {
-                                        let mut browser = ExploreState {
-                                            items,
-                                            episodes: Vec::new(),
-                                            selected: 0,
-                                            episode_cursor: 0,
-                                            selected_episodes: HashSet::new(),
-                                            search: String::new(),
-                                            series_title: None,
-                                            poster_id: None,
-                                            poster: None,
-                                        };
-                                        if let Some(item) = browser.items.first() {
-                                            browser.poster_id = Some(item.id.clone());
-                                            browser.poster = match jellyfin_poster(&api, item).await {
-                                                Ok(Some(data)) => poster_protocol(&picker, &data).ok(),
-                                                _ => None,
-                                            };
-                                        }
-                                        explore = Some(browser);
-                                        explore_notice = None;
-                                    }
-                                    Err(error) => sync_notice = Some((format!("Could not open Explore: {error:#}"), false)),
-                                }
+                                explore = Some(ExploreState {
+                                    api: None,
+                                    items: Vec::new(),
+                                    episodes: Vec::new(),
+                                    selected: 0,
+                                    episode_cursor: 0,
+                                    selected_episodes: HashSet::new(),
+                                    search: String::new(),
+                                    series_title: None,
+                                    poster_id: None,
+                                    poster_loading: false,
+                                    poster_loaded: false,
+                                    catalog_loading: true,
+                                    episode_loading: false,
+                                });
+                                let config = config.clone();
+                                catalog_task = Some(tokio::spawn(async move {
+                                    jellyfin_catalog(&config).await
+                                }));
+                                explore_notice = None;
                             }
                         }
                         KeyCode::Tab => download_focus = !download_focus,

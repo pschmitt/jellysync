@@ -23,7 +23,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 use ratatui_image::{
     Resize, StatefulImage,
@@ -348,6 +351,9 @@ type MediaSummary = Vec<(String, String)>;
 /// File name plus the ffprobe summary once it has finished.
 type FileInfo = (String, Option<std::result::Result<MediaSummary, String>>);
 type FileInfoTask = tokio::task::JoinHandle<Result<MediaSummary>>;
+/// Jellyfin rows, overview and (optional) still image for the file info popup.
+type FileMeta = (MediaSummary, String, Option<StatefulProtocol>);
+type FileMetaTask = tokio::task::JoinHandle<Result<FileMeta>>;
 type PreviewEpisodeTask = tokio::task::JoinHandle<(String, Result<Vec<MediaItem>>)>;
 type JobPosterCatalogTask =
     tokio::task::JoinHandle<Result<(JellyfinApi, Vec<(String, MediaItem)>)>>;
@@ -1800,6 +1806,9 @@ async fn tui(config: Config) -> Result<()> {
         let mut show_job_config = false;
         let mut file_info: Option<FileInfo> = None;
         let mut file_info_task: Option<FileInfoTask> = None;
+        let mut file_meta: Option<FileMeta> = None;
+        let mut file_meta_task: Option<FileMetaTask> = None;
+        let mut jellyfin_api: Option<JellyfinApi> = None;
         let mut explore: Option<ExploreState> = None;
         let mut explore_notice: Option<(String, bool)> = None;
         let mut explore_task: Option<tokio::task::JoinHandle<Result<usize>>> = None;
@@ -1853,6 +1862,15 @@ async fn tui(config: Config) -> Result<()> {
                     }
                 }
                 dashboard_refreshed_at = Instant::now();
+            }
+            if file_meta_task.as_ref().is_some_and(|task| task.is_finished()) {
+                let task = file_meta_task.take().expect("finished file meta task exists");
+                // Metadata is best effort; the ffprobe summary still shows without it.
+                if let Ok(Ok(meta)) = task.await
+                    && file_info.is_some()
+                {
+                    file_meta = Some(meta);
+                }
             }
             if file_info_task.as_ref().is_some_and(|task| task.is_finished()) {
                 let task = file_info_task.take().expect("finished file info task exists");
@@ -2007,6 +2025,7 @@ async fn tui(config: Config) -> Result<()> {
                     .take()
                     .expect("finished job poster catalog task exists");
                 if let Ok(Ok((api, posters))) = task.await {
+                    jellyfin_api = Some(api.clone());
                     for (job_name, item) in posters {
                         if job_poster_protocols.contains_key(&job_name)
                             || job_poster_tasks.contains_key(&job_name)
@@ -2534,6 +2553,26 @@ async fn tui(config: Config) -> Result<()> {
                     }
                 }
                 frame.render_stateful_widget(download_list, downloads_area, &mut downloads_state);
+                // Each file row is 3 lines tall.
+                let visible_files = usize::from(downloads_area.height.saturating_sub(2)) / 3;
+                if downloads.len() > visible_files {
+                    let mut scrollbar_state = ScrollbarState::new(
+                        downloads.len().saturating_sub(visible_files),
+                    )
+                    .position(downloads_state.offset());
+                    frame.render_stateful_widget(
+                        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                            .begin_symbol(None)
+                            .end_symbol(None),
+                        Rect {
+                            x: downloads_area.x,
+                            y: downloads_area.y + 1,
+                            width: downloads_area.width,
+                            height: downloads_area.height.saturating_sub(2),
+                        },
+                        &mut scrollbar_state,
+                    );
+                }
 
                 if show_job_config {
                     let popup = centered_rect(76, 72, area);
@@ -2573,30 +2612,90 @@ async fn tui(config: Config) -> Result<()> {
                     );
                 }
                 if let Some((name, info)) = &file_info {
-                    let popup = centered_rect(96, 14, area);
-                    let value_width = usize::from(popup.width.saturating_sub(16));
-                    let lines = match info {
-                        None => vec![Line::from(Span::styled(
-                            "Probing…",
-                            Style::default().fg(Color::Gray),
-                        ))],
-                        Some(Ok(rows)) => rows
-                            .iter()
-                            .map(|(label, value)| config_line(label, truncate(value, value_width)))
-                            .collect(),
-                        Some(Err(error)) => vec![Line::from(Span::styled(
-                            error.clone(),
-                            Style::default().fg(Color::Red),
-                        ))],
+                    let (meta_rows, overview, still) = match file_meta.as_mut() {
+                        Some((rows, overview, still)) => (rows.as_slice(), overview.as_str(), still.as_mut()),
+                        None => (&[][..], "", None),
                     };
-                    let title = truncate_near_end(name, usize::from(popup.width.saturating_sub(20)));
+                    let probe_rows: &[(String, String)] = match info {
+                        Some(Ok(rows)) => rows,
+                        _ => &[],
+                    };
+                    let row_count = (meta_rows.len() + probe_rows.len()).max(1) as u16;
+                    // Overview lines after wrapping (capped), plus one blank separator line.
+                    let text_width = usize::from(area.width.saturating_sub(4).min(108)).max(1);
+                    let overview_height = if overview.is_empty() {
+                        0
+                    } else {
+                        (overview.chars().count().div_ceil(text_width) as u16).min(6) + 1
+                    };
+                    let height = (row_count.max(if still.is_some() { 9 } else { 0 })
+                        + overview_height
+                        + 2)
+                    .min(area.height.saturating_sub(2));
+                    let popup = centered_rect(110, height, area);
+                    let inner = Rect {
+                        x: popup.x + 1,
+                        y: popup.y + 1,
+                        width: popup.width.saturating_sub(2),
+                        height: popup.height.saturating_sub(2),
+                    };
+                    let title = truncate_near_end(name, usize::from(popup.width.saturating_sub(24)));
                     frame.render_widget(Clear, popup);
                     frame.render_widget(
-                        Paragraph::new(lines)
-                            .block(panel_block(&format!("{title} · p play · i / Esc close"), true))
-                            .style(Style::default().fg(Color::White)),
+                        panel_block(&format!("{title} · p play · i / Esc close"), true),
                         popup,
                     );
+                    // A 16:9 still at 9 rows is ~32 cells wide with 1:2 cells.
+                    let still_width = if still.is_some() && inner.width >= 80 { 33 } else { 0 };
+                    let rows_area = Rect {
+                        x: inner.x + still_width,
+                        y: inner.y,
+                        width: inner.width.saturating_sub(still_width),
+                        height: inner.height.saturating_sub(overview_height),
+                    };
+                    if let Some(still) = still
+                        && still_width > 0
+                    {
+                        frame.render_stateful_widget(
+                            StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle))),
+                            Rect { x: inner.x, y: inner.y, width: still_width - 1, height: rows_area.height.min(9) },
+                            still,
+                        );
+                    }
+                    let value_width = usize::from(rows_area.width.saturating_sub(14));
+                    let mut lines: Vec<Line> = meta_rows
+                        .iter()
+                        .chain(probe_rows)
+                        .map(|(label, value)| config_line(label, truncate(value, value_width)))
+                        .collect();
+                    match info {
+                        None => lines.push(Line::from(Span::styled(
+                            "Probing…",
+                            Style::default().fg(Color::Gray),
+                        ))),
+                        Some(Err(error)) => lines.push(Line::from(Span::styled(
+                            error.clone(),
+                            Style::default().fg(Color::Red),
+                        ))),
+                        Some(Ok(_)) => {}
+                    }
+                    frame.render_widget(
+                        Paragraph::new(lines).style(Style::default().fg(Color::White)),
+                        rows_area,
+                    );
+                    if overview_height > 0 {
+                        frame.render_widget(
+                            Paragraph::new(overview.to_string())
+                                .wrap(Wrap { trim: true })
+                                .style(Style::default().fg(Color::Gray)),
+                            Rect {
+                                x: inner.x,
+                                y: inner.y + inner.height.saturating_sub(overview_height) + 1,
+                                width: inner.width,
+                                height: overview_height - 1,
+                            },
+                        );
+                    }
                 }
 
                 let footer_lines = if confirm_clear.is_some() {
@@ -3167,7 +3266,11 @@ async fn tui(config: Config) -> Result<()> {
                     if let Some(task) = file_info_task.take() {
                         task.abort();
                     }
+                    if let Some(task) = file_meta_task.take() {
+                        task.abort();
+                    }
                     file_info = None;
+                    file_meta = None;
                 } else if show_job_config && key.code == KeyCode::Esc {
                     show_job_config = false;
                 } else if show_job_config && key.code == KeyCode::Char('q') {
@@ -3374,6 +3477,19 @@ async fn tui(config: Config) -> Result<()> {
                                     None,
                                 ));
                                 file_info_task = Some(tokio::spawn(probe_media(path)));
+                                file_meta = None;
+                                if let Some(task) = file_meta_task.take() {
+                                    task.abort();
+                                }
+                                if online != Some(Some(false))
+                                    && let Some(api) = jellyfin_api.clone()
+                                {
+                                    file_meta_task = Some(tokio::spawn(jellyfin_file_meta(
+                                        api,
+                                        entry.item_id.clone(),
+                                        picker.clone(),
+                                    )));
+                                }
                             }
                         }
                         KeyCode::Char('i') if !jobs.is_empty() => {
@@ -3607,6 +3723,80 @@ fn optional_bool_display(value: Option<bool>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "—".into())
+}
+
+async fn jellyfin_file_meta(api: JellyfinApi, item_id: String, picker: Picker) -> Result<FileMeta> {
+    let item: serde_json::Value = api
+        .client
+        .get(format!(
+            "{}/Users/{}/Items/{}",
+            api.base, api.user_id, item_id
+        ))
+        .header("Authorization", jellyfin_authorization(&api.token))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .context("query Jellyfin item")?
+        .error_for_status()
+        .context("Jellyfin item query failed")?
+        .json()
+        .await
+        .context("parse Jellyfin item")?;
+    let text = |key: &str| item.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    let number = |key: &str| item.get(key).and_then(|v| v.as_f64());
+    let mut rows = Vec::new();
+    let mut title = Vec::new();
+    if let Some(series) = text("SeriesName") {
+        title.push(series);
+    }
+    if let (Some(season), Some(episode)) = (number("ParentIndexNumber"), number("IndexNumber")) {
+        title.push(format!("S{:02}E{:02}", season as u32, episode as u32));
+    }
+    if let Some(name) = text("Name") {
+        title.push(name);
+    }
+    if !title.is_empty() {
+        rows.push(("Title".to_string(), title.join(" · ")));
+    }
+    if let Some(date) = text("PremiereDate") {
+        rows.push(("Aired".to_string(), date.chars().take(10).collect()));
+    }
+    let mut rating = Vec::new();
+    if let Some(score) = number("CommunityRating") {
+        rating.push(format!("★ {score:.1}"));
+    }
+    if let Some(official) = text("OfficialRating") {
+        rating.push(official);
+    }
+    if !rating.is_empty() {
+        rows.push(("Rating".to_string(), rating.join("  ")));
+    }
+    if let Some(ticks) = number("RunTimeTicks") {
+        rows.push((
+            "Runtime".to_string(),
+            format!("{} min", (ticks / 600_000_000.0).round()),
+        ));
+    }
+    if let Some(played) = item
+        .get("UserData")
+        .and_then(|data| data.get("Played"))
+        .and_then(|v| v.as_bool())
+    {
+        rows.push((
+            "Watched".to_string(),
+            if played { "yes" } else { "no" }.to_string(),
+        ));
+    }
+    let overview = text("Overview").unwrap_or_default();
+    let still = match serde_json::from_value::<MediaItem>(item) {
+        Ok(media) => fetch_poster_protocol(api, media, picker, None)
+            .await
+            .ok()
+            .flatten()
+            .map(|(_, protocol)| protocol),
+        Err(_) => None,
+    };
+    Ok((rows, overview, still))
 }
 
 async fn probe_media(path: PathBuf) -> Result<MediaSummary> {

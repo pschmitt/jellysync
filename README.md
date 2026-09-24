@@ -162,13 +162,13 @@ jellysync config              # Print the parsed config
 ```
 
 The TUI keeps ad-hoc library downloads running when Explore is closed. Select a
-file and press `p` (or double-click it) to launch the
-configured player (default: `mpv`); set `player` in the YAML or Home Manager
-settings to change it. `Ctrl-C` closes Explore, and pressing it twice in the
-main view quits the TUI. Press `x` on an ad-hoc job in the Jobs list to delete
-its tracked files and remove it from the list. Press `o` to open the selected
-show's or movie's download directory with `file_manager` (default: `xdg-open`,
-falling back to `gio open`).
+file and press `p` (or double-click it) to launch the configured player
+(default: `mpv`); set `player` in the YAML or Home Manager settings to change
+it. `Ctrl-C` closes Explore, and pressing it twice in the main view quits the
+TUI. Press `x` on an ad-hoc job in the Jobs list to delete its tracked files and
+remove it from the list. Press `o` to open the selected show's or movie's
+download directory (or, with a file focused, its folder) with `file_manager`
+(default: `xdg-open`, falling back to `gio open`).
 
 The TUI works offline. It pings Jellyfin (`/System/Ping`) in the background and
 shows `ONLINE`/`OFFLINE` in the header; while offline, local files, playback,

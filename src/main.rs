@@ -1818,6 +1818,7 @@ async fn tui(config: Config) -> Result<()> {
         let mut ping_task: Option<tokio::task::JoinHandle<bool>> = None;
         let mut pinged_at: Option<Instant> = None;
         let mut reconciled = false;
+        let mut indexed: Option<usize> = None;
         let mut reconcile_task: Option<tokio::task::JoinHandle<Result<usize>>> = None;
         let mut catalog_task: Option<CatalogTask> = None;
         let mut library_cache: Option<(JellyfinApi, Vec<MediaItem>)> = None;
@@ -1930,12 +1931,16 @@ async fn tui(config: Config) -> Result<()> {
                 let task = reconcile_task.take().expect("finished reconcile task exists");
                 let result = task.await;
                 reconciled = matches!(result, Ok(Ok(_)));
-                sync_notice = Some(match result {
-                    Ok(Ok(0)) => ("Finished scanning existing media".into(), true),
-                    Ok(Ok(count)) => (format!("Indexed {count} existing media files"), true),
-                    Ok(Err(error)) => (format!("Could not reconcile existing files: {error:#}"), false),
-                    Err(error) => (format!("Reconciliation stopped: {error}"), false),
-                });
+                // Success is shown in the header; only failures need the footer.
+                match result {
+                    Ok(Ok(count)) => indexed = Some(count),
+                    Ok(Err(error)) => {
+                        sync_notice = Some((format!("Could not index existing files: {error:#}"), false));
+                    }
+                    Err(error) => {
+                        sync_notice = Some((format!("Indexing stopped: {error}"), false));
+                    }
+                }
             }
             if preview_episode_task
                 .as_ref()
@@ -2469,7 +2474,10 @@ async fn tui(config: Config) -> Result<()> {
                         })
                         .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        if online.is_some() { "  ·  " } else { "" },
+                        Style::default().fg(Color::DarkGray),
+                    ),
                     match online {
                         None => Span::raw(""),
                         Some(None) => Span::styled("CHECKING", state_style("stopped")),
@@ -2481,6 +2489,13 @@ async fn tui(config: Config) -> Result<()> {
                             "OFFLINE",
                             state_style("failed").add_modifier(Modifier::BOLD),
                         ),
+                    },
+                    if reconcile_task.is_some() {
+                        Span::styled("  ·  indexing…", Style::default().fg(Color::Gray))
+                    } else if let Some(count) = indexed.filter(|count| *count > 0) {
+                        Span::styled(format!("  ·  {count} indexed"), Style::default().fg(Color::Gray))
+                    } else {
+                        Span::raw("")
                     },
                     Span::styled("  ·  timer ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
@@ -3027,7 +3042,7 @@ async fn tui(config: Config) -> Result<()> {
                         Line::from("  b                 browse the Jellyfin library"),
                         Line::from("  i / Enter         job configuration / file media info"),
                         Line::from("  p / double-click  play selected file"),
-                        Line::from("  o                 open the show/movie download directory"),
+                        Line::from("  o                 open the file's or show's directory"),
                         Line::from("  x / X / c         clear file / season / show (x on ad-hoc job removes it)"),
                         Line::from("  Ctrl-C, Ctrl-C    quit the TUI"),
                         Line::from(""),
@@ -3642,8 +3657,15 @@ async fn tui(config: Config) -> Result<()> {
                         }
                         KeyCode::Char('o') if !jobs.is_empty() => {
                             let job_name = &jobs[selected].name;
+                            // With a file focused, open the directory containing it.
+                            let file_dir = download_focus
+                                .then(|| downloads.get(selected_download))
+                                .flatten()
+                                .and_then(|entry| entry.path.parent().map(Path::to_path_buf))
+                                .filter(|dir| dir.is_dir());
                             sync_notice = Some(
-                                match job_directory(&config, job_name)
+                                match file_dir
+                                    .map_or_else(|| job_directory(&config, job_name), Ok)
                                     .and_then(|path| Ok((open_directory(&config, &path)?, path)))
                                 {
                                     Ok((command, path)) => (

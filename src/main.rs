@@ -88,6 +88,9 @@ struct Config {
     parallelism: usize,
     #[serde(default = "default_player")]
     player: String,
+    /// Command used to open download directories; xdg-open or gio open when unset.
+    #[serde(default)]
+    file_manager: Option<String>,
     #[serde(default)]
     rsync: Rsync,
     #[serde(default)]
@@ -2202,7 +2205,7 @@ async fn tui(config: Config) -> Result<()> {
                             Span::raw(POSTER_INDENT),
                             Span::styled(format!("  {}", state.to_uppercase()), state_style(state)),
                             Span::styled(
-                                format!("  ·  {}", format_bytes(total_size)),
+                                format!("  {}", format_bytes(total_size)),
                                 Style::default().fg(Color::Gray),
                             ),
                             Span::styled(
@@ -2295,7 +2298,7 @@ async fn tui(config: Config) -> Result<()> {
                     let subtitle_line = if completed {
                         Line::from(vec![
                             Span::styled("  ✓ downloaded", Style::default().fg(Color::Green)),
-                            Span::styled(format!("  ·  {size}"), Style::default().fg(Color::Gray)),
+                            Span::styled(format!("  {size}"), Style::default().fg(Color::Gray)),
                         ])
                     } else {
                         Line::from(vec![
@@ -2380,7 +2383,7 @@ async fn tui(config: Config) -> Result<()> {
 
                 let jobs_title = format!("Jobs · {}", jobs.len());
                 let downloads_title = format!(
-                    "Tracked downloads · {} · {}",
+                    "Files: {} ({})",
                     selected_job.map_or("no job selected", |job| job.name.as_str()),
                     downloads.len()
                 );
@@ -2804,6 +2807,7 @@ async fn tui(config: Config) -> Result<()> {
                         Line::from("  b                 browse the Jellyfin library"),
                         Line::from("  i                 show selected job configuration"),
                         Line::from("  p / Enter         play selected download (or double-click)"),
+                        Line::from("  o                 open the show/movie download directory"),
                         Line::from("  x / X / c         clear file / season / show (x on ad-hoc job removes it)"),
                         Line::from("  Ctrl-C, Ctrl-C    quit the TUI"),
                         Line::from(""),
@@ -3350,6 +3354,22 @@ async fn tui(config: Config) -> Result<()> {
                                 };
                             }
                         }
+                        KeyCode::Char('o') if !jobs.is_empty() => {
+                            let job_name = &jobs[selected].name;
+                            sync_notice = Some(
+                                match job_directory(&config, job_name)
+                                    .and_then(|path| Ok((open_directory(&config, &path)?, path)))
+                                {
+                                    Ok((command, path)) => (
+                                        format!("Opened {} with {command}", path.display()),
+                                        true,
+                                    ),
+                                    Err(error) => {
+                                        (format!("Could not open directory: {error:#}"), false)
+                                    }
+                                },
+                            );
+                        }
                         KeyCode::Char('X') if download_focus && !downloads.is_empty() => {
                             confirm_clear = Some(ClearScope::Season)
                         }
@@ -3466,7 +3486,7 @@ fn key_sep() -> Span<'static> {
 
 fn download_progress(bytes: u64, total: Option<u64>, width: usize) -> (String, String) {
     let Some(total) = total.filter(|total| *total > 0) else {
-        return ("·".repeat(width), "  ?".into());
+        return ("─".repeat(width), "   ?".into());
     };
     let percent = ((bytes as f64 / total as f64) * 100.0).clamp(0.0, 100.0);
     let filled = ((percent / 100.0) * width as f64).round() as usize;
@@ -3503,6 +3523,53 @@ fn play_download(config: &Config, entry: &DownloadEntry) -> Result<()> {
         .spawn()
         .with_context(|| format!("start player '{}'", config.player))?;
     Ok(())
+}
+
+fn job_directory(config: &Config, job_name: &str) -> Result<PathBuf> {
+    if let Some(title) = job_name.strip_prefix("library:") {
+        let root = PathBuf::from(&config.local.root);
+        return ["TV Shows", "Movies"]
+            .iter()
+            .map(|kind| root.join(kind).join(safe_component(title)))
+            .find(|path| path.is_dir())
+            .with_context(|| format!("no download directory for {title}"));
+    }
+    let job = config
+        .jobs
+        .iter()
+        .find(|job| job.name == job_name)
+        .with_context(|| format!("unknown job {job_name}"))?;
+    let path = PathBuf::from(expand_home(&resolved_path(config, job, false)?));
+    if !path.is_dir() {
+        bail!("{} does not exist yet", path.display());
+    }
+    Ok(path)
+}
+
+fn in_path(program: &str) -> bool {
+    env::var_os("PATH")
+        .is_some_and(|paths| env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+}
+
+fn open_directory(config: &Config, path: &Path) -> Result<String> {
+    let command: Vec<String> = match config.file_manager.as_deref().map(str::trim) {
+        Some(command) if !command.is_empty() => {
+            command.split_whitespace().map(String::from).collect()
+        }
+        _ if in_path("xdg-open") => vec!["xdg-open".into()],
+        _ if in_path("gio") => vec!["gio".into(), "open".into()],
+        _ => bail!("neither xdg-open nor gio found; set file_manager in jellysync settings"),
+    };
+    let label = command.join(" ");
+    std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("start file manager '{label}'"))?;
+    Ok(label)
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {

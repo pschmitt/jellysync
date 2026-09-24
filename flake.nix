@@ -51,6 +51,9 @@
               }
               // lib.optionalAttrs (cfg.settings.jellyfin != null) {
                 inherit (cfg.settings) jellyfin;
+              }
+              // lib.optionalAttrs (cfg.settings.file_manager != null) {
+                inherit (cfg.settings) file_manager;
               };
               libConfig = lib.optionalAttrs (cfg.settings.library != null) {
                 inherit (cfg.settings) library;
@@ -108,6 +111,13 @@
                 default = "mpv";
                 description = "Command used by the TUI to play selected downloads.";
                 example = "mpv";
+              };
+
+              file_manager = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Command used by the TUI to open download directories. Defaults to xdg-open, falling back to gio open.";
+                example = "nautilus";
               };
 
               remote = lib.mkOption {

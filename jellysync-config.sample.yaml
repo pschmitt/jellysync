@@ -60,6 +60,10 @@ parallelism: 2
 # Command used by the TUI's `p` action for selected downloads.
 player: mpv
 
+# Optional: command used by the TUI's `o` action to open download directories
+# (default: xdg-open, falling back to `gio open`).
+# file_manager: nautilus
+
 jobs:
   # Sync all of pluribus
   - name: pluribus

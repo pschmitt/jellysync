@@ -162,11 +162,13 @@ jellysync config              # Print the parsed config
 ```
 
 The TUI keeps ad-hoc library downloads running when Explore is closed. Select a
-tracked download and press `p` or `Enter` (or double-click it) to launch the
+file and press `p` or `Enter` (or double-click it) to launch the
 configured player (default: `mpv`); set `player` in the YAML or Home Manager
 settings to change it. `Ctrl-C` closes Explore, and pressing it twice in the
 main view quits the TUI. Press `x` on an ad-hoc job in the Jobs list to delete
-its tracked files and remove it from the list.
+its tracked files and remove it from the list. Press `o` to open the selected
+show's or movie's download directory with `file_manager` (default: `xdg-open`,
+falling back to `gio open`).
 
 In Explore, `Tab`, `→` or `Enter` moves focus from the library to the details
 pane of the selected show; there, `↑`/`↓` move through episodes, `Space`
@@ -226,6 +228,7 @@ download:
 
 parallelism: 2 # Concurrent jobs; default is 2
 player: mpv # TUI player command; default is mpv
+file_manager: xdg-open # TUI `o` command; default is xdg-open, then gio open
 
 jobs:
   # Sync all of pluribus
@@ -576,7 +579,7 @@ jellysync --config /path/to/config.yaml config
 - `sync [JOB...]`: Sync all jobs or selected jobs
 - `status`: Show latest job state and systemd timer state
 - `prune [--apply] [JOB...]`: Preview deletions, or apply them
-- `tui`: Select a job to see its tracked downloads; `s` syncs that job, `S` syncs all jobs, and `e` opens Jellyfin Explore. Explore searches the library, renders posters with `ratatui-image` (including Kitty graphics protocol support), opens series to select episodes (`Space`/`a`), and downloads movies or selected episodes with `d`. In the main view, `x` (file), `X` (season), `c` (show), then `y` clears media. Mouse clicks and scrolling select rows.
+- `tui`: Select a job to see its files; `s` syncs that job, `S` syncs all jobs, `b` opens Jellyfin Explore, and `o` opens the job's download directory. Explore searches the library, renders posters with `ratatui-image` (including Kitty graphics protocol support), shows a series' episodes in the details pane (`Tab` to focus, `Space`/`a` to select), and downloads movies or selected episodes with `d`. In the main view, `x` (file), `X` (season), `c` (show), then `y` clears media; `x` on an ad-hoc job removes it. `p`, `Enter` or a double-click plays a file. Mouse clicks and scrolling select rows.
 - `-h, --help`: Show help message
 - `--version`: Show version
 

@@ -57,6 +57,9 @@ download:
 # Optional: number of concurrent jobs (default: 2)
 parallelism: 2
 
+# Command used by the TUI's `p` action for selected downloads.
+player: mpv
+
 jobs:
   # Sync all of pluribus
   - name: pluribus

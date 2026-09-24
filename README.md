@@ -161,6 +161,18 @@ jellysync stop                # Stop the user systemd service
 jellysync config              # Print the parsed config
 ```
 
+The TUI keeps ad-hoc library downloads running when Explore is closed. Select a
+tracked download and press `p` or `Enter` (or double-click it) to launch the
+configured player (default: `mpv`); set `player` in the YAML or Home Manager
+settings to change it. `Ctrl-C` closes Explore, and pressing it twice in the
+main view quits the TUI. Press `x` on an ad-hoc job in the Jobs list to delete
+its tracked files and remove it from the list.
+
+In Explore, `Tab`, `→` or `Enter` moves focus from the library to the details
+pane of the selected show; there, `↑`/`↓` move through episodes, `Space`
+selects one, `a` selects all, and `d` downloads the selection. `Tab`, `←` or
+`Esc` returns to the library.
+
 Use `--config FILE` to select a config and `--parallelism N` to override the worker limit for a sync. Legacy positional invocation (`jellysync JOB...`) remains an alias for `jellysync sync JOB...`.
 
 ### Manual Installation
@@ -213,6 +225,7 @@ download:
   mode: jellyfin # jellyfin (HTTP, default) or rsync (SSH)
 
 parallelism: 2 # Concurrent jobs; default is 2
+player: mpv # TUI player command; default is mpv
 
 jobs:
   # Sync all of pluribus

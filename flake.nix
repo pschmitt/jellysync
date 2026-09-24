@@ -47,7 +47,7 @@
           configFile =
             let
               baseConfig = {
-                inherit (cfg.settings) remote local;
+                inherit (cfg.settings) remote local player;
               }
               // lib.optionalAttrs (cfg.settings.jellyfin != null) {
                 inherit (cfg.settings) jellyfin;
@@ -101,6 +101,13 @@
                 type = lib.types.ints.positive;
                 default = 2;
                 description = "Maximum number of jobs downloaded concurrently.";
+              };
+
+              player = lib.mkOption {
+                type = lib.types.str;
+                default = "mpv";
+                description = "Command used by the TUI to play selected downloads.";
+                example = "mpv";
               };
 
               remote = lib.mkOption {

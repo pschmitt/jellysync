@@ -9,8 +9,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::style::{Color as TerminalColor, Stylize};
 use crossterm::{
-    event::{self, Event, KeyCode, MouseButton, MouseEventKind},
+    event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -52,6 +53,8 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long, global = true)]
     parallelism: Option<usize>,
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Option<Commands>,
     /// Legacy form: jellysync [JOB ...] is treated as jellysync sync [JOB ...].
@@ -83,6 +86,8 @@ struct Config {
     download: Download,
     #[serde(default = "default_parallelism")]
     parallelism: usize,
+    #[serde(default = "default_player")]
+    player: String,
     #[serde(default)]
     rsync: Rsync,
     #[serde(default)]
@@ -167,6 +172,9 @@ impl Default for Rsync {
 fn default_parallelism() -> usize {
     2
 }
+fn default_player() -> String {
+    "mpv".into()
+}
 fn default_port() -> u16 {
     22
 }
@@ -228,6 +236,10 @@ fn db() -> Result<Connection> {
 }
 fn update_job(name: &str, status: &str, message: &str) -> Result<()> {
     db()?.execute("INSERT INTO jobs(name,status,message,updated_at) VALUES(?1,?2,?3,datetime('now')) ON CONFLICT(name) DO UPDATE SET status=excluded.status,message=excluded.message,updated_at=excluded.updated_at", params![name, status, message])?;
+    Ok(())
+}
+fn forget_job(name: &str) -> Result<()> {
+    db()?.execute("DELETE FROM jobs WHERE name=?1", params![name])?;
     Ok(())
 }
 fn update_transfer(
@@ -329,6 +341,13 @@ struct MediaItem {
 type PosterFetch = Result<Option<(Vec<u8>, StatefulProtocol)>>;
 type PosterTask = tokio::task::JoinHandle<(String, PosterFetch)>;
 type CatalogTask = tokio::task::JoinHandle<Result<(JellyfinApi, Vec<MediaItem>)>>;
+type PreviewEpisodeTask = tokio::task::JoinHandle<(String, Result<Vec<MediaItem>>)>;
+type JobPosterCatalogTask =
+    tokio::task::JoinHandle<Result<(JellyfinApi, Vec<(String, MediaItem)>)>>;
+// Posters are 4 rows tall; at the usual 1:2 cell aspect a 2:3 poster is ~5.3
+// cells wide. The indent leaves one blank column between poster and text.
+const POSTER_WIDTH: u16 = 6;
+const POSTER_INDENT: &str = "       ";
 
 struct ExploreState {
     api: Option<JellyfinApi>,
@@ -338,12 +357,47 @@ struct ExploreState {
     episode_cursor: usize,
     selected_episodes: HashSet<usize>,
     search: String,
-    series_title: Option<String>,
+    type_filter: ExploreTypeFilter,
+    details_focus: bool,
     poster_id: Option<String>,
     poster_loading: bool,
     poster_loaded: bool,
+    preview_item_id: Option<String>,
+    preview_loading: bool,
     catalog_loading: bool,
-    episode_loading: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExploreTypeFilter {
+    All,
+    Shows,
+    Movies,
+}
+
+impl ExploreTypeFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Shows,
+            Self::Shows => Self::Movies,
+            Self::Movies => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Shows => "TV shows",
+            Self::Movies => "Movies",
+        }
+    }
+
+    fn matches(self, item_type: Option<&str>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Shows => item_type == Some("Series"),
+            Self::Movies => item_type == Some("Movie"),
+        }
+    }
 }
 
 impl ExploreState {
@@ -351,11 +405,12 @@ impl ExploreState {
         self.items
             .iter()
             .filter(|item| {
-                self.search.is_empty()
-                    || item
-                        .name
-                        .to_lowercase()
-                        .contains(&self.search.to_lowercase())
+                self.type_filter.matches(item.item_type.as_deref())
+                    && (self.search.is_empty()
+                        || item
+                            .name
+                            .to_lowercase()
+                            .contains(&self.search.to_lowercase()))
             })
             .collect()
     }
@@ -488,20 +543,101 @@ async fn jellyfin_catalog(config: &Config) -> Result<(JellyfinApi, Vec<MediaItem
     Ok((api, items))
 }
 
+async fn jellyfin_job_poster_catalog(
+    config: &Config,
+) -> Result<(JellyfinApi, Vec<(String, MediaItem)>)> {
+    let credentials = config
+        .jellyfin
+        .as_ref()
+        .context("job posters require Jellyfin credentials")?;
+    let api = jellyfin_login(credentials).await?;
+    let mut poster_jobs: Vec<(String, String)> = config
+        .jobs
+        .iter()
+        .map(|job| {
+            (
+                job.name.clone(),
+                job.jellyfin_name
+                    .as_deref()
+                    .unwrap_or(&job.name)
+                    .to_string(),
+            )
+        })
+        .collect();
+    let ad_hoc_jobs: Vec<String> = {
+        let conn = db()?;
+        let mut statement = conn.prepare(
+            "SELECT name FROM jobs WHERE name LIKE 'library:%'
+             UNION SELECT job FROM transfers WHERE job LIKE 'library:%'",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for job_name in ad_hoc_jobs {
+        if !poster_jobs.iter().any(|(name, _)| name == &job_name) {
+            poster_jobs.push((
+                job_name.clone(),
+                job_name.trim_start_matches("library:").to_string(),
+            ));
+        }
+    }
+
+    let mut posters = Vec::new();
+    for (job_name, name) in poster_jobs {
+        let Ok(items) = jellyfin_items(
+            &api,
+            &[
+                ("Recursive", "true"),
+                ("IncludeItemTypes", "Series,Movie"),
+                ("SearchTerm", &name),
+                ("Fields", "ProductionYear"),
+                ("Limit", "100"),
+            ],
+        )
+        .await
+        else {
+            continue;
+        };
+        if let Ok(Some(item)) = find_one(items, &name) {
+            posters.push((job_name, item));
+        }
+    }
+    Ok((api, posters))
+}
+
 async fn fetch_poster_protocol(
     api: JellyfinApi,
     item: MediaItem,
     picker: Picker,
     cached_data: Option<Vec<u8>>,
 ) -> Result<Option<(Vec<u8>, StatefulProtocol)>> {
-    tokio::time::sleep(Duration::from_millis(120)).await;
     let data = if let Some(data) = cached_data {
-        data
+        Some(data)
     } else {
-        let Some(data) = jellyfin_poster(&api, &item).await? else {
-            return Ok(None);
-        };
+        let mut data: Option<Vec<u8>> = None;
+        let mut last_error = None;
+        for attempt in 0..3 {
+            match jellyfin_poster(&api, &item).await {
+                Ok(result) => {
+                    data = result;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(250 * (attempt + 1))).await;
+                    }
+                }
+            }
+        }
+        if data.is_none() {
+            return Err(last_error.context("poster request failed")?);
+        }
         data
+    };
+    let Some(data) = data else {
+        return Ok(None);
     };
     let cached_data = data.clone();
     let protocol = tokio::task::spawn_blocking(move || poster_protocol(&picker, &data))
@@ -518,7 +654,9 @@ fn request_poster(
     image: &mut ThreadProtocol,
     image_task: &mut Option<PosterTask>,
 ) -> Result<()> {
-    if browser.poster_id.as_deref() == Some(item.id.as_str()) {
+    if browser.poster_id.as_deref() == Some(item.id.as_str())
+        && (browser.poster_loading || browser.poster_loaded)
+    {
         return Ok(());
     }
     let api = browser
@@ -569,6 +707,7 @@ async fn jellyfin_poster(api: &JellyfinApi, item: &MediaItem) -> Result<Option<V
             api.base, item.id
         ))
         .header("Authorization", jellyfin_authorization(&api.token))
+        .timeout(Duration::from_secs(10))
         .send()
         .await
         .context("request Jellyfin poster")?;
@@ -805,10 +944,11 @@ async fn jellyfin_job(
 ) -> Result<()> {
     let (api, movie_mode, items) = jellyfin_job_items(config, job).await?;
     if items.is_empty() {
-        let message = format!(
-            "No Jellyfin media matched '{}' or its filters",
-            job.jellyfin_name.as_deref().unwrap_or(&job.name)
-        );
+        let message = if job.unwatched == Some(true) {
+            "No new episodes (unwatched-only)".to_string()
+        } else {
+            "No media matched current filters".to_string()
+        };
         update_job(&job.name, "skipped", &message)?;
         if !quiet {
             eprintln!("{}", message);
@@ -1110,10 +1250,6 @@ async fn jellyfin_download_inner(
     Ok(())
 }
 
-async fn run_sync(config: Config, target: Vec<String>, parallelism: usize) -> Result<()> {
-    run_sync_mode(config, target, parallelism, false).await
-}
-
 async fn run_sync_mode(
     config: Config,
     target: Vec<String>,
@@ -1206,8 +1342,14 @@ async fn sync_job(config: Config, job: Job, slots: Arc<Semaphore>, quiet: bool) 
     }
     Ok(())
 }
-fn status() -> Result<()> {
+fn status(json_output: bool) -> Result<()> {
     let conn = db()?;
+    if json_output {
+        return status_json(&conn);
+    }
+    println!("\n{} {}", "◆".with(TerminalColor::Cyan), "Jellysync".bold());
+    println!("{}", "─".repeat(48).with(TerminalColor::DarkGrey));
+    println!("{}", "JOBS".with(TerminalColor::Magenta).bold());
     let mut statement =
         conn.prepare("SELECT name,status,message,updated_at FROM jobs ORDER BY name")?;
     let rows = statement.query_map([], |row| {
@@ -1218,13 +1360,42 @@ fn status() -> Result<()> {
             row.get::<_, String>(3)?,
         ))
     })?;
+    let mut job_count = 0;
     for row in rows {
         let (name, state, message, time) = row?;
+        job_count += 1;
+        let (icon, color) = match state.to_ascii_lowercase().as_str() {
+            "success" | "complete" | "completed" => ("●", TerminalColor::Green),
+            "running" | "downloading" | "queued" => ("◐", TerminalColor::Yellow),
+            "failed" | "error" | "skipped" => ("✕", TerminalColor::Red),
+            "interrupted" | "cleared" => ("◆", TerminalColor::Magenta),
+            _ => ("○", TerminalColor::DarkGrey),
+        };
         println!(
-            "{name}: {state} ({time}){}",
-            message.map(|m| format!(" — {m}")).unwrap_or_default()
+            "  {} {:<28} {} {}",
+            icon.with(color),
+            truncate(&name, 28).bold(),
+            state.to_uppercase().with(color),
+            if time.is_empty() {
+                String::new().dim()
+            } else {
+                time.dim()
+            }
         );
+        if let Some(message) = message.filter(|message| !message.is_empty()) {
+            println!(
+                "      {}",
+                truncate(&message, 88).with(TerminalColor::DarkGrey)
+            );
+        }
     }
+    if job_count == 0 {
+        println!("  {}", "No jobs have run yet".with(TerminalColor::DarkGrey));
+    }
+    println!(
+        "\n{}",
+        "ACTIVE DOWNLOADS".with(TerminalColor::Magenta).bold()
+    );
     let mut statement = conn.prepare("SELECT job,path,status,bytes,total FROM transfers WHERE status IN ('queued','downloading','interrupted') ORDER BY job,path")?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -1235,28 +1406,99 @@ fn status() -> Result<()> {
             row.get::<_, Option<u64>>(4)?,
         ))
     })?;
+    let mut download_count = 0;
     for row in rows {
         let (job, path, state, bytes, total) = row?;
+        download_count += 1;
+        let (bar, percent) = download_progress(bytes, total, 20);
+        let filename = Path::new(&path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let state_color = match state.as_str() {
+            "downloading" => TerminalColor::Cyan,
+            "queued" => TerminalColor::Yellow,
+            "interrupted" => TerminalColor::Red,
+            _ => TerminalColor::DarkGrey,
+        };
         println!(
-            "download {job}: {} — {state}, {bytes}/{} bytes",
-            Path::new(&path)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy(),
-            total
-                .map(|size| size.to_string())
-                .unwrap_or_else(|| "?".into())
+            "  {} {} {}",
+            "↳".with(state_color),
+            truncate(&filename, 42).bold(),
+            format!("({job})").with(TerminalColor::DarkGrey)
+        );
+        println!(
+            "    {} {}  {}",
+            bar.with(state_color),
+            percent.with(state_color),
+            state.to_uppercase().with(state_color)
+        );
+    }
+    if download_count == 0 {
+        println!(
+            "  {}",
+            "Nothing is downloading".with(TerminalColor::DarkGrey)
         );
     }
     if let Ok(output) = std::process::Command::new("systemctl")
         .args(["--user", "is-active", "jellysync.timer"])
         .output()
     {
-        println!("timer: {}", String::from_utf8_lossy(&output.stdout).trim());
+        let timer = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let color = if timer == "active" {
+            TerminalColor::Green
+        } else {
+            TerminalColor::DarkGrey
+        };
+        println!(
+            "\n{} {}",
+            "TIMER".with(TerminalColor::Magenta).bold(),
+            timer.with(color)
+        );
     }
     Ok(())
 }
-async fn prune(config: Config, target: Vec<String>, apply: bool) -> Result<()> {
+fn status_json(conn: &Connection) -> Result<()> {
+    let mut statement =
+        conn.prepare("SELECT name,status,message,updated_at FROM jobs ORDER BY name")?;
+    let jobs = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "name": row.get::<_, String>(0)?,
+                "status": row.get::<_, String>(1)?,
+                "message": row.get::<_, Option<String>>(2)?,
+                "updated_at": row.get::<_, String>(3)?,
+            }))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut statement = conn.prepare("SELECT job,path,status,bytes,total FROM transfers WHERE status IN ('queued','downloading','interrupted') ORDER BY job,path")?;
+    let downloads = statement
+        .query_map([], |row| {
+            Ok(json!({
+                "job": row.get::<_, String>(0)?,
+                "path": row.get::<_, String>(1)?,
+                "status": row.get::<_, String>(2)?,
+                "bytes": row.get::<_, u64>(3)?,
+                "total": row.get::<_, Option<u64>>(4)?,
+            }))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let timer = std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "jellysync.timer"])
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "jobs": jobs,
+            "downloads": downloads,
+            "timer": timer,
+        }))?
+    );
+    Ok(())
+}
+async fn prune(config: Config, target: Vec<String>, apply: bool, json_output: bool) -> Result<()> {
     let jobs = selected_jobs(&config, &target)?;
     if config.download.mode == "jellyfin" {
         for job in jobs {
@@ -1274,9 +1516,11 @@ async fn prune(config: Config, target: Vec<String>, apply: bool) -> Result<()> {
                 .collect();
             for entry in &stale {
                 if apply {
-                    println!("pruning {}", entry.path.display());
+                    if !json_output {
+                        println!("pruning {}", entry.path.display());
+                    }
                     clear_tracked(&config, entry, ClearScope::File)?;
-                } else {
+                } else if !json_output {
                     println!("would prune {}", entry.path.display());
                 }
             }
@@ -1310,6 +1554,9 @@ async fn prune(config: Config, target: Vec<String>, apply: bool) -> Result<()> {
             .arg(format!("ssh -p {}", config.remote.port))
             .arg(format!("{remote}/"))
             .arg(format!("{destination}/"));
+        if json_output {
+            command.arg("--quiet");
+        }
         let status = command.status().await.context("start rsync prune")?;
         if !status.success() {
             bail!("prune for '{}' failed with {status}", job.name);
@@ -1338,6 +1585,12 @@ struct DashboardSnapshot {
     history: BTreeMap<String, (String, String, String)>,
     downloads: Vec<DownloadEntry>,
     timer: String,
+}
+
+#[derive(Clone)]
+struct TuiJob {
+    name: String,
+    adhoc: bool,
 }
 
 fn dashboard_snapshot() -> Result<DashboardSnapshot> {
@@ -1403,6 +1656,7 @@ fn clear_tracked(config: &Config, selected: &DownloadEntry, scope: ClearScope) -
         })
         .collect();
     let conn = db()?;
+    let job_names: HashSet<_> = targets.iter().map(|entry| entry.job.clone()).collect();
     for entry in &targets {
         let partial = PathBuf::from(format!("{}.partial", entry.path.to_string_lossy()));
         for path in [&entry.path, &partial] {
@@ -1418,6 +1672,19 @@ fn clear_tracked(config: &Config, selected: &DownloadEntry, scope: ClearScope) -
             "UPDATE transfers SET status='cleared',updated_at=datetime('now') WHERE item_id=?1",
             params![entry.item_id],
         )?;
+    }
+    for job in job_names {
+        if !job.starts_with("library:") {
+            continue;
+        }
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM transfers WHERE job=?1 AND status != 'cleared'",
+            params![job],
+            |row| row.get(0),
+        )?;
+        if remaining == 0 {
+            conn.execute("DELETE FROM jobs WHERE name=?1", params![job])?;
+        }
     }
     Ok(targets.len())
 }
@@ -1485,17 +1752,34 @@ async fn tui(config: Config) -> Result<()> {
         let mut selected = 0usize;
         let mut selected_download = 0usize;
         let mut download_focus = false;
+        let mut main_split = 50u16;
+        let mut resizing_split = false;
         let mut confirm_clear = None;
+        let mut show_help = false;
+        let mut show_job_config = false;
         let mut explore: Option<ExploreState> = None;
         let mut explore_notice: Option<(String, bool)> = None;
         let mut explore_task: Option<tokio::task::JoinHandle<Result<usize>>> = None;
         let mut reconcile_task = Some(reconcile_task);
         let mut catalog_task: Option<CatalogTask> = None;
-        let mut episode_task: Option<tokio::task::JoinHandle<(String, Result<Vec<MediaItem>>) >> =
-            None;
+        let mut library_cache: Option<(JellyfinApi, Vec<MediaItem>)> = None;
+        let mut job_poster_catalog_task: Option<JobPosterCatalogTask> = config
+            .jellyfin
+            .as_ref()
+            .map(|_| {
+                let config = config.clone();
+                tokio::spawn(async move { jellyfin_job_poster_catalog(&config).await })
+            });
+        let mut job_poster_tasks = HashMap::<String, PosterTask>::new();
+        let mut job_poster_protocols = HashMap::<String, StatefulProtocol>::new();
+        let mut explore_poster_tasks = HashMap::<String, PosterTask>::new();
+        let mut explore_poster_protocols = HashMap::<String, StatefulProtocol>::new();
+        let mut preview_episode_task: Option<PreviewEpisodeTask> = None;
         let mut poster_task: Option<PosterTask> = None;
         let mut sync_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
         let mut sync_notice = None;
+        let mut last_ctrl_c: Option<Instant> = None;
+        let mut last_download_click: Option<(usize, Instant)> = None;
         let mut jobs_state = ListState::default();
         let mut downloads_state = ListState::default();
         let mut explore_state = ListState::default();
@@ -1508,6 +1792,7 @@ async fn tui(config: Config) -> Result<()> {
             Some(tokio::task::spawn_blocking(dashboard_snapshot));
         let mut dashboard_refreshed_at = Instant::now();
         loop {
+            terminal.autoresize()?;
             if dashboard_task
                 .as_ref()
                 .is_some_and(|task| task.is_finished())
@@ -1543,28 +1828,40 @@ async fn tui(config: Config) -> Result<()> {
                     Err(error) => (format!("Reconciliation stopped: {error}"), false),
                 });
             }
-            if episode_task.as_ref().is_some_and(|task| task.is_finished()) {
-                let task = episode_task.take().expect("finished episode task exists");
+            if preview_episode_task
+                .as_ref()
+                .is_some_and(|task| task.is_finished())
+            {
+                let task = preview_episode_task
+                    .take()
+                    .expect("finished preview episode task exists");
                 match task.await {
-                    Ok((series_title, Ok(episodes))) => {
+                    Ok((item_id, Ok(episodes))) => {
                         if let Some(browser) = explore.as_mut()
-                            && browser.series_title.as_deref() == Some(series_title.as_str())
+                            && browser.preview_item_id.as_deref() == Some(item_id.as_str())
                         {
                             browser.episodes = episodes;
-                            browser.episode_loading = false;
+                            browser.preview_loading = false;
                         }
                     }
-                    Ok((series_title, Err(error))) => {
+                    Ok((item_id, Err(error))) => {
                         if let Some(browser) = explore.as_mut()
-                            && browser.series_title.as_deref() == Some(series_title.as_str())
+                            && browser.preview_item_id.as_deref() == Some(item_id.as_str())
                         {
-                            browser.episode_loading = false;
-                            explore_notice = Some((format!("Could not load episodes: {error:#}"), false));
+                            browser.preview_loading = false;
+                            explore_notice = Some((
+                                format!("Could not load show contents: {error:#}"),
+                                false,
+                            ));
                         }
                     }
-                    Err(error) => {
-                        explore_notice = Some((format!("Episode request stopped: {error}"), false));
+                    Err(error) if !error.is_cancelled() => {
+                        explore_notice = Some((
+                            format!("Show contents request stopped: {error}"),
+                            false,
+                        ));
                     }
+                    Err(_) => {}
                 }
             }
             while let Ok(result) = resize_response_rx.try_recv() {
@@ -1581,6 +1878,7 @@ async fn tui(config: Config) -> Result<()> {
                 let task = catalog_task.take().expect("finished catalog task exists");
                 match task.await {
                     Ok(Ok((api, items))) => {
+                        library_cache = Some((api.clone(), items.clone()));
                         if let Some(browser) = explore.as_mut() {
                             browser.api = Some(api);
                             browser.items = items;
@@ -1610,6 +1908,75 @@ async fn tui(config: Config) -> Result<()> {
                     }
                 }
             }
+            if job_poster_catalog_task
+                .as_ref()
+                .is_some_and(|task| task.is_finished())
+            {
+                let task = job_poster_catalog_task
+                    .take()
+                    .expect("finished job poster catalog task exists");
+                if let Ok(Ok((api, posters))) = task.await {
+                    for (job_name, item) in posters {
+                        if job_poster_protocols.contains_key(&job_name)
+                            || job_poster_tasks.contains_key(&job_name)
+                        {
+                            continue;
+                        }
+                        let item_id = item.id.clone();
+                        let cached_data = poster_cache.get(&item_id).cloned();
+                        let picker = picker.clone();
+                        let api = api.clone();
+                        job_poster_tasks.insert(
+                            job_name,
+                            tokio::spawn(async move {
+                                let result =
+                                    fetch_poster_protocol(api, item, picker, cached_data).await;
+                                (item_id, result)
+                            }),
+                        );
+                    }
+                }
+            }
+            let finished_job_posters: Vec<_> = job_poster_tasks
+                .iter()
+                .filter_map(|(job_name, task)| task.is_finished().then_some(job_name.clone()))
+                .collect();
+            for job_name in finished_job_posters {
+                let task = job_poster_tasks
+                    .remove(&job_name)
+                    .expect("finished job poster task exists");
+                if let Ok((item_id, Ok(Some((data, protocol))))) = task.await {
+                    poster_cache.insert(item_id.clone(), data);
+                    poster_cache_order.retain(|id| id != &item_id);
+                    poster_cache_order.push_back(item_id.clone());
+                    while poster_cache_order.len() > 32 {
+                        if let Some(expired) = poster_cache_order.pop_front() {
+                            poster_cache.remove(&expired);
+                        }
+                    }
+                    job_poster_protocols.insert(job_name, protocol);
+                }
+            }
+            let finished_explore_posters: Vec<_> = explore_poster_tasks
+                .iter()
+                .filter_map(|(item_id, task)| task.is_finished().then_some(item_id.clone()))
+                .collect();
+            for item_id in finished_explore_posters {
+                let task = explore_poster_tasks
+                    .remove(&item_id)
+                    .expect("finished Explore poster task exists");
+                if let Ok((item_id, Ok(Some((data, protocol))))) = task.await {
+                    poster_cache.insert(item_id.clone(), data);
+                    poster_cache_order.retain(|id| id != &item_id);
+                    poster_cache_order.push_back(item_id.clone());
+                    while poster_cache_order.len() > 32 {
+                        if let Some(expired) = poster_cache_order.pop_front() {
+                            poster_cache.remove(&expired);
+                        }
+                    }
+                    explore_poster_protocols.insert(item_id, protocol);
+                }
+            }
             if poster_task.as_ref().is_some_and(|task| task.is_finished()) {
                 let task = poster_task.take().expect("finished poster task exists");
                 match task.await {
@@ -1634,24 +2001,109 @@ async fn tui(config: Config) -> Result<()> {
                                 Ok(None) => {
                                     poster_protocol.empty_protocol();
                                     browser.poster_loaded = false;
+                                    browser.poster_id = None;
                                 }
                                 Err(error) => {
                                     poster_protocol.empty_protocol();
                                     browser.poster_loaded = false;
+                                    browser.poster_id = None;
                                     explore_notice = Some((format!("Poster unavailable: {error:#}"), false));
                                 }
                             }
                         }
                     }
                     Err(error) if !error.is_cancelled() => {
+                        if let Some(browser) = explore.as_mut() {
+                            browser.poster_id = None;
+                            browser.poster_loading = false;
+                        }
                         explore_notice = Some((format!("Poster request stopped: {error}"), false));
                     }
                     Err(_) => {}
                 }
             }
+            if let Some(browser) = explore.as_ref()
+                && !browser.catalog_loading
+                && let Some(api) = browser.api.clone()
+            {
+                let mut items: Vec<_> = browser
+                    .filtered_items()
+                    .into_iter()
+                    .take(40)
+                    .cloned()
+                    .collect();
+                if let Some(item) = browser.filtered_items().get(browser.selected)
+                    && !items.iter().any(|candidate| candidate.id == item.id)
+                {
+                    items.push((*item).clone());
+                }
+                for item in items {
+                    if poster_cache.contains_key(&item.id)
+                        || explore_poster_protocols.contains_key(&item.id)
+                        || explore_poster_tasks.contains_key(&item.id)
+                        || browser.poster_id.as_deref() == Some(item.id.as_str())
+                    {
+                        continue;
+                    }
+                    let item_id = item.id.clone();
+                    let picker = picker.clone();
+                    let cached_data = poster_cache.get(&item_id).cloned();
+                    let api = api.clone();
+                    explore_poster_tasks.insert(
+                        item_id.clone(),
+                        tokio::spawn(async move {
+                            let result = fetch_poster_protocol(api, item, picker, cached_data).await;
+                            (item_id, result)
+                        }),
+                    );
+                }
+            }
+            let preview_item = explore.as_ref().and_then(|browser| {
+                if browser.catalog_loading {
+                    return None;
+                }
+                browser
+                    .filtered_items()
+                    .get(browser.selected)
+                    .cloned()
+                    .cloned()
+                    .zip(browser.api.clone())
+            });
+            if let Some((item, api)) = preview_item {
+                let should_refresh = explore
+                    .as_ref()
+                    .is_some_and(|browser| browser.preview_item_id.as_deref() != Some(item.id.as_str()));
+                if should_refresh {
+                    if let Some(task) = preview_episode_task.take() {
+                        task.abort();
+                    }
+                    if let Some(browser) = explore.as_mut() {
+                        browser.preview_item_id = Some(item.id.clone());
+                        browser.episodes.clear();
+                        browser.episode_cursor = 0;
+                        browser.selected_episodes.clear();
+                        browser.preview_loading = item.item_type.as_deref() == Some("Series");
+                    }
+                    if item.item_type.as_deref() == Some("Series") {
+                        let item_id = item.id.clone();
+                        preview_episode_task = Some(tokio::spawn(async move {
+                            let result = fetch_episodes(api, item).await;
+                            (item_id, result)
+                        }));
+                    }
+                }
+            }
             if explore_task.as_ref().is_some_and(|task| task.is_finished()) {
                 let task = explore_task.take().expect("finished Explore task exists");
-                explore_notice = Some(match task.await {
+                let result = task.await;
+                if let Some(task) = job_poster_catalog_task.take() {
+                    task.abort();
+                }
+                let config = config.clone();
+                job_poster_catalog_task = Some(tokio::spawn(async move {
+                    jellyfin_job_poster_catalog(&config).await
+                }));
+                explore_notice = Some(match result {
                     Ok(Ok(count)) => (format!("Queued {count} library download(s)"), true),
                     Ok(Err(error)) => (format!("Explore download failed: {error:#}"), false),
                     Err(error) => (format!("Explore download stopped: {error}"), false),
@@ -1666,7 +2118,34 @@ async fn tui(config: Config) -> Result<()> {
                 });
             }
             let history = &dashboard.history;
-            let jobs = &config.jobs;
+            let mut jobs: Vec<TuiJob> = config
+                .jobs
+                .iter()
+                .map(|job| TuiJob {
+                    name: job.name.clone(),
+                    adhoc: false,
+                })
+                .collect();
+            for name in history
+                .keys()
+                .filter(|name| name.starts_with("library:"))
+            {
+                if !jobs.iter().any(|job| job.name == *name) {
+                    jobs.push(TuiJob {
+                        name: name.clone(),
+                        adhoc: true,
+                    });
+                }
+            }
+            for entry in &dashboard.downloads {
+                if entry.job.starts_with("library:") && !jobs.iter().any(|job| job.name == entry.job)
+                {
+                    jobs.push(TuiJob {
+                        name: entry.job.clone(),
+                        adhoc: true,
+                    });
+                }
+            }
             if selected >= jobs.len() && !jobs.is_empty() {
                 selected = jobs.len() - 1;
             }
@@ -1674,10 +2153,7 @@ async fn tui(config: Config) -> Result<()> {
             let downloads: Vec<_> = dashboard
                 .downloads
                 .iter()
-                .filter(|entry| {
-                    entry.job.starts_with("library:")
-                        || selected_job.is_some_and(|job| entry.job == job.name)
-                })
+                .filter(|entry| selected_job.is_some_and(|job| entry.job == job.name))
                 .cloned()
                 .collect();
             if downloads.is_empty() {
@@ -1694,85 +2170,81 @@ async fn tui(config: Config) -> Result<()> {
                             (state.as_str(), message.as_str(), time.as_str())
                         })
                         .unwrap_or(("not run", "Waiting for first sync", ""));
+                    let (kind, kind_style) = if job.adhoc {
+                        ("LIBRARY", Style::default().fg(Color::Magenta))
+                    } else {
+                        ("JOB", Style::default().fg(Color::DarkGray))
+                    };
+                    let title_style = if job.adhoc {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    };
+                    let total_size = dashboard
+                        .downloads
+                        .iter()
+                        .filter(|entry| entry.job == job.name)
+                        .fold(0u64, |total, entry| {
+                            total.saturating_add(entry.total.unwrap_or(entry.bytes))
+                        });
                     ListItem::new(vec![
                         Line::from(vec![
-                            Span::styled("● ", state_style(state)),
-                            Span::styled(
-                                job.name.clone(),
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
+                            Span::raw(POSTER_INDENT),
+                            Span::styled(if job.adhoc { "↳ " } else { "● " }, state_style(state)),
+                            Span::styled(job.name.clone(), title_style),
+                            Span::styled(format!("  {kind}"), kind_style),
                         ]),
                         Line::from(vec![
+                            Span::raw(POSTER_INDENT),
                             Span::styled(format!("  {}", state.to_uppercase()), state_style(state)),
+                            Span::styled(
+                                format!("  ·  {}", format_bytes(total_size)),
+                                Style::default().fg(Color::Gray),
+                            ),
                             Span::styled(
                                 if time.is_empty() {
                                     String::new()
                                 } else {
                                     format!("  {time}")
                                 },
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                        ]),
-                        Line::from(Span::styled(
-                            format!("  {}", truncate(message, 64)),
-                            Style::default().fg(Color::Gray),
-                        )),
-                    ])
-                })
-                .collect();
-            let download_rows: Vec<ListItem> = downloads
-                .iter()
-                .map(|entry| {
-                    let filename = entry.path.file_name().unwrap_or_default().to_string_lossy();
-                    let (bar, percent) = download_progress(entry.bytes, entry.total, 18);
-                    let size = entry
-                        .total
-                        .map(|total| {
-                            format!("{} / {}", format_bytes(entry.bytes), format_bytes(total))
-                        })
-                        .unwrap_or_else(|| format!("{} downloaded", format_bytes(entry.bytes)));
-                    ListItem::new(vec![
-                        Line::from(vec![
-                            Span::styled("● ", state_style(&entry.status)),
-                            Span::styled(
-                                truncate(&filename, 48),
                                 Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::ITALIC),
                             ),
                         ]),
                         Line::from(vec![
+                            Span::raw(POSTER_INDENT),
                             Span::styled(
-                                format!("  {}  ·  {}", entry.job, entry.status),
-                                state_style(&entry.status),
-                            ),
-                            Span::styled(format!("  {size}"), Style::default().fg(Color::Gray)),
-                        ]),
-                        Line::from(vec![
-                            Span::styled("  ", Style::default()),
-                            Span::styled(bar, Style::default().fg(Color::Cyan)),
-                            Span::styled(
-                                format!(" {percent}"),
-                                Style::default().fg(Color::DarkGray),
+                                format!("  {}", truncate(message, 64)),
+                                message_style(state, message),
                             ),
                         ]),
+                        Line::from(Span::raw(POSTER_INDENT)),
                     ])
                 })
                 .collect();
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
-            let explore_popup = centered_rect(90, 88, area);
+            let explore_popup = centered_rect(100, 96, area);
             let [explore_list_area, explore_poster_area] = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(Rect {
                     x: explore_popup.x + 1,
                     y: explore_popup.y + 2,
                     width: explore_popup.width.saturating_sub(2),
                     height: explore_popup.height.saturating_sub(4),
                 });
+            let explore_contents_area = Rect {
+                x: explore_poster_area.x + 1,
+                y: explore_poster_area.y + 5,
+                width: explore_poster_area.width.saturating_sub(2),
+                height: explore_poster_area.height.saturating_sub(7),
+            };
             let [header, body, footer] = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -1782,9 +2254,12 @@ async fn tui(config: Config) -> Result<()> {
                 ])
                 .areas(area);
             let (jobs_area, downloads_area) = if area.width >= 100 {
-                let [downloads_area, jobs_area] = Layout::default()
+                let [jobs_area, downloads_area] = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+                    .constraints([
+                        Constraint::Percentage(main_split),
+                        Constraint::Percentage(100 - main_split),
+                    ])
                     .areas(body);
                 (jobs_area, downloads_area)
             } else {
@@ -1794,6 +2269,64 @@ async fn tui(config: Config) -> Result<()> {
                     .areas(body);
                 (jobs_area, downloads_area)
             };
+            // Borders, the "▌ " highlight symbol and the "● " bullet.
+            let download_text_width = usize::from(downloads_area.width.saturating_sub(6)).max(8);
+            // Leading indent plus the " 100%" suffix.
+            let download_bar_width = download_text_width.saturating_sub(7).clamp(8, 60);
+            let download_rows: Vec<ListItem> = downloads
+                .iter()
+                .map(|entry| {
+                    let filename = entry.path.file_name().unwrap_or_default().to_string_lossy();
+                    let (bar, percent) = download_progress(entry.bytes, entry.total, download_bar_width);
+                    let completed = matches!(
+                        entry.status.as_str(),
+                        "complete" | "completed" | "success"
+                    );
+                    let size = if completed {
+                        format_bytes(entry.bytes)
+                    } else {
+                        entry
+                            .total
+                            .map(|total| {
+                                format!("{} / {}", format_bytes(entry.bytes), format_bytes(total))
+                            })
+                            .unwrap_or_else(|| format!("{} downloaded", format_bytes(entry.bytes)))
+                    };
+                    let subtitle_line = if completed {
+                        Line::from(vec![
+                            Span::styled("  ✓ downloaded", Style::default().fg(Color::Green)),
+                            Span::styled(format!("  ·  {size}"), Style::default().fg(Color::Gray)),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::styled(format!("  {}", entry.status), state_style(&entry.status)),
+                            Span::styled(format!("  {size}"), Style::default().fg(Color::Gray)),
+                        ])
+                    };
+                    let progress_line = if completed {
+                        Line::from("")
+                    } else {
+                        Line::from(vec![
+                            Span::styled("  ", Style::default()),
+                            Span::styled(bar, Style::default().fg(Color::Cyan)),
+                            Span::styled(format!(" {percent}"), Style::default().fg(Color::DarkGray)),
+                        ])
+                    };
+                    ListItem::new(vec![
+                        Line::from(vec![
+                            Span::styled("● ", state_style(&entry.status)),
+                            Span::styled(
+                                truncate(&filename, download_text_width),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]),
+                        subtitle_line,
+                        progress_line,
+                    ])
+                })
+                .collect();
             terminal.draw(|frame| {
                 let sync_label = if sync_task.is_some() {
                     "SYNC RUNNING"
@@ -1880,7 +2413,67 @@ async fn tui(config: Config) -> Result<()> {
                     })
                     .highlight_symbol("▌ ");
                 frame.render_stateful_widget(job_list, jobs_area, &mut jobs_state);
+                if jobs_area.width >= 20 {
+                    let offset = jobs_state.offset();
+                    for (visible_index, job) in jobs.iter().skip(offset).enumerate() {
+                        let y = jobs_area.y + 1 + (visible_index as u16 * 4);
+                        if y + 4 > jobs_area.y + jobs_area.height.saturating_sub(1) {
+                            break;
+                        }
+                        if let Some(protocol) = job_poster_protocols.get_mut(&job.name) {
+                            frame.render_stateful_widget(
+                                StatefulImage::default()
+                                    .resize(Resize::Fit(Some(FilterType::Nearest))),
+                                Rect {
+                                    x: jobs_area.x + 3,
+                                    y,
+                                    width: POSTER_WIDTH,
+                                    height: 4,
+                                },
+                                protocol,
+                            );
+                        }
+                    }
+                }
                 frame.render_stateful_widget(download_list, downloads_area, &mut downloads_state);
+
+                if show_job_config {
+                    let popup = centered_rect(76, 72, area);
+                    let lines = if let Some(job) = jobs
+                        .get(selected)
+                        .and_then(|selected| config.jobs.iter().find(|job| job.name == selected.name))
+                    {
+                        vec![
+                            config_line("Name", job.name.clone()),
+                            config_line(
+                                "Jellyfin",
+                                job.jellyfin_name.clone().unwrap_or_else(|| job.name.clone()),
+                            ),
+                            config_line("Directory", job.directory.clone().unwrap_or_else(|| "—".into())),
+                            config_line("Remote dir", job.remote_dir.clone().unwrap_or_else(|| "—".into())),
+                            config_line("Local dir", job.local_dir.clone().unwrap_or_else(|| "—".into())),
+                            config_line("Seasons", yaml_value_display(job.seasons.as_ref())),
+                            config_line("Episodes", yaml_value_display(job.episodes.as_ref())),
+                            config_line("Wildcard", optional_bool_display(job.wildcard)),
+                            config_line("Unwatched", optional_bool_display(job.unwatched)),
+                        ]
+                    } else if let Some(job) = jobs.get(selected) {
+                        vec![
+                            config_line("Name", job.name.clone()),
+                            config_line("Type", "Ad-hoc library download"),
+                            config_line("Configured", "No static job configuration"),
+                        ]
+                    } else {
+                        vec![Line::from("No job selected")]
+                    };
+                    frame.render_widget(Clear, popup);
+                    frame.render_widget(
+                        Paragraph::new(lines)
+                            .block(panel_block("Job configuration · i / Esc close", true))
+                            .style(Style::default().fg(Color::White)),
+                        popup,
+                    );
+                }
 
                 let footer_lines = if confirm_clear.is_some() {
                     vec![Line::from(vec![
@@ -1898,25 +2491,23 @@ async fn tui(config: Config) -> Result<()> {
                     let mut shortcut_spans = Vec::new();
                     let shortcuts = if area.width < 110 {
                         vec![
-                            ("click", "select"),
                             ("Tab", "focus"),
                             ("s", "sync"),
-                            ("S", "all"),
-                            ("e", "explore"),
-                            ("x/X/c", "clear"),
+                            ("b", "browse"),
+                            ("p", "play"),
+                            ("i", "info"),
+                            ("?", "more"),
                             ("q", "quit"),
                         ]
                     } else {
                         vec![
-                            ("click", "select"),
                             ("Tab", "focus"),
-                            ("↑/↓", "select"),
-                            ("s", "sync job"),
-                            ("S", "sync all"),
-                            ("e", "explore library"),
-                            ("x", "clear file"),
-                            ("X", "clear season"),
-                            ("c", "clear show"),
+                            ("↑/↓", "move"),
+                            ("s", "sync"),
+                            ("b", "browse"),
+                            ("p", "play"),
+                            ("i", "config"),
+                            ("?", "more"),
                             ("q", "quit"),
                         ]
                     };
@@ -2005,43 +2596,6 @@ async fn tui(config: Config) -> Result<()> {
                                 .block(panel_block("Library", true)),
                             explore_list_area,
                         );
-                    } else if let Some(series_title) = &explore.series_title {
-                        if explore.episode_loading {
-                            frame.render_widget(
-                                Paragraph::new("Loading episodes…")
-                                    .style(Style::default().fg(Color::Gray))
-                                    .alignment(ratatui::layout::Alignment::Center)
-                                    .block(panel_block("Episodes", true)),
-                                explore_list_area,
-                            );
-                        } else {
-                        let rows: Vec<_> = explore
-                            .episodes
-                            .iter()
-                            .enumerate()
-                            .map(|(index, episode)| {
-                                let season = episode.parent_index_number.unwrap_or(0);
-                                let number = episode.index_number.unwrap_or(0);
-                                let mark = if explore.selected_episodes.contains(&index) { "✓ " } else { "  " };
-                                ListItem::new(format!("{mark}S{season:02}E{number:02}  {}", episode.name))
-                            })
-                            .collect();
-                        episode_state.select((!rows.is_empty()).then_some(explore.episode_cursor));
-                        frame.render_stateful_widget(
-                            List::new(rows)
-                                .block(panel_block(&format!("{series_title} · episodes"), true))
-                                .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
-                                .highlight_symbol("▌ "),
-                            explore_list_area,
-                            &mut episode_state,
-                        );
-                        let details = vec![
-                            Line::from(Span::styled(series_title.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
-                            Line::from(Span::styled(format!("{} episodes · {} selected", explore.episodes.len(), explore.selected_episodes.len()), Style::default().fg(Color::Gray))),
-                            Line::from(Span::styled("Space select · a select all · d download", Style::default().fg(Color::Cyan))),
-                        ];
-                        frame.render_widget(Paragraph::new(details).block(panel_block("Series", false)), explore_poster_area);
-                        }
                     } else {
                         let rows: Vec<_> = filtered
                             .iter()
@@ -2049,98 +2603,298 @@ async fn tui(config: Config) -> Result<()> {
                                 let kind = item.item_type.as_deref().unwrap_or("Media");
                                 let year = item.production_year.map(|year| format!(" · {year}")).unwrap_or_default();
                                 ListItem::new(vec![
-                                    Line::from(Span::styled(item.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
-                                    Line::from(Span::styled(format!("{kind}{year}"), Style::default().fg(Color::Gray))),
+                                    Line::from(vec![
+                                        Span::raw(POSTER_INDENT),
+                                        Span::styled(item.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                                    ]),
+                                    Line::from(vec![
+                                        Span::raw(POSTER_INDENT),
+                                        Span::styled(format!("{kind}{year}"), Style::default().fg(Color::Gray)),
+                                    ]),
+                                    Line::from(vec![
+                                        Span::raw(POSTER_INDENT),
+                                        Span::styled(
+                                            if item.item_type.as_deref() == Some("Series") { "Show contents · Enter open" } else { "Movie · d download" },
+                                            Style::default().fg(Color::Cyan),
+                                        ),
+                                    ]),
+                                    Line::from(""),
                                 ])
                             })
                             .collect();
                         explore_state.select((!rows.is_empty()).then_some(explore.selected.min(rows.len().saturating_sub(1))));
                         frame.render_stateful_widget(
                             List::new(rows)
-                                .block(panel_block(&format!("Library · {} · / search", filtered.len()), true))
+                                .block(panel_block(
+                                    &format!(
+                                        "Library · {} · {} · / search · f type",
+                                        filtered.len(),
+                                        explore.type_filter.label()
+                                    ),
+                                    !explore.details_focus,
+                                ))
                                 .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
                                 .highlight_symbol("▌ "),
                             explore_list_area,
                             &mut explore_state,
                         );
+                        for (visible_index, item) in filtered.iter().skip(explore_state.offset()).enumerate() {
+                            let y = explore_list_area.y + 1 + (visible_index as u16 * 4);
+                            if y + 4 > explore_list_area.y + explore_list_area.height.saturating_sub(1) {
+                                break;
+                            }
+                            if let Some(protocol) = explore_poster_protocols.get_mut(&item.id) {
+                                frame.render_stateful_widget(
+                                    StatefulImage::default()
+                                        .resize(Resize::Fit(Some(FilterType::Nearest))),
+                                    Rect {
+                                        x: explore_list_area.x + 3,
+                                        y,
+                                        width: POSTER_WIDTH,
+                                        height: 4,
+                                    },
+                                    protocol,
+                                );
+                            } else if explore.poster_id.as_deref() == Some(item.id.as_str())
+                                && explore.poster_loaded
+                            {
+                                frame.render_stateful_widget(
+                                    StatefulImage::default()
+                                        .resize(Resize::Fit(Some(FilterType::Nearest))),
+                                    Rect {
+                                        x: explore_list_area.x + 3,
+                                        y,
+                                        width: POSTER_WIDTH,
+                                        height: 4,
+                                    },
+                                    &mut poster_protocol,
+                                );
+                            }
+                        }
                         if let Some(item) = filtered.get(explore.selected) {
                             let details_area = Rect { x: explore_poster_area.x + 1, y: explore_poster_area.y + 1, width: explore_poster_area.width.saturating_sub(2), height: 3 };
                             frame.render_widget(
                                 Paragraph::new(vec![
                                     Line::from(Span::styled(item.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
                                     Line::from(Span::styled(format!("{}{}", item.item_type.as_deref().unwrap_or("Media"), item.production_year.map(|year| format!(" · {year}")).unwrap_or_default()), Style::default().fg(Color::Gray))),
-                                    Line::from(Span::styled("Enter open series · d download movie", Style::default().fg(Color::Cyan))),
+                                    Line::from(Span::styled(
+                                        if explore.details_focus {
+                                            "Space select · a select all · d download · Tab/←/Esc back"
+                                        } else {
+                                            "Tab/→/Enter select episodes · d download movie"
+                                        },
+                                        Style::default().fg(Color::Cyan),
+                                    )),
                                 ]),
                                 details_area,
                             );
-                            let poster_box = Rect { x: explore_poster_area.x + 2, y: explore_poster_area.y + 5, width: explore_poster_area.width.saturating_sub(4), height: explore_poster_area.height.saturating_sub(7) };
-                            if explore.poster_loaded {
-                                frame.render_stateful_widget(
-                                    StatefulImage::default()
-                                        .resize(Resize::Fit(Some(FilterType::Lanczos3))),
-                                    poster_box,
-                                    &mut poster_protocol,
-                                );
-                            } else {
-                                let status = if explore.poster_loading {
-                                    "Loading poster…"
+                            let content_area = explore_contents_area;
+                            if item.item_type.as_deref() == Some("Series") {
+                                if explore.preview_loading && explore.episodes.is_empty() {
+                                    frame.render_widget(
+                                        Paragraph::new("Loading show contents…")
+                                            .style(Style::default().fg(Color::DarkGray))
+                                            .alignment(ratatui::layout::Alignment::Center)
+                                            .block(panel_block("Contents", false)),
+                                        content_area,
+                                    );
                                 } else {
-                                    "Poster unavailable"
-                                };
-                                frame.render_widget(Paragraph::new(status).style(Style::default().fg(Color::DarkGray)), poster_box);
+                                    let rows: Vec<_> = explore
+                                        .episodes
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(index, episode)| {
+                                            let season = episode.parent_index_number.unwrap_or(0);
+                                            let number = episode.index_number.unwrap_or(0);
+                                            let mark = if explore.selected_episodes.contains(&index) { "✓ " } else { "  " };
+                                            ListItem::new(format!(
+                                                "{mark}S{season:02}E{number:02}  {}",
+                                                episode.name
+                                            ))
+                                        })
+                                        .collect();
+                                    episode_state.select(
+                                        (explore.details_focus && !rows.is_empty())
+                                            .then_some(explore.episode_cursor),
+                                    );
+                                    frame.render_stateful_widget(
+                                        List::new(rows)
+                                            .block(panel_block(
+                                                &format!(
+                                                    "Contents · {} episodes · {} selected",
+                                                    explore.episodes.len(),
+                                                    explore.selected_episodes.len()
+                                                ),
+                                                explore.details_focus,
+                                            ))
+                                            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
+                                            .highlight_symbol("▌ "),
+                                        content_area,
+                                        &mut episode_state,
+                                    );
+                                }
+                            } else {
+                                frame.render_widget(
+                                    Paragraph::new(vec![
+                                        Line::from(Span::styled(
+                                            "Movie",
+                                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                                        )),
+                                        Line::from(Span::styled(
+                                            "This title has no episodic contents.",
+                                            Style::default().fg(Color::Gray),
+                                        )),
+                                        Line::from(Span::styled(
+                                            "Press d to download it.",
+                                            Style::default().fg(Color::Gray),
+                                        )),
+                                    ])
+                                    .block(panel_block("Contents", false)),
+                                    content_area,
+                                );
                             }
                         }
                     }
                     let footer = Rect { x: explore_popup.x + 1, y: explore_popup.y + explore_popup.height.saturating_sub(2), width: explore_popup.width.saturating_sub(2), height: 1 };
-                    let text = if let Some((notice, _)) = &explore_notice {
-                        format!("{}  ·  {}  ·  Esc close", explore.search, notice)
+                    let footer_line = if let Some((notice, success)) = &explore_notice {
+                        Line::from(vec![
+                            Span::styled(
+                                format!("{}  ·  ", explore.search),
+                                Style::default().fg(Color::Gray),
+                            ),
+                            Span::styled(
+                                truncate(notice, explore_popup.width.saturating_sub(24) as usize),
+                                if *success {
+                                    Style::default().fg(Color::Green)
+                                } else {
+                                    Style::default()
+                                        .fg(Color::Red)
+                                        .add_modifier(Modifier::ITALIC)
+                                },
+                            ),
+                            Span::styled("  ·  Esc close", Style::default().fg(Color::Gray)),
+                        ])
                     } else {
-                        format!("{}  ·  ↑/↓ navigate  ·  Enter open  ·  d download  ·  Esc close", if explore.series_title.is_some() { "episode selection".to_string() } else { format!("Search: {}", explore.search) })
+                        Line::from(format!(
+                            "{}  ·  ↑/↓ navigate  ·  Tab switch pane  ·  d download  ·  Esc {}",
+                            if explore.details_focus {
+                                "episode selection".to_string()
+                            } else {
+                                format!("Search: {} · Filter: {}", explore.search, explore.type_filter.label())
+                            },
+                            if explore.details_focus { "back" } else { "close" }
+                        ))
                     };
-                    frame.render_widget(Paragraph::new(text).style(Style::default().fg(Color::Gray)), footer);
+                    frame.render_widget(
+                        Paragraph::new(footer_line).style(Style::default().fg(Color::Gray)),
+                        footer,
+                    );
+                }
+                if show_help {
+                    let help_popup = centered_rect(68, 58, area);
+                    let help_lines = vec![
+                        Line::from(Span::styled(
+                            "Main view",
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from("  ↑/↓ or click     select a job or download"),
+                        Line::from("  Tab / ← / →       switch focus"),
+                        Line::from("  Mouse drag        resize Jobs/Details split"),
+                        Line::from("  s / S             sync selected / all jobs"),
+                        Line::from("  b                 browse the Jellyfin library"),
+                        Line::from("  i                 show selected job configuration"),
+                        Line::from("  p / Enter         play selected download (or double-click)"),
+                        Line::from("  x / X / c         clear file / season / show (x on ad-hoc job removes it)"),
+                        Line::from("  Ctrl-C, Ctrl-C    quit the TUI"),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "Explore",
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from("  ↑/↓               move through library or episodes"),
+                        Line::from("  /                 search library"),
+                        Line::from("  f                 cycle type filter"),
+                        Line::from("  Tab / ← / → / Enter  switch library / details pane"),
+                        Line::from("  Space / a         select episode / select all"),
+                        Line::from("  d                 download selected media"),
+                        Line::from("  Ctrl-C or Esc     close Explore"),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "Ad-hoc downloads continue after Explore closes.",
+                            Style::default().fg(Color::Gray),
+                        )),
+                    ];
+                    frame.render_widget(Clear, help_popup);
+                    frame.render_widget(
+                        Paragraph::new(help_lines)
+                            .block(panel_block("Keyboard shortcuts · ? / Esc close", true))
+                            .style(Style::default().fg(Color::White)),
+                        help_popup,
+                    );
                 }
             })?;
             if event::poll(Duration::from_millis(250))? {
                 let input = event::read()?;
+                if let Event::Resize(_, _) = input {
+                    terminal.autoresize()?;
+                    terminal.clear()?;
+                    continue;
+                }
                 if let Event::Mouse(mouse) = &input {
                     if let Some(browser) = explore.as_mut() {
+                        let in_library = mouse.column >= explore_list_area.x
+                            && mouse.column < explore_list_area.x + explore_list_area.width
+                            && mouse.row >= explore_list_area.y
+                            && mouse.row < explore_list_area.y + explore_list_area.height;
+                        let in_details = mouse.column >= explore_poster_area.x
+                            && mouse.column < explore_poster_area.x + explore_poster_area.width
+                            && mouse.row >= explore_poster_area.y
+                            && mouse.row < explore_poster_area.y + explore_poster_area.height;
+                        let has_episodes = !browser.episodes.is_empty();
                         match mouse.kind {
-                            MouseEventKind::Down(MouseButton::Left) if browser.series_title.is_some() => {
-                                if mouse.column >= explore_list_area.x
-                                    && mouse.column < explore_list_area.x + explore_list_area.width
-                                    && mouse.row > explore_list_area.y
-                                    && mouse.row < explore_list_area.y + explore_list_area.height.saturating_sub(1)
-                                {
-                                    browser.episode_cursor = (usize::from(mouse.row - explore_list_area.y - 1)).min(browser.episodes.len().saturating_sub(1));
-                                    if !browser.episodes.is_empty()
-                                        && !browser
-                                            .selected_episodes
-                                            .remove(&browser.episode_cursor)
-                                    {
-                                        browser.selected_episodes.insert(browser.episode_cursor);
+                            MouseEventKind::Down(MouseButton::Left) if in_details && has_episodes => {
+                                browser.details_focus = true;
+                                if let Some(index) = list_index_at(
+                                    explore_contents_area,
+                                    mouse.column,
+                                    mouse.row,
+                                    episode_state.offset(),
+                                    browser.episodes.len(),
+                                    1,
+                                ) {
+                                    browser.episode_cursor = index;
+                                    if !browser.selected_episodes.remove(&index) {
+                                        browser.selected_episodes.insert(index);
                                     }
                                 }
                             }
-                            MouseEventKind::Down(MouseButton::Left) => {
-                                if mouse.column >= explore_list_area.x
-                                    && mouse.column < explore_list_area.x + explore_list_area.width
-                                    && mouse.row > explore_list_area.y
-                                    && mouse.row < explore_list_area.y + explore_list_area.height.saturating_sub(1)
-                                {
-                                    let row = usize::from(mouse.row - explore_list_area.y - 1);
-                                    browser.selected = (row / 2).min(browser.filtered_items().len().saturating_sub(1));
+                            MouseEventKind::Down(MouseButton::Left) if in_library => {
+                                browser.details_focus = false;
+                                if let Some(index) = list_index_at(
+                                    explore_list_area,
+                                    mouse.column,
+                                    mouse.row,
+                                    explore_state.offset(),
+                                    browser.filtered_items().len(),
+                                    4,
+                                ) {
+                                    browser.selected = index;
                                 }
                             }
-                            MouseEventKind::ScrollUp if browser.series_title.is_some() => {
+                            MouseEventKind::ScrollUp if in_details && has_episodes => {
+                                browser.details_focus = true;
                                 browser.episode_cursor = browser.episode_cursor.saturating_sub(1);
                             }
-                            MouseEventKind::ScrollDown if browser.series_title.is_some() => {
+                            MouseEventKind::ScrollDown if in_details && has_episodes => {
+                                browser.details_focus = true;
                                 if browser.episode_cursor + 1 < browser.episodes.len() {
                                     browser.episode_cursor += 1;
                                 }
                             }
-                            MouseEventKind::ScrollUp => browser.selected = browser.selected.saturating_sub(1),
-                            MouseEventKind::ScrollDown => {
+                            MouseEventKind::ScrollUp if !browser.details_focus => {
+                                browser.selected = browser.selected.saturating_sub(1);
+                            }
+                            MouseEventKind::ScrollDown if !browser.details_focus => {
                                 let len = browser.filtered_items().len();
                                 if browser.selected + 1 < len {
                                     browser.selected += 1;
@@ -2148,8 +2902,7 @@ async fn tui(config: Config) -> Result<()> {
                             }
                             _ => {}
                         }
-                        if browser.series_title.is_none()
-                            && let Some(item) = browser
+                        if let Some(item) = browser
                                 .filtered_items()
                                 .get(browser.selected)
                                 .map(|item| (*item).clone())
@@ -2165,6 +2918,22 @@ async fn tui(config: Config) -> Result<()> {
                         }
                     } else if confirm_clear.is_none() {
                         match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left)
+                                if area.width >= 100
+                                    && mouse.column.abs_diff(downloads_area.x) <= 1
+                                    && mouse.row >= body.y
+                                    && mouse.row < body.y + body.height =>
+                            {
+                                resizing_split = true;
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) if resizing_split => {
+                                let relative = mouse.column.saturating_sub(body.x);
+                                let ratio = relative.saturating_mul(100) / body.width.max(1);
+                                main_split = ratio.clamp(20, 80);
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                resizing_split = false;
+                            }
                             MouseEventKind::Down(MouseButton::Left) => {
                                 if let Some(index) = list_index_at(
                                     jobs_area,
@@ -2172,6 +2941,7 @@ async fn tui(config: Config) -> Result<()> {
                                     mouse.row,
                                     jobs_state.offset(),
                                     jobs.len(),
+                                    4,
                                 ) {
                                     selected = index;
                                     selected_download = 0;
@@ -2182,9 +2952,29 @@ async fn tui(config: Config) -> Result<()> {
                                     mouse.row,
                                     downloads_state.offset(),
                                     downloads.len(),
+                                    3,
                                 ) {
                                     selected_download = index;
                                     download_focus = true;
+                                    let now = Instant::now();
+                                    let double_click = last_download_click.is_some_and(|(last, at)| {
+                                        last == index
+                                            && now.duration_since(at) <= Duration::from_millis(400)
+                                    });
+                                    if double_click {
+                                        last_download_click = None;
+                                        if let Some(entry) = downloads.get(index) {
+                                            sync_notice = match play_download(&config, entry) {
+                                                Ok(()) => Some((
+                                                    format!("Playing {} with {}", entry.path.display(), config.player),
+                                                    true,
+                                                )),
+                                                Err(error) => Some((format!("Could not start player: {error:#}"), false)),
+                                            };
+                                        }
+                                    } else {
+                                        last_download_click = Some((index, now));
+                                    }
                                 }
                             }
                             MouseEventKind::ScrollUp
@@ -2231,92 +3021,116 @@ async fn tui(config: Config) -> Result<()> {
                         }
                     }
                 } else if let Event::Key(key) = input {
-                if let Some(browser) = explore.as_mut() {
+                if key.code == KeyCode::Char('?') {
+                    show_help = !show_help;
+                    show_job_config = false;
+                } else if show_help && key.code == KeyCode::Esc {
+                    show_help = false;
+                } else if show_job_config && key.code == KeyCode::Esc {
+                    show_job_config = false;
+                } else if show_job_config && key.code == KeyCode::Char('q') {
+                    show_job_config = false;
+                } else if key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    if explore.is_some() {
+                        if let Some(task) = catalog_task.take() {
+                            task.abort();
+                        }
+                        if let Some(task) = poster_task.take() {
+                            task.abort();
+                        }
+                        for (_, task) in explore_poster_tasks.drain() {
+                            task.abort();
+                        }
+                        if let Some(task) = preview_episode_task.take() {
+                            task.abort();
+                        }
+                        poster_protocol.empty_protocol();
+                        explore = None;
+                        explore_notice = None;
+                    } else if last_ctrl_c.is_some_and(|time| time.elapsed() < Duration::from_secs(1)) {
+                        break;
+                    } else {
+                        last_ctrl_c = Some(Instant::now());
+                        sync_notice = Some(("Press Ctrl-C again to quit".into(), false));
+                    }
+                } else if let Some(browser) = explore.as_mut() {
+                    last_ctrl_c = None;
                     match key.code {
+                        KeyCode::Esc | KeyCode::Tab | KeyCode::Left if browser.details_focus => {
+                            browser.details_focus = false;
+                        }
+                        KeyCode::Tab | KeyCode::Right | KeyCode::Enter
+                            if !browser.details_focus && !browser.episodes.is_empty() =>
+                        {
+                            browser.details_focus = true;
+                            explore_notice = None;
+                        }
                         KeyCode::Esc => {
-                            if browser.series_title.take().is_some() {
-                                if let Some(task) = episode_task.take() {
-                                    task.abort();
-                                }
-                                browser.selected_episodes.clear();
-                                browser.episodes.clear();
-                                browser.episode_cursor = 0;
-                                browser.episode_loading = false;
-                            } else {
-                                if let Some(task) = catalog_task.take() {
-                                    task.abort();
-                                }
-                                if let Some(task) = poster_task.take() {
-                                    task.abort();
-                                }
-                                if let Some(task) = episode_task.take() {
-                                    task.abort();
-                                }
-                                poster_protocol.empty_protocol();
-                                explore = None;
-                                explore_notice = None;
+                            if let Some(task) = catalog_task.take() {
+                                task.abort();
+                            }
+                            if let Some(task) = poster_task.take() {
+                                task.abort();
+                            }
+                            for (_, task) in explore_poster_tasks.drain() {
+                                task.abort();
+                            }
+                            if let Some(task) = preview_episode_task.take() {
+                                task.abort();
+                            }
+                            poster_protocol.empty_protocol();
+                            explore = None;
+                            explore_notice = None;
+                        }
+                        KeyCode::Up if browser.details_focus => {
+                            browser.episode_cursor = browser.episode_cursor.saturating_sub(1);
+                        }
+                        KeyCode::Down if browser.details_focus => {
+                            if browser.episode_cursor + 1 < browser.episodes.len() {
+                                browser.episode_cursor += 1;
                             }
                         }
                         KeyCode::Up => {
-                            if browser.series_title.is_some() {
-                                browser.episode_cursor = browser.episode_cursor.saturating_sub(1);
-                            } else {
-                                browser.selected = browser.selected.saturating_sub(1);
-                            }
+                            browser.selected = browser.selected.saturating_sub(1);
                         }
                         KeyCode::Down => {
-                            if browser.series_title.is_some() {
-                                if browser.episode_cursor + 1 < browser.episodes.len() {
-                                    browser.episode_cursor += 1;
-                                }
-                            } else {
-                                let len = browser.filtered_items().len();
-                                if browser.selected + 1 < len {
-                                    browser.selected += 1;
-                                }
+                            let len = browser.filtered_items().len();
+                            if browser.selected + 1 < len {
+                                browser.selected += 1;
                             }
                         }
-                        KeyCode::Char('/') if browser.series_title.is_none() => {
-                            browser.search.clear();
-                            browser.selected = 0;
-                        }
-                        KeyCode::Backspace if browser.series_title.is_none() => {
-                            browser.search.pop();
-                            browser.selected = 0;
-                        }
-                        KeyCode::Char(' ') if browser.series_title.is_some() && !browser.episodes.is_empty() => {
+                        KeyCode::Char(' ') if browser.details_focus && !browser.episodes.is_empty() => {
                             if !browser.selected_episodes.remove(&browser.episode_cursor) {
                                 browser.selected_episodes.insert(browser.episode_cursor);
                             }
                         }
-                        KeyCode::Char('a') if browser.series_title.is_some() => {
+                        KeyCode::Char('a') if browser.details_focus => {
                             browser.selected_episodes = (0..browser.episodes.len()).collect();
                         }
-                        KeyCode::Enter if browser.series_title.is_none() => {
-                            if let Some(item) = browser.filtered_items().get(browser.selected).map(|item| (*item).clone())
-                                && item.item_type.as_deref() == Some("Series")
-                            {
-                                browser.episodes.clear();
-                                browser.episode_cursor = 0;
-                                browser.selected_episodes.clear();
-                                browser.episode_loading = true;
-                                browser.series_title = Some(item.name.clone());
-                                let api = browser.api.clone();
-                                episode_task = Some(tokio::spawn(async move {
-                                    let title = item.name.clone();
-                                    let result = match api {
-                                        Some(api) => fetch_episodes(api, item).await,
-                                        None => Err(anyhow::anyhow!("Explore Jellyfin session is not ready")),
-                                    };
-                                    (title, result)
-                                }));
-                                explore_notice = None;
-                            }
+                        KeyCode::Char('/') if !browser.details_focus => {
+                            browser.search.clear();
+                            browser.selected = 0;
+                        }
+                        KeyCode::Backspace if !browser.details_focus => {
+                            browser.search.pop();
+                            browser.selected = 0;
+                        }
+                        KeyCode::Char('f') if !browser.details_focus => {
+                            browser.type_filter = browser.type_filter.next();
+                            browser.selected = 0;
+                            explore_notice = None;
                         }
                         KeyCode::Char('d') => {
                             if explore_task.is_some() {
                                 explore_notice = Some(("A library download is already running".into(), false));
-                            } else if let Some(title) = browser.series_title.clone() {
+                            } else if browser.details_focus
+                                && let Some(title) = browser
+                                    .filtered_items()
+                                    .get(browser.selected)
+                                    .map(|item| item.name.clone())
+                            {
                                 let items: Vec<_> = browser.selected_episodes.iter()
                                     .filter_map(|index| browser.episodes.get(*index).cloned())
                                     .collect();
@@ -2340,14 +3154,13 @@ async fn tui(config: Config) -> Result<()> {
                                 }));
                             }
                         }
-                        KeyCode::Char(character) if browser.series_title.is_none() && !character.is_control() => {
+                        KeyCode::Char(character) if !browser.details_focus && !character.is_control() => {
                             browser.search.push(character);
                             browser.selected = 0;
                         }
                         _ => {}
                     }
                     if let Some(browser) = explore.as_mut()
-                        && browser.series_title.is_none()
                         && let Some(item) = browser
                             .filtered_items()
                             .get(browser.selected)
@@ -2363,29 +3176,41 @@ async fn tui(config: Config) -> Result<()> {
                         explore_notice = Some((format!("Could not load poster: {error:#}"), false));
                     }
                 } else if let Some(scope) = confirm_clear {
+                    last_ctrl_c = None;
                     match key.code {
                         KeyCode::Char('y') => {
-                            if download_focus {
-                                if let Some(entry) = downloads.get(selected_download) {
-                                    let removed = clear_tracked(&config, entry, scope)?;
-                                    if matches!(scope, ClearScope::Show) {
+                            let (entry, scope) = if download_focus {
+                                (downloads.get(selected_download), scope)
+                            } else {
+                                (
+                                    jobs.get(selected).and_then(|job| {
+                                        downloads.iter().find(|entry| entry.job == job.name)
+                                    }),
+                                    ClearScope::Show,
+                                )
+                            };
+                            let result = if let Some(entry) = entry {
+                                clear_tracked(&config, entry, scope).and_then(|removed| {
+                                    // Ad-hoc jobs are dropped by clear_tracked once empty;
+                                    // recording a status here would resurrect them.
+                                    if matches!(scope, ClearScope::Show)
+                                        && !entry.job.starts_with("library:")
+                                    {
                                         update_job(
                                             &entry.job,
                                             "cleared",
                                             &format!("cleared {removed} tracked files"),
                                         )?;
                                     }
-                                }
-                            } else if let Some(job) = jobs.get(selected)
-                                && let Some(entry) =
-                                    downloads.iter().find(|entry| entry.job == job.name)
-                            {
-                                let removed = clear_tracked(&config, entry, ClearScope::Show)?;
-                                update_job(
-                                    &job.name,
-                                    "cleared",
-                                    &format!("cleared {removed} tracked files"),
-                                )?;
+                                    Ok(())
+                                })
+                            } else if let Some(job) = jobs.get(selected).filter(|job| job.adhoc) {
+                                forget_job(&job.name)
+                            } else {
+                                Ok(())
+                            };
+                            if let Err(error) = result {
+                                sync_notice = Some((format!("Could not clear: {error:#}"), false));
                             }
                             confirm_clear = None;
                         }
@@ -2393,11 +3218,34 @@ async fn tui(config: Config) -> Result<()> {
                         _ => {}
                     }
                 } else {
+                    last_ctrl_c = None;
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('e') => {
+                        KeyCode::Char('i') if !jobs.is_empty() => {
+                            show_job_config = !show_job_config;
+                        }
+                        KeyCode::Char('b') => {
                             if explore_task.is_some() {
                                 explore_notice = Some(("Wait for the current library download to finish".into(), false));
+                            } else if let Some((api, items)) = library_cache.clone() {
+                                explore = Some(ExploreState {
+                                    api: Some(api),
+                                    items,
+                                    episodes: Vec::new(),
+                                    selected: 0,
+                                    episode_cursor: 0,
+                                    selected_episodes: HashSet::new(),
+                                    search: String::new(),
+                                    type_filter: ExploreTypeFilter::All,
+                                    details_focus: false,
+                                    poster_id: None,
+                                    poster_loading: false,
+                                    poster_loaded: false,
+                                    preview_item_id: None,
+                                    preview_loading: false,
+                                    catalog_loading: false,
+                                });
+                                explore_notice = None;
                             } else {
                                 explore = Some(ExploreState {
                                     api: None,
@@ -2407,12 +3255,14 @@ async fn tui(config: Config) -> Result<()> {
                                     episode_cursor: 0,
                                     selected_episodes: HashSet::new(),
                                     search: String::new(),
-                                    series_title: None,
+                                    type_filter: ExploreTypeFilter::All,
+                                    details_focus: false,
                                     poster_id: None,
                                     poster_loading: false,
                                     poster_loaded: false,
+                                    preview_item_id: None,
+                                    preview_loading: false,
                                     catalog_loading: true,
-                                    episode_loading: false,
                                 });
                                 let config = config.clone();
                                 catalog_task = Some(tokio::spawn(async move {
@@ -2422,6 +3272,8 @@ async fn tui(config: Config) -> Result<()> {
                             }
                         }
                         KeyCode::Tab => download_focus = !download_focus,
+                        KeyCode::Left => download_focus = false,
+                        KeyCode::Right => download_focus = !downloads.is_empty(),
                         KeyCode::Up if download_focus => {
                             selected_download = selected_download.saturating_sub(1)
                         }
@@ -2441,7 +3293,17 @@ async fn tui(config: Config) -> Result<()> {
                             selected += 1;
                             selected_download = 0;
                         }
-                        KeyCode::Char('s') if !jobs.is_empty() => {
+                        KeyCode::Char('s')
+                            if jobs.get(selected).is_some_and(|job| job.adhoc) =>
+                        {
+                            sync_notice = Some((
+                                "Ad-hoc downloads are already running in the background".into(),
+                                false,
+                            ));
+                        }
+                        KeyCode::Char('s')
+                            if jobs.get(selected).is_some_and(|job| !job.adhoc) =>
+                        {
                             if sync_task.is_some() {
                                 sync_notice = Some(("A sync is already running".into(), false));
                             } else {
@@ -2471,6 +3333,23 @@ async fn tui(config: Config) -> Result<()> {
                         KeyCode::Char('x') if download_focus && !downloads.is_empty() => {
                             confirm_clear = Some(ClearScope::File)
                         }
+                        KeyCode::Char('x')
+                            if !download_focus
+                                && jobs.get(selected).is_some_and(|job| job.adhoc) =>
+                        {
+                            confirm_clear = Some(ClearScope::Show)
+                        }
+                        KeyCode::Char('p') | KeyCode::Enter if download_focus && !downloads.is_empty() => {
+                            if let Some(entry) = downloads.get(selected_download) {
+                                sync_notice = match play_download(&config, entry) {
+                                    Ok(()) => Some((
+                                        format!("Playing {} with {}", entry.path.display(), config.player),
+                                        true,
+                                    )),
+                                    Err(error) => Some((format!("Could not start player: {error:#}"), false)),
+                                };
+                            }
+                        }
                         KeyCode::Char('X') if download_focus && !downloads.is_empty() => {
                             confirm_clear = Some(ClearScope::Season)
                         }
@@ -2499,12 +3378,57 @@ fn state_style(state: &str) -> Style {
     let color = match state.to_ascii_lowercase().as_str() {
         "success" | "complete" | "completed" => Color::Green,
         "running" | "downloading" | "queued" => Color::Yellow,
-        "failed" | "error" => Color::Red,
+        "failed" | "error" | "skipped" => Color::Red,
         "interrupted" | "cleared" => Color::Magenta,
         "not run" | "stopped" => Color::DarkGray,
         _ => Color::Cyan,
     };
     Style::default().fg(color)
+}
+
+fn message_style(state: &str, message: &str) -> Style {
+    let lower = message.to_ascii_lowercase();
+    if matches!(
+        state.to_ascii_lowercase().as_str(),
+        "failed" | "error" | "skipped"
+    ) || lower.contains("no jellyfin media")
+        || lower.contains("jellyfin returned no media")
+    {
+        Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
+}
+
+fn yaml_value_display(value: Option<&serde_yaml::Value>) -> String {
+    value
+        .map(|value| {
+            serde_yaml::to_string(value)
+                .unwrap_or_else(|_| "<invalid>".into())
+                .trim()
+                .replace('\n', " ")
+        })
+        .unwrap_or_else(|| "—".into())
+}
+
+fn optional_bool_display(value: Option<bool>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "—".into())
+}
+
+fn config_line(label: &str, value: impl Into<String>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<14}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(value.into()),
+    ])
 }
 
 fn panel_block(title: &str, focused: bool) -> Block<'_> {
@@ -2526,13 +3450,13 @@ fn panel_block(title: &str, focused: bool) -> Block<'_> {
 fn key_hint(key: &'static str, label: &'static str) -> [Span<'static>; 2] {
     [
         Span::styled(
-            format!(" {key} "),
+            format!("{key} "),
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" {label} "), Style::default().fg(Color::Gray)),
+        Span::styled(label, Style::default().fg(Color::Gray)),
     ]
 }
 
@@ -2567,6 +3491,20 @@ fn format_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+fn play_download(config: &Config, entry: &DownloadEntry) -> Result<()> {
+    if config.player.trim().is_empty() {
+        bail!("player command is empty; set player in jellysync settings");
+    }
+    std::process::Command::new(&config.player)
+        .arg(&entry.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("start player '{}'", config.player))?;
+    Ok(())
+}
+
 fn truncate(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         value.to_string()
@@ -2594,7 +3532,14 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
-fn list_index_at(area: Rect, column: u16, row: u16, offset: usize, len: usize) -> Option<usize> {
+fn list_index_at(
+    area: Rect,
+    column: u16,
+    row: u16,
+    offset: usize,
+    len: usize,
+    row_height: usize,
+) -> Option<usize> {
     if column < area.x
         || column >= area.x + area.width
         || row < area.y + 1
@@ -2602,7 +3547,7 @@ fn list_index_at(area: Rect, column: u16, row: u16, offset: usize, len: usize) -
     {
         return None;
     }
-    let index = offset + usize::from(row - area.y - 1) / 3;
+    let index = offset + usize::from(row - area.y - 1) / row_height;
     (index < len).then_some(index)
 }
 
@@ -2610,9 +3555,10 @@ fn list_index_at(area: Rect, column: u16, row: u16, offset: usize, len: usize) -
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Commands::Status) => status(),
-        Some(Commands::Start) => systemctl("start"),
-        Some(Commands::Stop) => systemctl("stop"),
+        Some(Commands::Status) => status(cli.json),
+        Some(Commands::Start) => systemctl("start", cli.json),
+        Some(Commands::Stop) => systemctl("stop", cli.json),
+        Some(Commands::Tui) if cli.json => bail!("--json is not supported with tui"),
         Some(Commands::Tui) => {
             let path = config_path(cli.config)?;
             let config =
@@ -2628,13 +3574,62 @@ async fn main() -> Result<()> {
                 bail!("parallelism must be at least 1");
             }
             match command {
-                Some(Commands::Sync { target }) => run_sync(config, target, parallelism).await,
-                Some(Commands::Prune { apply, target }) => prune(config, target, apply).await,
+                Some(Commands::Sync { target }) => {
+                    let result = run_sync_mode(config, target.clone(), parallelism, cli.json).await;
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "command": "sync",
+                                "targets": target,
+                                "ok": result.is_ok(),
+                                "error": result.as_ref().err().map(|error| format!("{error:#}")),
+                            }))?
+                        );
+                    }
+                    result
+                }
+                Some(Commands::Prune { apply, target }) => {
+                    let result = prune(config, target.clone(), apply, cli.json).await;
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "command": "prune",
+                                "targets": target,
+                                "apply": apply,
+                                "ok": result.is_ok(),
+                                "error": result.as_ref().err().map(|error| format!("{error:#}")),
+                            }))?
+                        );
+                    }
+                    result
+                }
                 Some(Commands::Config) => {
-                    println!("{}", serde_yaml::to_string(&config)?);
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&config)?);
+                    } else {
+                        println!("{}", serde_yaml::to_string(&config)?);
+                    }
                     Ok(())
                 }
-                None => run_sync(config, cli.targets, parallelism).await,
+                None => {
+                    let targets = cli.targets;
+                    let result =
+                        run_sync_mode(config, targets.clone(), parallelism, cli.json).await;
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "command": "sync",
+                                "targets": targets,
+                                "ok": result.is_ok(),
+                                "error": result.as_ref().err().map(|error| format!("{error:#}")),
+                            }))?
+                        );
+                    }
+                    result
+                }
                 Some(Commands::Status | Commands::Start | Commands::Stop | Commands::Tui) => {
                     unreachable!()
                 }
@@ -2642,12 +3637,22 @@ async fn main() -> Result<()> {
         }
     }
 }
-fn systemctl(action: &str) -> Result<()> {
+fn systemctl(action: &str, json_output: bool) -> Result<()> {
     let status = std::process::Command::new("systemctl")
         .args(["--user", action, "jellysync.service"])
         .status()?;
     if !status.success() {
         bail!("systemctl {action} jellysync.service failed with {status}");
+    }
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "command": action,
+                "service": "jellysync.service",
+                "ok": true,
+            }))?
+        );
     }
     Ok(())
 }

@@ -1556,7 +1556,7 @@ fn open_db(path: &Path) -> Result<Connection> {
         loop {
             match conn.execute_batch("PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS jobs (name TEXT PRIMARY KEY, status TEXT NOT NULL, message TEXT, updated_at TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS transfers (item_id TEXT PRIMARY KEY, job TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, total INTEGER, updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS transfers (item_id TEXT PRIMARY KEY, job TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, total INTEGER, rate INTEGER, updated_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS watched (item_id TEXT PRIMARY KEY, played INTEGER NOT NULL, pending INTEGER NOT NULL DEFAULT 0, played_at TEXT, updated_at TEXT NOT NULL);")
             {
                 Ok(()) => break,
@@ -1568,6 +1568,19 @@ fn open_db(path: &Path) -> Result<Connection> {
                 }
                 Err(error) => return Err(error).context("set up the state database"),
             }
+        }
+        // State databases from before throughput tracking lack the rate column;
+        // another process may add it concurrently, so re-check on failure.
+        let has_rate = |conn: &Connection| -> Result<bool> {
+            Ok(conn
+                .prepare("SELECT 1 FROM pragma_table_info('transfers') WHERE name='rate'")?
+                .exists([])?)
+        };
+        if !has_rate(&conn)?
+            && let Err(error) = conn.execute_batch("ALTER TABLE transfers ADD COLUMN rate INTEGER")
+            && !has_rate(&conn)?
+        {
+            return Err(error).context("add the rate column to the state database");
         }
         ready.push(path.to_path_buf());
     }
@@ -1807,7 +1820,7 @@ fn update_transfer(
     total: Option<u64>,
 ) -> Result<()> {
     db()?.execute("INSERT INTO transfers(item_id,job,path,status,bytes,total,updated_at) VALUES(?1,?2,?3,?4,?5,?6,datetime('now'))
-        ON CONFLICT(item_id) DO UPDATE SET job=excluded.job,path=excluded.path,status=excluded.status,bytes=excluded.bytes,total=excluded.total,updated_at=excluded.updated_at",
+        ON CONFLICT(item_id) DO UPDATE SET job=excluded.job,path=excluded.path,status=excluded.status,bytes=excluded.bytes,total=excluded.total,rate=NULL,updated_at=excluded.updated_at",
         params![item_id, job, path.to_string_lossy(), status, bytes as i64, total.map(|v| v as i64)])?;
     Ok(())
 }
@@ -3427,10 +3440,16 @@ fn transfer_status(item_id: &str) -> Result<Option<String>> {
 
 /// Record progress; false when the transfer was paused, cleared or ignored
 /// meanwhile, in which case the download stops (and must not come back to life).
-fn update_progress(item_id: &str, bytes: u64, total: Option<u64>) -> Result<bool> {
+/// `rate` is the current throughput in bytes per second.
+fn update_progress(
+    item_id: &str,
+    bytes: u64,
+    total: Option<u64>,
+    rate: Option<u64>,
+) -> Result<bool> {
     let updated = db()?.execute(
-        "UPDATE transfers SET status='downloading',bytes=?2,total=?3,updated_at=datetime('now') WHERE item_id=?1 AND status NOT IN ('paused','cleared','ignored')",
-        params![item_id, bytes as i64, total.map(|v| v as i64)],
+        "UPDATE transfers SET status='downloading',bytes=?2,total=?3,rate=?4,updated_at=datetime('now') WHERE item_id=?1 AND status NOT IN ('paused','cleared','ignored')",
+        params![item_id, bytes as i64, total.map(|v| v as i64), rate.map(|v| v as i64)],
     )?;
     Ok(updated > 0)
 }
@@ -3614,23 +3633,31 @@ async fn jellyfin_download_inner(
     } else {
         tokio::fs::File::create(&partial).await?
     };
-    if !update_progress(&item.id, start, total)? {
+    if !update_progress(&item.id, start, total, None)? {
         return Ok(());
     }
     let mut stream = response.bytes_stream();
     let mut bytes = start;
     let mut checkpoint = start;
+    let mut checkpoint_at = Instant::now();
+    let mut rate: Option<f64> = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("read Jellyfin download stream")?;
         tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
         bytes += chunk.len() as u64;
-        if bytes - checkpoint >= 4 * 1024 * 1024 {
-            if !update_progress(&item.id, bytes, total)? {
+        let elapsed = checkpoint_at.elapsed();
+        if elapsed >= PROGRESS_INTERVAL {
+            // Smooth the per-interval throughput so the display does not jitter.
+            let sample = (bytes - checkpoint) as f64 / elapsed.as_secs_f64();
+            let smoothed = rate.map_or(sample, |previous| previous * 0.7 + sample * 0.3);
+            rate = Some(smoothed);
+            if !update_progress(&item.id, bytes, total, Some(smoothed as u64))? {
                 // Paused: keep the .partial file and free this worker slot.
                 tokio::io::AsyncWriteExt::flush(&mut file).await?;
                 return Ok(());
             }
             checkpoint = bytes;
+            checkpoint_at = Instant::now();
         }
     }
     tokio::io::AsyncWriteExt::flush(&mut file).await?;
@@ -3926,6 +3953,15 @@ fn status(json_output: bool) -> Result<()> {
         );
     }
     println!("{}", "JOBS".with(TerminalColor::Magenta).bold());
+    let mut file_states: HashMap<String, Vec<String>> = HashMap::new();
+    let mut statement =
+        conn.prepare("SELECT job,status FROM transfers WHERE status IN ('queued','downloading')")?;
+    for row in statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (job, state) = row?;
+        file_states.entry(job).or_default().push(state);
+    }
     let mut statement =
         conn.prepare("SELECT name,status,message,updated_at FROM jobs ORDER BY name")?;
     let rows = statement.query_map([], |row| {
@@ -3940,9 +3976,19 @@ fn status(json_output: bool) -> Result<()> {
     for row in rows {
         let (name, state, message, time) = row?;
         job_count += 1;
+        let (state, summary) = job_display_state(
+            &state,
+            file_states
+                .get(&name)
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        );
+        let message = summary.or(message);
         let (icon, color) = match state.to_ascii_lowercase().as_str() {
             "success" | "complete" | "completed" => ("●", TerminalColor::Green),
-            "running" | "downloading" => ("◐", TerminalColor::Yellow),
+            "running" => ("◐", TerminalColor::Yellow),
+            "downloading" => ("◐", TerminalColor::Cyan),
             "queued" => ("◌", TerminalColor::Blue),
             "paused" => ("⏸", TerminalColor::DarkGrey),
             "failed" | "error" | "skipped" => ("✕", TerminalColor::Red),
@@ -3974,7 +4020,7 @@ fn status(json_output: bool) -> Result<()> {
         "\n{}",
         "ACTIVE DOWNLOADS".with(TerminalColor::Magenta).bold()
     );
-    let mut statement = conn.prepare("SELECT job,path,status,bytes,total FROM transfers WHERE status IN ('queued','downloading','interrupted','paused') ORDER BY job,path")?;
+    let mut statement = conn.prepare(&format!("SELECT job,path,status,bytes,total,{LIVE_RATE_SQL} FROM transfers WHERE status IN ('queued','downloading','interrupted','paused') ORDER BY job,path"))?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -3982,13 +4028,15 @@ fn status(json_output: bool) -> Result<()> {
             row.get::<_, String>(2)?,
             row.get::<_, u64>(3)?,
             row.get::<_, Option<u64>>(4)?,
+            row.get::<_, Option<u64>>(5)?,
         ))
     })?;
     let mut download_count = 0;
+    let mut total_rate: Option<u64> = None;
     for row in rows {
-        let (job, path, state, bytes, total) = row?;
+        let (job, path, state, bytes, total, rate) = row?;
         download_count += 1;
-        let (bar, percent) = download_progress(bytes, total, 20);
+        let (filled, track, percent) = download_progress(bytes, total, 20);
         let filename = Path::new(&path)
             .file_name()
             .unwrap_or_default()
@@ -4006,17 +4054,35 @@ fn status(json_output: bool) -> Result<()> {
             truncate(&filename, 42).bold(),
             format!("({job})").with(TerminalColor::DarkGrey)
         );
-        println!(
-            "    {} {}  {}",
-            bar.with(state_color),
-            percent.with(state_color),
-            state.to_uppercase().with(state_color)
-        );
+        if state == "queued" {
+            // Nothing transferred yet: no progress bar or unknown percentage.
+            println!("    {}", state.to_uppercase().with(state_color));
+        } else {
+            println!(
+                "    {}{} {}  {}  {}",
+                filled.with(state_color),
+                track.with(TerminalColor::DarkGrey),
+                percent.with(state_color),
+                state.to_uppercase().with(state_color),
+                rate.map(|rate| format_throughput(rate, bytes, total))
+                    .unwrap_or_default()
+                    .with(TerminalColor::Grey)
+            );
+        }
+        if let Some(rate) = rate {
+            total_rate = Some(total_rate.unwrap_or(0) + rate);
+        }
     }
     if download_count == 0 {
         println!(
             "  {}",
             "Nothing is downloading".with(TerminalColor::DarkGrey)
+        );
+    } else if let Some(rate) = total_rate {
+        println!(
+            "  {} {}",
+            "total".with(TerminalColor::DarkGrey),
+            format!("{}/s", format_bytes(rate)).with(TerminalColor::Grey)
         );
     }
     if let Ok(output) = std::process::Command::new("systemctl")
@@ -4050,7 +4116,7 @@ fn status_json(conn: &Connection) -> Result<()> {
             }))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut statement = conn.prepare("SELECT job,path,status,bytes,total FROM transfers WHERE status IN ('queued','downloading','interrupted','paused') ORDER BY job,path")?;
+    let mut statement = conn.prepare(&format!("SELECT job,path,status,bytes,total,{LIVE_RATE_SQL} FROM transfers WHERE status IN ('queued','downloading','interrupted','paused') ORDER BY job,path"))?;
     let downloads = statement
         .query_map([], |row| {
             Ok(json!({
@@ -4059,6 +4125,7 @@ fn status_json(conn: &Connection) -> Result<()> {
                 "status": row.get::<_, String>(2)?,
                 "bytes": row.get::<_, u64>(3)?,
                 "total": row.get::<_, Option<u64>>(4)?,
+                "rate": row.get::<_, Option<u64>>(5)?,
             }))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4366,6 +4433,8 @@ struct DownloadEntry {
     status: String,
     bytes: u64,
     total: Option<u64>,
+    /// Live throughput in bytes per second while downloading.
+    rate: Option<u64>,
 }
 
 #[derive(Default)]
@@ -4423,7 +4492,9 @@ fn dashboard_snapshot(check_timer: bool) -> Result<DashboardSnapshot> {
 
 fn tracked_downloads() -> Result<Vec<DownloadEntry>> {
     let conn = db()?;
-    let mut statement = conn.prepare("SELECT item_id,job,path,status,bytes,total FROM transfers WHERE status != 'cleared' ORDER BY job,path")?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT item_id,job,path,status,bytes,total,{LIVE_RATE_SQL} FROM transfers WHERE status != 'cleared' ORDER BY job,path"
+    ))?;
     let rows = statement.query_map([], |row| {
         Ok(DownloadEntry {
             item_id: row.get(0)?,
@@ -4432,6 +4503,7 @@ fn tracked_downloads() -> Result<Vec<DownloadEntry>> {
             status: row.get(3)?,
             bytes: row.get(4)?,
             total: row.get(5)?,
+            rate: row.get(6)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -5291,6 +5363,15 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         .get(&job.name)
                         .map(|(state, message, _)| (state.as_str(), message.as_str()))
                         .unwrap_or(("not run", "Waiting for first sync"));
+                    let (state, summary) = job_display_state(
+                        state,
+                        dashboard
+                            .downloads
+                            .iter()
+                            .filter(|entry| entry.job == job.name)
+                            .map(|entry| entry.status.as_str()),
+                    );
+                    let message = summary.as_deref().unwrap_or(message);
                     let disabled = config
                         .jobs
                         .iter()
@@ -5479,10 +5560,13 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     };
                     let filename = entry.path.file_name().unwrap_or_default().to_string_lossy();
                     let episode = file_title(selected_details, entry, downloads.len() == 1);
-                    let (bar, percent) = download_progress(entry.bytes, entry.total, download_bar_width);
+                    let (filled, track, percent) =
+                        download_progress(entry.bytes, entry.total, download_bar_width);
                     let completed = download_complete(&entry.status);
                     let size = if completed {
                         format_bytes(entry.bytes)
+                    } else if entry.status == "queued" && entry.bytes == 0 {
+                        entry.total.map(format_bytes).unwrap_or_default()
                     } else {
                         entry
                             .total
@@ -5506,10 +5590,17 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             Span::styled(format!("  {size}"), Style::default().fg(Color::Gray)),
                         ]
                     } else {
-                        vec![
+                        let mut spans = vec![
                             Span::styled(format!("  {}", entry.status), state_style(&entry.status)),
                             Span::styled(format!("  {size}"), Style::default().fg(Color::Gray)),
-                        ]
+                        ];
+                        if let Some(rate) = entry.rate {
+                            spans.push(Span::styled(
+                                format!("  {}", format_throughput(rate, entry.bytes, entry.total)),
+                                Style::default().fg(Color::Cyan),
+                            ));
+                        }
+                        spans
                     };
                     if completed && let Some(Ok(probe)) = probe_cache.get(&entry.path) {
                         let used: usize = subtitle.iter().map(|span| span.content.chars().count()).sum();
@@ -5519,11 +5610,13 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             Style::default().fg(Color::Blue),
                         ));
                     }
-                    let third_line = if !completed && !ignored {
+                    // Queued files have no progress yet: skip the bar and its "?".
+                    let third_line = if !completed && !ignored && entry.status != "queued" {
                         Line::from(vec![
                             Span::styled("  ", Style::default()),
-                            Span::styled(bar, Style::default().fg(Color::Cyan)),
-                            Span::styled(format!(" {percent}"), Style::default().fg(Color::DarkGray)),
+                            Span::styled(filled, Style::default().fg(Color::Cyan)),
+                            Span::styled(track, Style::default().fg(Color::DarkGray)),
+                            Span::styled(format!(" {percent}"), Style::default().fg(Color::Gray)),
                         ])
                     } else if episode.is_some() {
                         // The title replaced the file name on the first line.
@@ -5550,7 +5643,8 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                         )],
                     };
-                    let mut first = vec![Span::styled("● ", state_style(&entry.status))];
+                    let (marker, marker_style) = transfer_marker(&entry.status);
+                    let mut first = vec![Span::styled(format!("{marker} "), marker_style)];
                     if ignored {
                         // Dim the whole title: the file is gone and stays gone.
                         first.extend(title_line.into_iter().map(|span| {
@@ -5659,6 +5753,35 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     header_segments.push(vec![Span::styled(
                         format!("{count} indexed"),
                         Style::default().fg(Color::Gray),
+                    )]);
+                }
+                // Everything tracked across all jobs; while files are still
+                // pending, show how much of it is already on disk.
+                let (done_size, tracked_size) = dashboard
+                    .downloads
+                    .iter()
+                    .filter(|entry| entry.status != "ignored")
+                    .fold((0u64, 0u64), |(done, tracked), entry| {
+                        (
+                            done.saturating_add(entry.bytes),
+                            tracked.saturating_add(entry.total.unwrap_or(entry.bytes).max(entry.bytes)),
+                        )
+                    });
+                if tracked_size > 0 {
+                    header_segments.push(vec![Span::styled(
+                        if done_size < tracked_size {
+                            format!("{} / {}", format_bytes(done_size), format_bytes(tracked_size))
+                        } else {
+                            format_bytes(tracked_size)
+                        },
+                        Style::default().fg(Color::Gray),
+                    )]);
+                }
+                let total_rate: u64 = dashboard.downloads.iter().filter_map(|entry| entry.rate).sum();
+                if total_rate > 0 {
+                    header_segments.push(vec![Span::styled(
+                        format!("↓ {}/s", format_bytes(total_rate)),
+                        Style::default().fg(Color::Cyan),
                     )]);
                 }
                 header_segments.push(vec![
@@ -7745,6 +7868,60 @@ fn state_style(state: &str) -> Style {
     Style::default().fg(color)
 }
 
+/// The state to show for a job: a running job is only "downloading" while
+/// one of its files actually transfers; otherwise its files wait for a worker
+/// slot. Returns the state and, when derived from the files, a summary message.
+fn job_display_state<'a>(
+    state: &'a str,
+    file_states: impl IntoIterator<Item = &'a str>,
+) -> (&'a str, Option<String>) {
+    if !matches!(state, "running" | "queued") {
+        return (state, None);
+    }
+    let (mut downloading, mut queued) = (0, 0);
+    for file_state in file_states {
+        match file_state {
+            "downloading" => downloading += 1,
+            "queued" => queued += 1,
+            _ => {}
+        }
+    }
+    let summary = match (downloading, queued) {
+        (0, 0) => return (state, None),
+        (0, queued) => format!("{queued} queued"),
+        (downloading, 0) => format!("{downloading} downloading"),
+        (downloading, queued) => format!("{downloading} downloading · {queued} queued"),
+    };
+    (
+        if downloading > 0 {
+            "downloading"
+        } else {
+            "queued"
+        },
+        Some(summary),
+    )
+}
+
+/// A distinct single-column glyph and colour per file state, so downloading,
+/// queued, paused and ignored files tell apart at a glance.
+fn transfer_marker(state: &str) -> (&'static str, Style) {
+    match state {
+        "complete" | "completed" | "success" => ("●", Style::default().fg(Color::Green)),
+        "downloading" => (
+            "◐",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "queued" => ("◌", Style::default().fg(Color::Blue)),
+        "paused" => ("○", Style::default().fg(Color::Yellow)),
+        "interrupted" => ("◆", Style::default().fg(Color::Magenta)),
+        "failed" | "error" => ("✕", Style::default().fg(Color::Red)),
+        "ignored" => ("⊘", Style::default().fg(Color::DarkGray)),
+        _ => ("●", state_style(state)),
+    }
+}
+
 fn message_style(state: &str, message: &str) -> Style {
     let lower = message.to_ascii_lowercase();
     if matches!(
@@ -8553,20 +8730,50 @@ fn key_sep() -> Span<'static> {
     Span::raw("  ")
 }
 
-fn download_progress(bytes: u64, total: Option<u64>, width: usize) -> (String, String) {
+/// A progress bar as its filled part, its empty track and the percentage, so
+/// callers can colour the fill and the track apart. The fill uses eighth
+/// blocks for sub-cell precision.
+fn download_progress(bytes: u64, total: Option<u64>, width: usize) -> (String, String, String) {
+    const PARTIAL: [&str; 7] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉"];
     let Some(total) = total.filter(|total| *total > 0) else {
-        return ("─".repeat(width), "   ?".into());
+        return (String::new(), "░".repeat(width), "   ?".into());
     };
     let percent = ((bytes as f64 / total as f64) * 100.0).clamp(0.0, 100.0);
-    let filled = ((percent / 100.0) * width as f64).round() as usize;
+    let eighths = ((percent / 100.0) * (width * 8) as f64).round() as usize;
+    let mut filled = "█".repeat(eighths / 8);
+    let mut cells = eighths / 8;
+    if !eighths.is_multiple_of(8) {
+        filled.push_str(PARTIAL[eighths % 8 - 1]);
+        cells += 1;
+    }
     (
-        format!(
-            "{}{}",
-            "━".repeat(filled),
-            "─".repeat(width.saturating_sub(filled))
-        ),
+        filled,
+        "░".repeat(width.saturating_sub(cells)),
         format!("{percent:3.0}%"),
     )
+}
+
+/// How often a running download records its progress and throughput.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The throughput of a transfer only when it is actually running: a rate that
+/// has not been refreshed recently belongs to a worker that died.
+const LIVE_RATE_SQL: &str =
+    "CASE WHEN status='downloading' AND updated_at >= datetime('now','-15 seconds') THEN rate END";
+
+/// "12.3 MiB/s · 4m left" for a running transfer.
+fn format_throughput(rate: u64, bytes: u64, total: Option<u64>) -> String {
+    let mut text = format!("{}/s", format_bytes(rate));
+    if let Some(total) = total
+        && rate > 0
+        && total > bytes
+    {
+        text.push_str(&format!(
+            " · {} left",
+            format_duration_short((total - bytes).div_ceil(rate))
+        ));
+    }
+    text
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -9042,6 +9249,7 @@ mod tests {
             status: "complete".into(),
             bytes: 1,
             total: Some(1),
+            rate: None,
         }
     }
 
@@ -9473,6 +9681,43 @@ jobs: []",
         assert_eq!(viewer_cell_size(clients, "@3"), None);
         // Older tmux without cell sizes reports empty or zero fields.
         assert_eq!(viewer_cell_size("100\t@1\t\t\n200\t@1\t0\t0\n", "@1"), None);
+    }
+
+    #[test]
+    fn progress_bar_cells() {
+        let cells = |(filled, track, _): (String, String, String)| {
+            (filled.chars().count(), track.chars().count())
+        };
+        assert_eq!(cells(download_progress(0, Some(100), 10)), (0, 10));
+        assert_eq!(cells(download_progress(50, Some(100), 10)), (5, 5));
+        assert_eq!(cells(download_progress(55, Some(100), 10)), (6, 4));
+        assert_eq!(cells(download_progress(100, Some(100), 10)), (10, 0));
+        assert_eq!(download_progress(55, Some(100), 10).0, "█████▌");
+        assert_eq!(download_progress(1, None, 4).1, "░░░░");
+    }
+
+    #[test]
+    fn job_state_follows_its_files() {
+        assert_eq!(job_display_state("success", ["queued"]), ("success", None));
+        assert_eq!(job_display_state("running", []), ("running", None));
+        assert_eq!(
+            job_display_state("running", ["queued", "complete"]),
+            ("queued", Some("1 queued".into()))
+        );
+        assert_eq!(
+            job_display_state("running", ["downloading", "queued", "queued"]),
+            ("downloading", Some("1 downloading · 2 queued".into()))
+        );
+    }
+
+    #[test]
+    fn throughput_with_eta() {
+        assert_eq!(format_throughput(1024 * 1024, 0, None), "1.0 MiB/s");
+        assert_eq!(
+            format_throughput(1024 * 1024, 0, Some(120 * 1024 * 1024)),
+            "1.0 MiB/s · 2m left"
+        );
+        assert_eq!(format_throughput(1024, 10, Some(10)), "1.0 KiB/s");
     }
 
     #[test]

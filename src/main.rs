@@ -68,10 +68,29 @@ const HELP_STYLES: clap::builder::Styles = {
         .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
 };
 
+/// Git revision from build.rs: empty on a tagged release, otherwise the short
+/// commit, with `-dirty` for uncommitted changes.
+const GIT_REVISION: &str = env!("JELLYSYNC_REVISION");
+
+/// `1.1.0` on a tagged release, `1.1.0-135343d` or `1.1.0-135343d-dirty` otherwise.
+fn version_string() -> &'static str {
+    static VERSION: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format_version(env!("CARGO_PKG_VERSION"), GIT_REVISION));
+    &VERSION
+}
+
+fn format_version(version: &str, revision: &str) -> String {
+    if revision.is_empty() {
+        version.to_string()
+    } else {
+        format!("{version}-{revision}")
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "jellysync",
-    version,
+    version = version_string(),
     about = "◆ jellysync · keep a local copy of your Jellyfin shows and movies",
     long_about = None,
     styles = HELP_STYLES,
@@ -121,6 +140,8 @@ enum Commands {
     },
     /// Print the parsed configuration
     Config,
+    /// Print the version (same as --version / -V)
+    Version,
     /// Start the jellysync user service
     Start,
     /// Stop the jellysync user service
@@ -7536,6 +7557,21 @@ async fn main() -> Result<()> {
     }
     match cli.command {
         Some(Commands::Status) => status(cli.json),
+        Some(Commands::Version) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    json!({
+                        "version": version_string(),
+                        "release": env!("CARGO_PKG_VERSION"),
+                        "revision": (!GIT_REVISION.is_empty()).then_some(GIT_REVISION),
+                    })
+                );
+            } else {
+                println!("jellysync {}", version_string());
+            }
+            Ok(())
+        }
         Some(Commands::Start) => systemctl("start", cli.json),
         Some(Commands::Stop) => systemctl("stop", cli.json),
         None | Some(Commands::Tui) if cli.json => bail!("--json is not supported with tui"),
@@ -7599,7 +7635,13 @@ async fn main() -> Result<()> {
                 }
                 Some(Commands::Worker { job }) => library_worker(&config, &job).await,
                 None
-                | Some(Commands::Status | Commands::Start | Commands::Stop | Commands::Tui) => {
+                | Some(
+                    Commands::Status
+                    | Commands::Start
+                    | Commands::Stop
+                    | Commands::Tui
+                    | Commands::Version,
+                ) => {
                     unreachable!()
                 }
             }
@@ -8404,5 +8446,15 @@ jobs:
         assert_eq!(fields, GLOBAL_FIELDS.len());
         assert!(rows.contains(&SettingsRow::Job("Silo".into())));
         assert_eq!(rows.last(), Some(&SettingsRow::OpenEditor));
+    }
+
+    #[test]
+    fn versions_look_like_git_describe() {
+        assert_eq!(format_version("1.1.0", ""), "1.1.0");
+        assert_eq!(format_version("1.1.0", "135343d"), "1.1.0-135343d");
+        assert_eq!(
+            format_version("1.1.0", "135343d-dirty"),
+            "1.1.0-135343d-dirty"
+        );
     }
 }

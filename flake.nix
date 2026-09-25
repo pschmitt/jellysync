@@ -435,7 +435,8 @@
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        version = "1.1.0";
+        # Single source of truth: the crate version.
+        inherit ((builtins.fromTOML (builtins.readFile ./Cargo.toml)).package) version;
         runtimeInputs = [
           pkgs.rsync
           pkgs.openssh
@@ -449,6 +450,9 @@
           inherit version;
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          # For --version (see build.rs): the source has no .git in the Nix build.
+          # Tags are not visible to flakes, so Nix builds always name the commit.
+          env.JELLYSYNC_GIT_REV = self.shortRev or self.dirtyShortRev or "";
           nativeBuildInputs = [ pkgs.makeWrapper ];
           postInstall = ''
             wrapProgram $out/bin/jellysync \

@@ -87,14 +87,14 @@ Jellysync includes a Home Manager module for automated synchronization with syst
         };
 
         jobs = {
-          pluribus = {
-            remote_dir = "$tv_shows/Pluribus";
-            local_dir = "$tv_shows/Pluribus";
+          "Pioneer One" = {
+            remote_dir = "$tv_shows/Pioneer One";
+            local_dir = "$tv_shows/Pioneer One";
           };
-          "Star Trek" = {
-            directory = "tv_shows";
+          "Night of the Living Dead" = {
+            directory = "movies";
           };
-          Andor = {
+          "The Long-Running Show" = {
             directory = "tv_shows";
             seasons = "latest-2";
           };
@@ -103,12 +103,12 @@ Jellysync includes a Home Manager module for automated synchronization with syst
 
       # Sync schedule (systemd timer format)
       schedule = "*-*-* 03:00:00";  # Daily at 3 AM
-      
+
       # Run missed jobs after system restart
       persistent = true;
 
       # Optional: sync only specific jobs
-      jobNames = [ "pluribus" "Star Trek" ];
+      jobNames = [ "Pioneer One" "Night of the Living Dead" ];
     };
   };
 }
@@ -223,6 +223,13 @@ remote build host (`rofl-13` by default, override with `just <recipe> host`):
 `just nix-check`; `just lint` runs the format checks, `statix`/`deadnix` and
 clippy, and `just check` runs everything.
 
+`just screenshot` retakes `docs/screenshot.png` on the build host (it needs
+Docker there): it starts a throwaway Jellyfin container holding only Creative
+Commons media, syncs it with a throwaway config and captures the TUI in a real
+kitty under a virtual X server. The default font is JetBrains Mono. To use a
+font that can't live in this repository, pass its family and a local font
+directory, e.g. `just screenshot rofl-13 "ComicCode Nerd Font" ~/fonts/comic-code`.
+
 ### Manual Installation
 
 Install the flake package with Nix, then copy `jellysync-config.sample.yaml` to `~/.config/jellysync/config.yaml` and configure it.
@@ -277,55 +284,54 @@ player: mpv # TUI player command; default is mpv
 file_manager: xdg-open # TUI `o` command; default is xdg-open, then gio open
 
 jobs:
-  # Sync all of pluribus
-  - name: pluribus
-    remote_dir: $tv_shows/Pluribus
-    local_dir: $tv_shows/Pluribus
+  # Sync all of Pioneer One (explicit paths)
+  - name: Pioneer One
+    remote_dir: $tv_shows/Pioneer One
+    local_dir: $tv_shows/Pioneer One
 
-  # Sync all of Star Trek (shorthand syntax)
-  - name: Star Trek
-    directory: tv_shows
+  # Sync a movie (shorthand syntax)
+  - name: Night of the Living Dead
+    directory: movies
 
-  # Sync season 1 of The Penguin
-  - name: The Penguin
+  # Sync season 1 into a custom folder
+  - name: The Long-Running Show
     remote_dir: "$tv_shows/$name/Season 1"
-    local_dir: "$tv_shows/The Penguin - Season 1"
+    local_dir: "$tv_shows/The Long-Running Show - Season 1"
 
-  # Sync seasons 1-10 of Andor (range)
-  - name: Andor
+  # Sync seasons 1-10 (range)
+  - name: Example Anthology
     directory: tv_shows
     seasons: "1-10"
 
   # Sync only episodes marked unplayed by this Jellyfin user
-  - name: South Park
+  - name: The Weekly Show
     directory: tv_shows
     seasons: latest-2
     unwatched: true
 
   # Sync the latest season
-  - name: Slow Horses
+  - name: Example Comedy
     directory: tv_shows
     seasons: latest
 
   # Sync season 13 and any later seasons
-  - name: American Horror Story
+  - name: Example Soap
     directory: tv_shows
     seasons: "13-9999"
 
-  # Sync specific seasons of Breaking Bad (list)
-  - name: "Breaking Bad"
+  # Sync specific seasons (list)
+  - name: Example Drama
     directory: tv_shows
     seasons: [1, 2, 5]
 
-  # Sync only latest season of The Paper
-  - name: "The Paper"
-    directory: tv_shows
-    seasons: "latest"
+  # Sync a Blender open movie
+  - name: Sintel
+    directory: movies
 
   # Sync using wildcards (resolves to first match)
-  - name: "The Paper (2025)"
-    remote_dir: "$tv_shows/The Paper*"
-    local_dir: "$tv_shows/The Paper (2025)"
+  - name: "Pioneer One (2010)"
+    remote_dir: "$tv_shows/Pioneer One*"
+    local_dir: "$tv_shows/Pioneer One (2010)"
 ```
 
 Jellyfin is the default `download.mode`. The HTTP downloader keeps interrupted data in `.partial` files and resumes from the saved byte offset with an HTTP Range request. If the server declines the range, Jellysync restarts that file from byte zero. `parallelism` defaults to two concurrent transfers.
@@ -412,7 +418,7 @@ library:
 
   # Include show name
   season_pattern: "$name - Season $season_number"
-  # Results: "Breaking Bad - Season 1", "Breaking Bad - Season 2"
+  # Results: "Pioneer One - Season 1", "Pioneer One - Season 2"
 
   # Short format
   season_pattern: "S$season_number"
@@ -549,7 +555,7 @@ The `episodes` option allows selective syncing of episodes within seasons:
 - `$tv_shows`, `$movies`, etc.: Replaced with directory mappings
 
 ```yaml
-- name: The Penguin
+- name: The Long-Running Show
   remote_dir: "$tv_shows/$name/Season 1"
   local_dir: "$tv_shows/$name - Season 1"
 ```
@@ -559,14 +565,14 @@ Remote paths support wildcards (`*` and `?`) for pattern matching. The first mat
 
 ```yaml
 # Explicit wildcard pattern
-- name: The Paper (2025)
-  remote_dir: "$tv_shows/The Paper*"  # Resolves to first match, e.g., "The Paper (2025)"
-  local_dir: "$tv_shows/The Paper (2025)"
+- name: Pioneer One (2010)
+  remote_dir: "$tv_shows/Pioneer One*"  # Resolves to first match, e.g., "Pioneer One (2010)"
+  local_dir: "$tv_shows/Pioneer One (2010)"
 
 # Wildcard flag (automatically adds *name* pattern)
-- name: The Paper
+- name: Pioneer One
   directory: tv_shows
-  wildcard: true  # Will match *The Paper* on remote
+  wildcard: true  # Will match *Pioneer One* on remote
 ```
 
 **5. Season and Episode Filtering:**
@@ -575,33 +581,33 @@ Combine season and episode filters for precise control:
 
 ```yaml
 # Sync episodes 1-5 of season 1
-- name: The Office
+- name: Example Sitcom
   directory: tv_shows
   seasons: "1"
   episodes: "1-5"
 
 # Sync latest episode from seasons 1 and 2
-- name: Friends
+- name: Example Comedy
   directory: tv_shows
   seasons: [1, 2]
   episodes: "latest"
 
 # Sync latest 3 episodes from latest 2 seasons
-- name: Modern Family
+- name: The Long-Running Show
   directory: tv_shows
   seasons: "latest-2"
   episodes: "latest-3"
 
 # Sync specific episodes from latest season
-- name: Seinfeld
+- name: Example Drama
   directory: tv_shows
   seasons: "latest"
   episodes: [1, 2, 10]
 
 # Episodes without seasons (single directory)
-- name: Stand-up Special
-  remote_dir: "$movies/Stand-up Special"
-  local_dir: "$movies/Stand-up Special"
+- name: Open Movie Collection
+  remote_dir: "$movies/Open Movie Collection"
+  local_dir: "$movies/Open Movie Collection"
   episodes: "1-3"
 ```
 
@@ -610,8 +616,8 @@ Combine season and episode filters for precise control:
 ```bash
 jellysync --help
 jellysync download
-jellysync download pluribus
-jellysync download "Star Trek" "The Penguin"
+jellysync download "Pioneer One"
+jellysync download "Pioneer One" Sintel
 jellysync status
 jellysync tui
 jellysync prune
@@ -685,7 +691,7 @@ configuration file and then merges the overlay on top of it, if the overlay exis
 ```yaml
 # ~/.local/state/jellysync/config.yaml
 jobs:
-  - name: Fallout
+  - name: Pioneer One
     seasons: latest-2
     unwatched: true
 ```
@@ -721,12 +727,12 @@ The Rust tool uses these rsync options:
 
 ### Sync Everything
 ```bash
-./jellysync
+jellysync download
 ```
 
 ### Sync One Show
 ```bash
-./jellysync "Star Trek"
+jellysync download "Pioneer One"
 ```
 
 ### Preview Changes
@@ -736,7 +742,7 @@ jellysync prune
 
 ### Sync Multiple Specific Jobs
 ```bash
-jellysync download pluribus "The Penguin"
+jellysync download "Pioneer One" Sintel "Big Buck Bunny"
 ```
 
 ## Requirements

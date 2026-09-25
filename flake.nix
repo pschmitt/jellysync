@@ -282,14 +282,14 @@
                         type = types.nullOr types.str;
                         default = null;
                         description = "Remote directory path (supports templating with $var).";
-                        example = "$tv_shows/Pluribus";
+                        example = "$tv_shows/Pioneer One";
                       };
 
                       local_dir = mkOption {
                         type = types.nullOr types.str;
                         default = null;
                         description = "Local directory path (supports templating with $var).";
-                        example = "$tv_shows/Pluribus";
+                        example = "$tv_shows/Pioneer One";
                       };
 
                       directory = mkOption {
@@ -346,12 +346,12 @@
                 default = { };
                 description = "Sync jobs configuration (attrset where key is the job name).";
                 example = {
-                  pluribus = {
-                    remote_dir = "$tv_shows/Pluribus";
-                    local_dir = "$tv_shows/Pluribus";
+                  "Pioneer One" = {
+                    remote_dir = "$tv_shows/Pioneer One";
+                    local_dir = "$tv_shows/Pioneer One";
                   };
-                  "Star Trek" = {
-                    directory = "tv_shows";
+                  "Night of the Living Dead" = {
+                    directory = "movies";
                   };
                 };
               };
@@ -375,8 +375,8 @@
               default = [ ];
               description = "List of specific job names to sync. If empty, all jobs are synced.";
               example = [
-                "pluribus"
-                "Star Trek"
+                "Pioneer One"
+                "Night of the Living Dead"
               ];
             };
           };

@@ -29,7 +29,7 @@ library:
   # Default: "Season $season_number"
   season_pattern: "Season $season_number"
   # Examples:
-  # season_pattern: "$name - Season $season_number"  # "Breaking Bad - Season 1"
+  # season_pattern: "$name - Season $season_number"  # "Pioneer One - Season 1"
   # season_pattern: "S$season_number"                # "S1"
 
   # Episode file pattern
@@ -66,82 +66,81 @@ player: mpv
 # file_manager: nautilus
 
 jobs:
-  # Sync all of pluribus
-  - name: pluribus
-    remote_dir: $tv_shows/Pluribus
-    local_dir: $tv_shows/Pluribus
+  # Example titles: Pioneer One (CC BY-NC-SA), the Blender open movies
+  # (CC BY) and Night of the Living Dead (public domain); the others are
+  # made-up names for the filter examples.
 
-  # Sync all of Star Trek using shorthand syntax
-  - name: Star Trek
-    directory: tv_shows
+  # Sync all of Pioneer One (explicit paths)
+  - name: Pioneer One
+    remote_dir: $tv_shows/Pioneer One
+    local_dir: $tv_shows/Pioneer One
 
-  # Sync season 1 of The Penguin
-  - name: The Penguin
+  # Sync a movie using shorthand syntax
+  - name: Night of the Living Dead
+    directory: movies
+
+  # Sync season 1 into a custom folder
+  - name: The Long-Running Show
     remote_dir: "$tv_shows/$name/Season 1"
-    local_dir: "$tv_shows/The Penguin - Season 1"
+    local_dir: "$tv_shows/The Long-Running Show - Season 1"
 
-  - name: Andor
+  - name: Example Anthology
     directory: tv_shows
     seasons: "1-10" # seasons 1 to 10 (string with range)
 
-  - name: South Park
+  - name: The Weekly Show
     directory: tv_shows
     seasons: latest-2
     unwatched: true # only episodes marked unplayed by Jellyfin
 
-  - name: Slow Horses
+  - name: Example Comedy
     directory: tv_shows
     seasons: latest
 
-  - name: American Horror Story
+  - name: Example Soap
     directory: tv_shows
     seasons: "13-9999" # season 13 and later
 
-  - name: "Breaking Bad"
+  - name: Example Drama
     directory: tv_shows
     seasons: [1, 2, 5] # specific seasons (list)
 
-  - name: "The Paper"
-    directory: tv_shows
-    seasons: "latest" # only the latest season
-
-  - name: "Modern Family"
+  - name: Example Sitcom
     directory: tv_shows
     seasons: "latest-3" # latest 3 seasons
 
   # Episode filtering examples
-  - name: "The Office"
+  - name: Example Cartoon
     directory: tv_shows
     seasons: "1"
     episodes: "1-5" # episodes 1 to 5 of season 1
 
-  - name: "Friends"
+  - name: Example Quiz Show
     directory: tv_shows
     seasons: [1, 2]
     episodes: "latest" # only the latest episode from seasons 1 and 2
 
-  - name: "Brooklyn Nine-Nine"
+  - name: Example Talk Show
     directory: tv_shows
     seasons: "latest-2"
     episodes: "latest-5" # latest 5 episodes from the latest 2 seasons
 
-  - name: "Seinfeld"
+  - name: Example Documentary Series
     directory: tv_shows
     seasons: "latest"
     episodes: [1, 2, 10] # specific episodes from the latest season
 
-  # Episodes without seasons (for movies or single-directory shows)
-  - name: "Stand-up Special"
-    remote_dir: "$movies/Stand-up Special"
-    local_dir: "$movies/Stand-up Special"
-    episodes: "1-3" # first 3 episodes/parts
+  # A Blender open movie; disabled jobs are skipped by `jellysync download`
+  - name: Sintel
+    directory: movies
+    enabled: false
 
   # Sync using wildcards (resolves to first match)
-  - name: "The Paper (2025)"
-    remote_dir: "$tv_shows/The Paper*"
-    local_dir: "$tv_shows/The Paper (2025)"
+  - name: "Pioneer One (2010)"
+    remote_dir: "$tv_shows/Pioneer One*"
+    local_dir: "$tv_shows/Pioneer One (2010)"
 
   # Sync with wildcard flag (adds *name* pattern)
-  - name: The Paper
-    directory: tv_shows
-    wildcard: true # will match *The Paper* pattern
+  - name: Big Buck Bunny
+    directory: movies
+    wildcard: true # will match *Big Buck Bunny* pattern

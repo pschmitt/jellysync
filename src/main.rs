@@ -1466,7 +1466,7 @@ struct UserData {
 /// Cheap unauthenticated reachability check used by the TUI's offline mode.
 async fn jellyfin_reachable(config: &Jellyfin) -> bool {
     let Ok(client) = HttpClient::builder()
-        .user_agent("jellysync/1.1.0")
+        .user_agent(concat!("jellysync/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(3))
         .build()
     else {
@@ -1482,10 +1482,37 @@ async fn jellyfin_reachable(config: &Jellyfin) -> bool {
         .is_ok_and(|response| response.status().is_success())
 }
 
+/// Log in to Jellyfin, reusing this process's recent session.
+///
+/// Password logins all use the same device id, and Jellyfin revokes a device's
+/// previous token when it logs in again, so jobs syncing in parallel used to
+/// invalidate each other's sessions (401 mid-download). Logins are serialized
+/// and shared per server and account; sessions are renewed after a while so a
+/// long-running TUI recovers when another process (e.g. the timer) took over.
 async fn jellyfin_login(config: &Jellyfin) -> Result<JellyfinApi> {
+    const SESSION_REUSE: Duration = Duration::from_secs(300);
+    static SESSIONS: std::sync::LazyLock<
+        tokio::sync::Mutex<HashMap<String, (Instant, JellyfinApi)>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let key = format!(
+        "{}\n{:?}\n{:?}\n{:?}\n{:?}",
+        config.base_url, config.username, config.user_id, config.api_key_file, config.password_file
+    );
+    let mut sessions = SESSIONS.lock().await;
+    if let Some((at, api)) = sessions.get(&key)
+        && at.elapsed() < SESSION_REUSE
+    {
+        return Ok(api.clone());
+    }
+    let api = jellyfin_login_uncached(config).await?;
+    sessions.insert(key, (Instant::now(), api.clone()));
+    Ok(api)
+}
+
+async fn jellyfin_login_uncached(config: &Jellyfin) -> Result<JellyfinApi> {
     let base = config.base_url.trim_end_matches('/').to_string();
     let client = HttpClient::builder()
-        .user_agent("jellysync/1.1.0")
+        .user_agent(concat!("jellysync/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(Duration::from_secs(60))
         .build()?;
@@ -1539,7 +1566,11 @@ async fn jellyfin_login(config: &Jellyfin) -> Result<JellyfinApi> {
             .context("password authentication requires jellyfin.username")?;
         let password = std::fs::read_to_string(password_file)
             .with_context(|| format!("read Jellyfin password file {password_file}"))?;
-        let authorization = r#"MediaBrowser Client="jellysync", Device="jellysync", DeviceId="jellysync", Version="1.1.0""#;
+        let authorization = concat!(
+            r#"MediaBrowser Client="jellysync", Device="jellysync", DeviceId="jellysync", Version=""#,
+            env!("CARGO_PKG_VERSION"),
+            '"'
+        );
         let response = client
             .post(format!("{base}/Users/AuthenticateByName"))
             .header("Authorization", authorization)
@@ -1564,7 +1595,8 @@ async fn jellyfin_login(config: &Jellyfin) -> Result<JellyfinApi> {
 
 fn jellyfin_authorization(token: &str) -> String {
     format!(
-        r#"MediaBrowser Client="jellysync", Device="jellysync", DeviceId="jellysync", Version="1.1.0", Token="{token}""#
+        r#"MediaBrowser Client="jellysync", Device="jellysync", DeviceId="jellysync", Version="{}", Token="{token}""#,
+        env!("CARGO_PKG_VERSION")
     )
 }
 
@@ -4570,12 +4602,15 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     .fg(Color::White)
                     .bg(Color::Rgb(38, 44, 66))
                     .add_modifier(Modifier::BOLD);
+                // The unfocused list keeps its selection visible, but only as a
+                // faint gray band so the focused list stays obvious.
+                let unfocused_style = Style::default().bg(Color::Rgb(46, 50, 58));
                 let job_list = List::new(entries)
                     .block(jobs_block)
                     .highlight_style(if !download_focus {
                         list_style
                     } else {
-                        Style::default()
+                        unfocused_style
                     })
                     .highlight_symbol("▌ ");
                 let download_list = List::new(download_rows)
@@ -4583,7 +4618,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     .highlight_style(if download_focus {
                         list_style
                     } else {
-                        Style::default()
+                        unfocused_style
                     })
                     .highlight_symbol("▌ ");
                 frame.render_stateful_widget(job_list, jobs_area, &mut jobs_state);
@@ -5069,10 +5104,8 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                         truncate(message, area.width.saturating_sub(2) as usize)
                                     )
                                 })
-                                .unwrap_or_else(|| {
-                                    "  Downloads follow the selected job; clear a file, season, or show."
-                                        .into()
-                                }),
+                                // Empty without a notice; the line stays reserved for them.
+                                .unwrap_or_default(),
                             Style::default()
                                 .fg(sync_notice
                                     .as_ref()

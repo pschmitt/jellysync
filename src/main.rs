@@ -4123,17 +4123,14 @@ fn status(json_output: bool, config: Option<&Config>) -> Result<()> {
                 Some(width) => truncate_near_end(&filename, width.saturating_sub(8).max(20)),
                 None => filename.into_owned(),
             };
+            // The icon carries the state; queued files have no progress yet.
             println!("      {} {}", state_icon(state).with(state_color), filename);
-            if state == "queued" {
-                // Nothing transferred yet: no progress bar or unknown percentage.
-                println!("        {}", state.to_uppercase().with(state_color));
-            } else {
+            if state != "queued" {
                 println!(
-                    "        {}{} {}  {}  {}",
+                    "        {}{} {}  {}",
                     filled.with(state_color),
                     track.with(TerminalColor::DarkGrey),
                     percent.with(state_color),
-                    state.to_uppercase().with(state_color),
                     rate.map(|rate| format_throughput(rate, *bytes, *total))
                         .unwrap_or_default()
                         .with(TerminalColor::Grey)
@@ -4190,10 +4187,9 @@ fn status(json_output: bool, config: Option<&Config>) -> Result<()> {
         let icon = state_icon(state);
         // Pad before styling: styled text ignores the width.
         println!(
-            "  {} {} {} {}",
+            "  {} {} {}",
             icon.with(color),
             format!("{:<28}", truncate_near_end(name, 28)).bold(),
-            state.to_uppercase().with(color),
             time.as_str().dim()
         );
         if let Some(summary) = configured_summary(name).filter(|summary| !summary.is_empty()) {
@@ -5563,7 +5559,6 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         ]),
                         Line::from(vec![
                             Span::raw(POSTER_INDENT),
-                            Span::styled(format!("  {}", state.to_uppercase()), state_style(state)),
                             Span::styled(
                                 format!("  {}", format_bytes(total_size)),
                                 Style::default().fg(Color::Gray),
@@ -5734,7 +5729,6 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     let ignored = entry.status == "ignored";
                     let mut subtitle = if ignored {
                         vec![
-                            Span::styled(format!("  {} ignored by sync", icon::CANCEL), Style::default().fg(Color::DarkGray)),
                             Span::styled(
                                 if entry.path.exists() { "  file kept · I to sync again" } else { "  I to sync again" },
                                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
@@ -5742,12 +5736,10 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         ]
                     } else if completed {
                         vec![
-                            Span::styled(format!("  {} downloaded", icon::CHECK), Style::default().fg(Color::Green)),
                             Span::styled(format!("  {size}"), Style::default().fg(Color::Gray)),
                         ]
                     } else {
                         let mut spans = vec![
-                            Span::styled(format!("  {}", entry.status), state_style(&entry.status)),
                             Span::styled(format!("  {size}"), Style::default().fg(Color::Gray)),
                         ];
                         if let Some(rate) = entry.rate {

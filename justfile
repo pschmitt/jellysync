@@ -65,6 +65,32 @@ nix-check host=default-host:
 # Run the full validation suite.
 check: lint test nix-build
 
+# Retake docs/screenshot.png on a remote host with Docker: a throwaway Jellyfin
+# with Creative Commons media, the TUI in a real kitty (see scripts/screenshot.sh).
+# font_dir is an optional local font directory for font_family (e.g. a non-free
+# font that cannot live in this repository).
+screenshot host=default-host font_family="JetBrains Mono" font_dir="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    host="{{ host }}"
+    remote_dir="$(ssh -- "$host" "mkdir -p {{ remote-build-base }} && mktemp -d {{ remote-build-base }}/screenshot.XXXXXX")"
+    cleanup() {
+      ssh -- "$host" rm -rf -- "$remote_dir"
+    }
+    trap cleanup EXIT
+    rsync -az --delete --exclude target --exclude result --exclude .git --exclude .screenshot ./ "$host:$remote_dir/"
+    font_env=""
+    if [[ -n "{{ font_dir }}" ]]
+    then
+      ssh -- "$host" mkdir -p "$remote_dir/.screenshot/fonts"
+      # Nix store fonts are read-only; keep the copy removable.
+      rsync -a --chmod=u+w "{{ font_dir }}/" "$host:$remote_dir/.screenshot/fonts/"
+      font_env="FONT_DIR=$remote_dir/.screenshot/fonts"
+    fi
+    ssh -- "$host" "cd '$remote_dir' && $font_env FONT_FAMILY='{{ font_family }}' scripts/screenshot.sh"
+    rsync -az "$host:$remote_dir/docs/screenshot.png" docs/screenshot.png
+    echo "Updated docs/screenshot.png"
+
 # Remove Cargo's local build output.
 clean:
     rm -rf target result

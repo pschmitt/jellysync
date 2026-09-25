@@ -14,3 +14,6 @@ jellysync.yaml
 
 # Cargo build output
 target/
+
+# just screenshot work directory
+.screenshot/

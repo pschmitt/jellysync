@@ -2009,9 +2009,9 @@ type JobPosterCatalogTask =
 // cells wide. The indent leaves one blank column between poster and text.
 const POSTER_WIDTH: u16 = 6;
 const POSTER_INDENT: &str = "       ";
-/// Lines per job in the Jobs list: the four-row poster (beside three lines of
-/// text) with one blank line above and below, so the selection band centres it.
-const JOB_ROW_HEIGHT: u16 = 6;
+/// Lines per job in the Jobs list: three lines of text and a blank one, so the
+/// four-row poster fills the selection band.
+const JOB_ROW_HEIGHT: u16 = 4;
 
 struct ExploreState {
     api: Option<JellyfinApi>,
@@ -5581,7 +5581,6 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         })
                         .count();
                     ListItem::new(vec![
-                        Line::from(""),
                         Line::from(vec![
                             Span::raw(POSTER_INDENT),
                             {
@@ -5625,7 +5624,6 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             ),
                         ]),
                         Line::from(Span::raw(POSTER_INDENT)),
-                        Line::from(""),
                     ])
                 })
                 .collect();
@@ -6084,8 +6082,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 if jobs_area.width >= 20 {
                     let offset = jobs_state.offset();
                     for (visible_index, job) in jobs.iter().skip(offset).enumerate() {
-                        // Below the list border and the row's blank first line.
-                        let y = jobs_area.y + 2 + (visible_index as u16 * JOB_ROW_HEIGHT);
+                        let y = jobs_area.y + 1 + (visible_index as u16 * JOB_ROW_HEIGHT);
                         if y + 4 > jobs_area.y + jobs_area.height.saturating_sub(1) {
                             break;
                         }

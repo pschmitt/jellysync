@@ -4832,6 +4832,8 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
         // Filter for the Jobs list; typing goes into it while `job_search_input`.
         let mut job_search = String::new();
         let mut job_search_input = false;
+        // The first g of a vim-style gg (jump to the top).
+        let mut last_g: Option<Instant> = None;
         let mut show_job_config = false;
         let mut editor = JobEditor::default();
         let mut settings: Option<SettingsScreen> = None;
@@ -6874,7 +6876,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     );
                 }
                 if show_help {
-                    let help_popup = centered_rect(84, 36, area);
+                    let help_popup = centered_rect(84, 37, area);
                     let help_lines = vec![
                         Line::from(Span::styled(
                             "Main view",
@@ -6882,6 +6884,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         )),
                         Line::from("  ↑/↓ or click     select a job or download"),
                         Line::from("  PgUp/PgDn Home/End  jump through the list"),
+                        Line::from("  gg / G            jump to the first / last item"),
                         Line::from("  Tab / ← / →       switch focus"),
                         Line::from("  Mouse drag        resize Jobs/Files split (wide terminals)"),
                         Line::from("                    and the Details/Files split"),
@@ -7769,7 +7772,22 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     }
                 } else {
                     last_ctrl_c = None;
-                    match key.code {
+                    // vim-style jumps: G to the last item, gg to the first.
+                    let jump = match key.code {
+                        _ if job_search_input => None,
+                        KeyCode::Char('G') => Some(KeyCode::End),
+                        KeyCode::Char('g') => {
+                            if last_g.take().is_some_and(|at| at.elapsed() < Duration::from_millis(600)) {
+                                Some(KeyCode::Home)
+                            } else {
+                                last_g = Some(Instant::now());
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    let code = jump.unwrap_or(key.code);
+                    match code {
                         // While searching, text goes to the job filter; arrows still move.
                         KeyCode::Char(c) if job_search_input && !key.modifiers.contains(KeyModifiers::CONTROL) => {
                             job_search.push(c);
@@ -7905,10 +7923,10 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
                             if download_focus {
                                 let page = usize::from(downloads_area.height.saturating_sub(2)) / file_row_height(&FileRow::File(0));
-                                selected_download = list_jump(key.code, selected_download, downloads.len(), page);
+                                selected_download = list_jump(code, selected_download, downloads.len(), page);
                             } else {
-                                let page = usize::from(jobs_area.height.saturating_sub(2)) / 4;
-                                let next = list_jump(key.code, selected, jobs.len(), page);
+                                let page = usize::from(jobs_area.height.saturating_sub(2)) / usize::from(JOB_ROW_HEIGHT);
+                                let next = list_jump(code, selected, jobs.len(), page);
                                 if next != selected {
                                     selected = next;
                                     selected_download = 0;

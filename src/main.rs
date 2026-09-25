@@ -4123,7 +4123,7 @@ fn status(json_output: bool, config: Option<&Config>) -> Result<()> {
                 Some(width) => truncate_near_end(&filename, width.saturating_sub(8).max(20)),
                 None => filename.into_owned(),
             };
-            println!("      {} {}", "↳".with(state_color), filename);
+            println!("      {} {}", state_icon(state).with(state_color), filename);
             if state == "queued" {
                 // Nothing transferred yet: no progress bar or unknown percentage.
                 println!("        {}", state.to_uppercase().with(state_color));
@@ -4176,8 +4176,7 @@ fn status(json_output: bool, config: Option<&Config>) -> Result<()> {
                 .flatten()
                 .copied(),
         );
-<<<<<<< Updated upstream
-        let message = summary.or(message);
+        let message = summary.or(message.clone());
         let color = match state.to_ascii_lowercase().as_str() {
             "success" | "complete" | "completed" => TerminalColor::Green,
             "running" => TerminalColor::Yellow,
@@ -4189,20 +4188,7 @@ fn status(json_output: bool, config: Option<&Config>) -> Result<()> {
             _ => TerminalColor::DarkGrey,
         };
         let icon = state_icon(state);
-=======
-        let message = summary.or(message.clone());
-        let (icon, color) = match state.to_ascii_lowercase().as_str() {
-            "success" | "complete" | "completed" => ("●", TerminalColor::Green),
-            "running" => ("◐", TerminalColor::Yellow),
-            "downloading" => ("◐", TerminalColor::Cyan),
-            "queued" => ("◌", TerminalColor::Blue),
-            "paused" => ("⏸", TerminalColor::DarkGrey),
-            "failed" | "error" | "skipped" => ("✕", TerminalColor::Red),
-            "interrupted" | "cleared" => ("◆", TerminalColor::Magenta),
-            _ => ("○", TerminalColor::DarkGrey),
-        };
         // Pad before styling: styled text ignores the width.
->>>>>>> Stashed changes
         println!(
             "  {} {} {} {}",
             icon.with(color),
@@ -4226,46 +4212,11 @@ fn status(json_output: bool, config: Option<&Config>) -> Result<()> {
     }
     if let Some(rate) = total_rate {
         println!(
-<<<<<<< Updated upstream
-            "  {} {} {}",
-            state_icon(&state).with(state_color),
-            filename.bold(),
-            label.with(TerminalColor::DarkGrey)
-        );
-        if state == "queued" {
-            // Nothing transferred yet: no progress bar or unknown percentage.
-            println!("    {}", state.to_uppercase().with(state_color));
-        } else {
-            println!(
-                "    {}{} {}  {}  {}",
-                filled.with(state_color),
-                track.with(TerminalColor::DarkGrey),
-                percent.with(state_color),
-                state.to_uppercase().with(state_color),
-                rate.map(|rate| format_throughput(rate, bytes, total))
-                    .unwrap_or_default()
-                    .with(TerminalColor::Grey)
-            );
-        }
-        if let Some(rate) = rate {
-            total_rate = Some(total_rate.unwrap_or(0) + rate);
-        }
-    }
-    if download_count == 0 {
-        println!(
-            "  {}",
-            "Nothing is downloading".with(TerminalColor::DarkGrey)
-        );
-    } else if let Some(rate) = total_rate {
-        println!(
-            "  {} {}",
-            format!("{} total", icon::DOWNLOAD).with(TerminalColor::DarkGrey),
-            format!("{}/s", format_bytes(rate)).with(TerminalColor::Grey)
-=======
             "\n{} {}",
-            "DOWNLOADING".with(TerminalColor::Magenta).bold(),
+            format!("{} DOWNLOADING", icon::DOWNLOAD)
+                .with(TerminalColor::Magenta)
+                .bold(),
             format!("{}/s in total", format_bytes(rate)).with(TerminalColor::Grey)
->>>>>>> Stashed changes
         );
     }
     if let Ok(output) = std::process::Command::new("systemctl")

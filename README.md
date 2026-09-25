@@ -481,6 +481,7 @@ Each job defines a sync operation.
 | `episodes` | No | string or array | Episode filter: `"latest"`, `"1-10"`, or `[1, 2, 3]` |
 | `wildcard` | No | boolean | If `true`, adds `*name*` pattern to remote path |
 | `unwatched` | No | boolean | If `true`, syncs episodes marked unplayed by the configured Jellyfin user |
+| `enabled` | No | boolean | `false` skips the job when syncing all jobs; it still runs when named (default `true`) |
 
 **Season Filtering:**
 
@@ -641,10 +642,25 @@ JELLYSYNC_CONFIG=~/my-config.yaml jellysync download
 
 ### Settings overlay (editing from the TUI)
 
-Press `i` on a job in the TUI to edit its sync settings: Jellyfin name,
-seasons, episodes and unwatched-only (plus wildcard in rsync mode). Use `↑`/`↓`
-to pick a setting, `Enter` to edit or toggle it, `Del` to clear it and `r` to
-reset it. Invalid filters are rejected before anything is saved.
+Press `,` in the TUI for the Settings screen:
+
+- **General, Jellyfin, remote, local**: download mode, parallel transfers,
+  player, file manager, Jellyfin URL, user, API key or password file, SSH host,
+  user, port and root, the download root, season folder pattern and rsync flags.
+  `Enter` edits a field (or cycles a choice), `Del` clears it, and `r` resets it
+  to the configuration file's value.
+- **Jobs**: `Enter` opens a job's sync settings, `Space` enables or disables it
+  (disabled jobs are skipped when syncing all jobs but still run when named),
+  `d` deletes it (downloaded files stay on disk), and `a` adds a job in one of
+  the library folders.
+- **Everything else**, such as the `directories` maps: `E` (also in the main
+  view) opens the file in `$VISUAL`/`$EDITOR` (default `vi`) and reloads it
+  when the editor exits.
+
+`i` on a job edits the same sync settings directly: enabled, Jellyfin name,
+seasons, episodes and unwatched-only (plus wildcard in rsync mode). Invalid
+values, such as a bad filter or a cleared required option, are rejected before
+anything is saved.
 
 Edits go into the configuration file when it is writable. When it is read-only,
 as with the Nix store symlink the Home Manager module creates, they go into a
@@ -668,9 +684,11 @@ jobs:
 ```
 
 Settings set by the overlay show as *overridden* in the TUI; `r` removes the
-override so the Nix-managed value applies again. Delete the file to make the
-Nix configuration fully authoritative again. `jellysync status` shows the
-overlay's path when one exists.
+override so the Nix-managed value applies again. Jobs from a read-only config
+cannot be deleted, only disabled; jobs added in the TUI live in the overlay and
+can be deleted. `E` opens the overlay when the config is read-only. Delete the
+overlay to make the Nix configuration fully authoritative again.
+`jellysync status` shows the overlay's path when one exists.
 
 ## Environment Variables
 

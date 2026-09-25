@@ -209,6 +209,15 @@ struct Job {
     episodes: Option<serde_yaml::Value>,
     wildcard: Option<bool>,
     unwatched: Option<bool>,
+    /// false skips the job when syncing all jobs; it can still be synced by name.
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+impl Job {
+    fn enabled(&self) -> bool {
+        self.enabled != Some(false)
+    }
 }
 impl Default for Download {
     fn default() -> Self {
@@ -395,6 +404,12 @@ fn job_settings(mode: &str) -> Vec<JobSetting> {
             help: "per season: all, latest, latest-3, 1-6 or 1,2",
         },
         JobSetting {
+            key: "enabled",
+            label: "Enabled",
+            kind: SettingKind::Toggle,
+            help: "disabled jobs are skipped when syncing all jobs",
+        },
+        JobSetting {
             key: "unwatched",
             label: "Unwatched only",
             kind: SettingKind::Toggle,
@@ -447,6 +462,7 @@ fn job_setting_bool(job: &Job, key: &str) -> Option<bool> {
     match key {
         "unwatched" => job.unwatched,
         "wildcard" => job.wildcard,
+        "enabled" => Some(job.enabled()),
         _ => None,
     }
 }
@@ -473,6 +489,343 @@ fn parse_setting_input(kind: SettingKind, input: &str) -> Result<SettingChange> 
             _ => bail!("expected yes or no"),
         },
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FieldKind {
+    Text,
+    Number,
+    /// Enter cycles through the choices.
+    Choice(&'static [&'static str]),
+    /// Whitespace-separated words, stored as a YAML list.
+    List,
+}
+
+/// A top-level config option the Settings screen edits natively.
+struct GlobalField {
+    section: &'static str,
+    path: &'static [&'static str],
+    label: &'static str,
+    kind: FieldKind,
+    /// Shown when the option is unset.
+    default: &'static str,
+    help: &'static str,
+}
+
+const GLOBAL_FIELDS: &[GlobalField] = &[
+    GlobalField {
+        section: "General",
+        path: &["download", "mode"],
+        label: "Download mode",
+        kind: FieldKind::Choice(&["jellyfin", "rsync"]),
+        default: "jellyfin",
+        help: "jellyfin: HTTP downloads with resume; rsync: over SSH (no filters)",
+    },
+    GlobalField {
+        section: "General",
+        path: &["parallelism"],
+        label: "Parallel transfers",
+        kind: FieldKind::Number,
+        default: "2",
+        help: "how many files download at the same time",
+    },
+    GlobalField {
+        section: "General",
+        path: &["player"],
+        label: "Player",
+        kind: FieldKind::Text,
+        default: "mpv",
+        help: "command used to play files (p)",
+    },
+    GlobalField {
+        section: "General",
+        path: &["file_manager"],
+        label: "File manager",
+        kind: FieldKind::Text,
+        default: "xdg-open",
+        help: "command used to open download folders (o)",
+    },
+    GlobalField {
+        section: "Jellyfin",
+        path: &["jellyfin", "base_url"],
+        label: "Server URL",
+        kind: FieldKind::Text,
+        default: "",
+        help: "e.g. https://jellyfin.example.com",
+    },
+    GlobalField {
+        section: "Jellyfin",
+        path: &["jellyfin", "username"],
+        label: "Username",
+        kind: FieldKind::Text,
+        default: "",
+        help: "Jellyfin user whose library and watched state are used",
+    },
+    GlobalField {
+        section: "Jellyfin",
+        path: &["jellyfin", "api_key_file"],
+        label: "API key file",
+        kind: FieldKind::Text,
+        default: "",
+        help: "path to a file holding the API key (never the key itself)",
+    },
+    GlobalField {
+        section: "Jellyfin",
+        path: &["jellyfin", "password_file"],
+        label: "Password file",
+        kind: FieldKind::Text,
+        default: "",
+        help: "path to a file holding the password, instead of an API key",
+    },
+    GlobalField {
+        section: "Jellyfin",
+        path: &["jellyfin", "user_id"],
+        label: "User ID",
+        kind: FieldKind::Text,
+        default: "",
+        help: "optional; looked up from the username when unset",
+    },
+    GlobalField {
+        section: "Remote (rsync)",
+        path: &["remote", "hostname"],
+        label: "Host",
+        kind: FieldKind::Text,
+        default: "",
+        help: "SSH host serving the media",
+    },
+    GlobalField {
+        section: "Remote (rsync)",
+        path: &["remote", "username"],
+        label: "User",
+        kind: FieldKind::Text,
+        default: "",
+        help: "SSH user",
+    },
+    GlobalField {
+        section: "Remote (rsync)",
+        path: &["remote", "port"],
+        label: "Port",
+        kind: FieldKind::Number,
+        default: "22",
+        help: "SSH port",
+    },
+    GlobalField {
+        section: "Remote (rsync)",
+        path: &["remote", "root"],
+        label: "Root",
+        kind: FieldKind::Text,
+        default: "",
+        help: "media root on the remote host",
+    },
+    GlobalField {
+        section: "Local",
+        path: &["local", "root"],
+        label: "Download root",
+        kind: FieldKind::Text,
+        default: "",
+        help: "where downloads go (~ and $HOME are expanded)",
+    },
+    GlobalField {
+        section: "Local",
+        path: &["library", "season_pattern"],
+        label: "Season folders",
+        kind: FieldKind::Text,
+        default: "Season $season_number",
+        help: "season folder name; $season_number and $name are replaced",
+    },
+    GlobalField {
+        section: "Local",
+        path: &["rsync", "flags"],
+        label: "Rsync flags",
+        kind: FieldKind::List,
+        default: "-a -v -z",
+        help: "space-separated rsync options",
+    },
+];
+
+/// How a config value reads in the Settings screen.
+fn field_display(value: Option<&serde_yaml::Value>) -> Option<String> {
+    match value? {
+        serde_yaml::Value::Null => None,
+        serde_yaml::Value::String(text) => Some(text.clone()),
+        serde_yaml::Value::Sequence(items) => Some(
+            items
+                .iter()
+                .filter_map(|item| field_display(Some(item)))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        other => Some(
+            serde_yaml::to_string(other)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        ),
+    }
+}
+
+/// Turn what was typed for a global field into a change; empty input clears it.
+fn parse_field_input(kind: FieldKind, input: &str) -> Result<SettingChange> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(SettingChange::Clear);
+    }
+    Ok(SettingChange::Set(match kind {
+        FieldKind::Number => serde_yaml::Value::from(
+            input
+                .parse::<u64>()
+                .with_context(|| format!("'{input}' is not a number"))?,
+        ),
+        FieldKind::List => serde_yaml::Value::Sequence(
+            input
+                .split_whitespace()
+                .map(serde_yaml::Value::from)
+                .collect(),
+        ),
+        FieldKind::Text | FieldKind::Choice(_) => input.into(),
+    }))
+}
+
+/// A row of the Settings screen.
+#[derive(Clone, Debug, PartialEq)]
+enum SettingsRow {
+    Header(String),
+    /// Index into [GLOBAL_FIELDS].
+    Field(usize),
+    Job(String),
+    AddJob,
+    OpenEditor,
+}
+
+impl SettingsRow {
+    fn selectable(&self) -> bool {
+        !matches!(self, SettingsRow::Header(_))
+    }
+}
+
+fn settings_rows(jobs: &[Job]) -> Vec<SettingsRow> {
+    let mut rows = Vec::new();
+    let mut section = "";
+    for (index, field) in GLOBAL_FIELDS.iter().enumerate() {
+        if field.section != section {
+            section = field.section;
+            rows.push(SettingsRow::Header(section.to_string()));
+        }
+        rows.push(SettingsRow::Field(index));
+    }
+    rows.push(SettingsRow::Header("Jobs".into()));
+    rows.extend(jobs.iter().map(|job| SettingsRow::Job(job.name.clone())));
+    rows.push(SettingsRow::AddJob);
+    rows.push(SettingsRow::Header("Everything else".into()));
+    rows.push(SettingsRow::OpenEditor);
+    rows
+}
+
+/// A job being added from the Settings screen.
+struct NewJob {
+    name: String,
+    /// Index into the configured library directories.
+    directory: usize,
+}
+
+/// State of the Settings screen.
+#[derive(Default)]
+struct SettingsScreen {
+    cursor: usize,
+    offset: usize,
+    input: Option<String>,
+    new_job: Option<NewJob>,
+    confirm_delete: Option<String>,
+    error: Option<String>,
+    /// Merged config and overlay documents, for values and override markers.
+    merged: serde_yaml::Value,
+    overlay: serde_yaml::Value,
+}
+
+impl SettingsScreen {
+    fn open(config_path: &Path) -> Self {
+        let mut screen = SettingsScreen::default();
+        screen.reload(config_path);
+        // Start on the first field, not a heading.
+        screen.cursor = 1;
+        screen
+    }
+
+    fn reload(&mut self, config_path: &Path) {
+        let overlay_path = state_config_path().ok();
+        self.overlay = overlay_path
+            .as_deref()
+            .filter(|path| path.is_file())
+            .and_then(|path| read_yaml(path).ok())
+            .unwrap_or_else(|| serde_yaml::Value::Mapping(Default::default()));
+        self.merged = read_yaml(config_path).unwrap_or_default();
+        merge_config(&mut self.merged, self.overlay.clone());
+    }
+}
+
+/// Library directory names a new job can use (the `local.directories` keys).
+fn library_directories(config: &Config) -> Vec<String> {
+    let mut names: Vec<String> = config.local.directories.keys().cloned().collect();
+    for name in config.remote.directories.keys() {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    if names.is_empty() {
+        names.push("tv_shows".into());
+    }
+    names
+}
+
+/// The file `E` opens: the config when writable, otherwise the overlay (created
+/// with a short explanation when missing).
+fn editable_config_file(config_path: &Path) -> Result<PathBuf> {
+    if config_is_writable(config_path) {
+        return Ok(config_path.to_path_buf());
+    }
+    let overlay = state_config_path()?;
+    if !overlay.exists() {
+        std::fs::write(
+            &overlay,
+            format!(
+                "# jellysync settings overlay, merged on top of {}\n\
+                 # (read-only). Jobs merge by name; null unsets a value.\n\
+                 # Settings saved from the TUI rewrite this file without comments.\n{{}}\n",
+                config_path.display()
+            ),
+        )?;
+    }
+    Ok(overlay)
+}
+
+/// Suspend the TUI, edit `path` in $VISUAL/$EDITOR (vi by default) and come back.
+fn run_editor(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    path: &Path,
+) -> Result<()> {
+    // Empty variables count as unset.
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .filter_map(|name| env::var(name).ok())
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "vi".into());
+    disable_raw_mode()?;
+    execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    // Through sh so editors configured with arguments ("code -w") work.
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(path)
+        .status();
+    enable_raw_mode()?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    terminal.clear()?;
+    let status = status.with_context(|| format!("start editor '{editor}'"))?;
+    if !status.success() {
+        bail!("editor '{editor}' exited with {status}");
+    }
+    Ok(())
 }
 
 /// State of the job configuration dialog's settings editor.
@@ -580,15 +933,72 @@ fn write_yaml_atomic(path: &Path, value: &serde_yaml::Value) -> Result<()> {
     Ok(())
 }
 
-/// Apply a job setting change and return the file it was written to: the main
-/// config when it is writable and defines the job, otherwise the overlay. The
-/// merged result is validated before anything is written.
-fn save_job_setting(
+/// What a settings change applies to.
+#[derive(Clone, Copy, Debug)]
+enum SettingTarget<'a> {
+    /// A top-level setting, by YAML key path (e.g. `["jellyfin", "base_url"]`).
+    Global(&'a [&'a str]),
+    /// A setting of the named job.
+    Job(&'a str, &'a str),
+}
+
+/// The mapping holding the target's last key, created along the way when
+/// `create` is set. None when (part of) the path does not exist.
+fn setting_parent<'a>(
+    document: &'a mut serde_yaml::Value,
+    target: SettingTarget,
+    create: bool,
+) -> Option<&'a mut serde_yaml::Mapping> {
+    match target {
+        SettingTarget::Job(name, _) => job_entry(document, name, create),
+        SettingTarget::Global(path) => {
+            let (_, parents) = path.split_last()?;
+            let mut current = document.as_mapping_mut()?;
+            for key in parents {
+                if !current.contains_key(*key) {
+                    if !create {
+                        return None;
+                    }
+                    current.insert(
+                        (*key).into(),
+                        serde_yaml::Value::Mapping(Default::default()),
+                    );
+                }
+                let next = current.get_mut(*key)?;
+                if next.is_null() && create {
+                    *next = serde_yaml::Value::Mapping(Default::default());
+                }
+                current = next.as_mapping_mut()?;
+            }
+            Some(current)
+        }
+    }
+}
+
+fn setting_key<'a>(target: SettingTarget<'a>) -> &'a str {
+    match target {
+        SettingTarget::Global(path) => path.last().copied().unwrap_or_default(),
+        SettingTarget::Job(_, key) => key,
+    }
+}
+
+/// The value a document sets for the target, if any (null counts as set).
+fn setting_value(document: &serde_yaml::Value, target: SettingTarget) -> Option<serde_yaml::Value> {
+    let mut document = document.clone();
+    setting_parent(&mut document, target, false)?
+        .get(setting_key(target))
+        .cloned()
+}
+
+/// Read the config and overlay documents, apply `edit` to one of them, check
+/// that the merged result is a valid config and write what changed. Returns
+/// the file that received the edit: the config when it is writable (and, for
+/// job edits, defines the job), otherwise the overlay.
+fn edit_config(
     config_path: &Path,
     overlay_path: &Path,
-    job: &str,
-    key: &str,
-    change: SettingChange,
+    use_base: impl FnOnce(&mut serde_yaml::Value) -> bool,
+    edit: impl FnOnce(&mut serde_yaml::Value, &mut serde_yaml::Value, bool) -> Result<()>,
 ) -> Result<PathBuf> {
     let mut base = read_yaml(config_path)?;
     let mut overlay = if overlay_path.is_file() {
@@ -596,51 +1006,154 @@ fn save_job_setting(
     } else {
         serde_yaml::Value::Mapping(Default::default())
     };
-    let write_base = config_is_writable(config_path) && job_entry(&mut base, job, false).is_some();
-    if write_base {
-        let entry = job_entry(&mut base, job, false).context("job vanished from the config")?;
-        match &change {
-            SettingChange::Set(value) => {
-                entry.insert(key.into(), value.clone());
-            }
-            SettingChange::Clear | SettingChange::Reset => {
-                entry.remove(key);
-            }
-        }
-        // An older overlay value would otherwise hide the edit.
-        if let Some(entry) = job_entry(&mut overlay, job, false) {
-            entry.remove(key);
-        }
-    } else {
-        let entry = job_entry(&mut overlay, job, true).context("overlay is not a mapping")?;
-        match &change {
-            SettingChange::Set(value) => {
-                entry.insert(key.into(), value.clone());
-            }
-            SettingChange::Clear => {
-                entry.insert(key.into(), serde_yaml::Value::Null);
-            }
-            SettingChange::Reset => {
-                entry.remove(key);
-            }
-        }
-    }
+    let original_overlay = overlay.clone();
+    let write_base = config_is_writable(config_path) && use_base(&mut base);
+    edit(&mut base, &mut overlay, write_base)?;
     let mut merged = base.clone();
     merge_config(&mut merged, overlay.clone());
     let config = parse_config(merged)?;
-    if let Some(job) = config.jobs.iter().find(|candidate| candidate.name == job) {
-        validate_job_filters(job)?;
+    for job in &config.jobs {
+        validate_job_filters(job).with_context(|| format!("job '{}'", job.name))?;
     }
     if write_base {
         write_yaml_atomic(config_path, &base)?;
-        if overlay_path.is_file() {
-            write_yaml_atomic(overlay_path, &overlay)?;
-        }
-        Ok(config_path.to_path_buf())
-    } else {
-        write_yaml_atomic(overlay_path, &overlay)?;
-        Ok(overlay_path.to_path_buf())
     }
+    if overlay != original_overlay {
+        write_yaml_atomic(overlay_path, &overlay)?;
+    }
+    Ok(if write_base {
+        config_path.to_path_buf()
+    } else {
+        overlay_path.to_path_buf()
+    })
+}
+
+/// Apply a settings change (see [edit_config] for where it is written).
+fn save_setting(
+    config_path: &Path,
+    overlay_path: &Path,
+    target: SettingTarget,
+    change: SettingChange,
+) -> Result<PathBuf> {
+    let key = setting_key(target);
+    edit_config(
+        config_path,
+        overlay_path,
+        |base| match target {
+            SettingTarget::Job(name, _) => job_entry(base, name, false).is_some(),
+            SettingTarget::Global(_) => true,
+        },
+        |base, overlay, write_base| {
+            if write_base {
+                if let Some(parent) =
+                    setting_parent(base, target, matches!(change, SettingChange::Set(_)))
+                {
+                    match &change {
+                        SettingChange::Set(value) => {
+                            parent.insert(key.into(), value.clone());
+                        }
+                        SettingChange::Clear | SettingChange::Reset => {
+                            parent.remove(key);
+                        }
+                    }
+                }
+                // An older overlay value would otherwise hide the edit.
+                if let Some(parent) = setting_parent(overlay, target, false) {
+                    parent.remove(key);
+                }
+            } else {
+                match &change {
+                    SettingChange::Set(value) => {
+                        setting_parent(overlay, target, true)
+                            .context("overlay is not a mapping")?
+                            .insert(key.into(), value.clone());
+                    }
+                    SettingChange::Clear => {
+                        setting_parent(overlay, target, true)
+                            .context("overlay is not a mapping")?
+                            .insert(key.into(), serde_yaml::Value::Null);
+                    }
+                    SettingChange::Reset => {
+                        if let Some(parent) = setting_parent(overlay, target, false) {
+                            parent.remove(key);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+fn save_job_setting(
+    config_path: &Path,
+    overlay_path: &Path,
+    job: &str,
+    key: &str,
+    change: SettingChange,
+) -> Result<PathBuf> {
+    save_setting(
+        config_path,
+        overlay_path,
+        SettingTarget::Job(job, key),
+        change,
+    )
+}
+
+/// Add a job with the given library directory (a `local.directories` key).
+fn add_job(
+    config_path: &Path,
+    overlay_path: &Path,
+    name: &str,
+    directory: &str,
+) -> Result<PathBuf> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("the job needs a name");
+    }
+    let current = load_config_with_overlay(config_path, overlay_path)?;
+    if current.jobs.iter().any(|job| job.name == name) {
+        bail!("a job named '{name}' already exists");
+    }
+    edit_config(
+        config_path,
+        overlay_path,
+        |_| true,
+        |base, overlay, write_base| {
+            let document = if write_base { base } else { overlay };
+            let entry = job_entry(document, name, true).context("config is not a mapping")?;
+            entry.insert("directory".into(), directory.into());
+            Ok(())
+        },
+    )
+}
+
+/// Remove a job. A job from a read-only config cannot be removed, only disabled.
+fn delete_job(config_path: &Path, overlay_path: &Path, name: &str) -> Result<PathBuf> {
+    let in_base = job_entry(&mut read_yaml(config_path)?, name, false).is_some();
+    if in_base && !config_is_writable(config_path) {
+        bail!("'{name}' comes from the read-only config; disable it instead");
+    }
+    let remove = |document: &mut serde_yaml::Value| {
+        if let Some(jobs) = document
+            .get_mut("jobs")
+            .and_then(|jobs| jobs.as_sequence_mut())
+        {
+            jobs.retain(|entry| entry.get("name").and_then(|v| v.as_str()) != Some(name));
+        }
+    };
+    edit_config(
+        config_path,
+        overlay_path,
+        |_| in_base,
+        |base, overlay, write_base| {
+            if write_base {
+                remove(base);
+            }
+            remove(overlay);
+            Ok(())
+        },
+    )
 }
 
 /// Reject seasons/episodes filters that would fail at sync time.
@@ -2320,7 +2833,16 @@ async fn run_sync_mode(
 }
 fn selected_jobs(config: &Config, targets: &[String]) -> Result<Vec<Job>> {
     let jobs: Vec<Job> = if targets.is_empty() {
-        config.jobs.clone()
+        if config.jobs.is_empty() {
+            bail!("no matching jobs configured");
+        }
+        // Disabled jobs only run when named explicitly; all disabled is not an error.
+        return Ok(config
+            .jobs
+            .iter()
+            .filter(|job| job.enabled())
+            .cloned()
+            .collect());
     } else {
         let found: Vec<Job> = config
             .jobs
@@ -2904,6 +3426,28 @@ async fn reconcile_existing(config: &Config) -> Result<usize> {
     Ok(indexed)
 }
 
+/// Open the editable config file in $EDITOR and reload the config afterwards.
+fn edit_config_file(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    config_path: &Path,
+    config: &mut Config,
+) -> (String, bool) {
+    let result = editable_config_file(config_path).and_then(|path| {
+        run_editor(terminal, &path)?;
+        Ok((path, load_config(config_path)?))
+    });
+    match result {
+        Ok((path, reloaded)) => {
+            *config = reloaded;
+            (
+                format!("Reloaded settings after editing {}", tilde_path(&path)),
+                true,
+            )
+        }
+        Err(error) => (format!("Settings not reloaded: {error:#}"), false),
+    }
+}
+
 async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
     // Status messages used to read "downloaded N item(s)".
     db()?.execute(
@@ -2954,6 +3498,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
         let mut show_help = false;
         let mut show_job_config = false;
         let mut editor = JobEditor::default();
+        let mut settings: Option<SettingsScreen> = None;
         let mut file_info: Option<FileInfo> = None;
         let mut file_info_entry: Option<DownloadEntry> = None;
         // (index, job name) and (index, item id) selected when the last frame was drawn.
@@ -3601,8 +4146,14 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         .get(&job.name)
                         .map(|(state, message, _)| (state.as_str(), message.as_str()))
                         .unwrap_or(("not run", "Waiting for first sync"));
+                    let disabled = config
+                        .jobs
+                        .iter()
+                        .any(|configured| configured.name == job.name && !configured.enabled());
                     let (kind, kind_style) = if job.adhoc {
                         ("LIBRARY", Style::default().fg(Color::Magenta))
+                    } else if disabled {
+                        ("DISABLED", Style::default().fg(Color::Yellow))
                     } else {
                         ("JOB", Style::default().fg(Color::DarkGray))
                     };
@@ -4076,6 +4627,172 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     );
                 }
 
+                if let Some(screen) = settings.as_mut() {
+                    let popup = centered_rect(96, area.height, area);
+                    let rows = settings_rows(&config.jobs);
+                    let inner = Rect {
+                        x: popup.x + 1,
+                        y: popup.y + 1,
+                        width: popup.width.saturating_sub(2),
+                        height: popup.height.saturating_sub(2),
+                    };
+                    // Three lines at the bottom for help/errors, keys and the target file.
+                    let visible = usize::from(inner.height.saturating_sub(4)).max(1);
+                    if screen.cursor < screen.offset {
+                        screen.offset = screen.cursor;
+                    }
+                    // Keep a section heading above its first row visible.
+                    if screen.offset > 0
+                        && screen.offset == screen.cursor
+                        && !rows[screen.cursor - 1].selectable()
+                    {
+                        screen.offset -= 1;
+                    }
+                    if screen.cursor >= screen.offset + visible {
+                        screen.offset = screen.cursor + 1 - visible;
+                    }
+                    let value_width = usize::from(inner.width.saturating_sub(40));
+                    let muted = Style::default().fg(Color::DarkGray);
+                    let mut lines: Vec<Line> = Vec::new();
+                    for (index, row) in rows.iter().enumerate().skip(screen.offset).take(visible) {
+                        let focused = index == screen.cursor;
+                        let pointer = Span::styled(if focused { "▸ " } else { "  " }, Style::default().fg(Color::Cyan));
+                        let label_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                        let value_style = if focused {
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        lines.push(match row {
+                            SettingsRow::Header(title) => Line::from(Span::styled(
+                                title.clone(),
+                                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                            )),
+                            SettingsRow::Field(field_index) => {
+                                let field = &GLOBAL_FIELDS[*field_index];
+                                let target = SettingTarget::Global(field.path);
+                                let mut spans = vec![pointer, Span::styled(format!("{:<20}", field.label), label_style)];
+                                match (&screen.input, focused) {
+                                    (Some(input), true) => spans.push(Span::styled(
+                                        format!("{input}▏"),
+                                        Style::default().fg(Color::Black).bg(Color::Cyan),
+                                    )),
+                                    _ => match field_display(setting_value(&screen.merged, target).as_ref()) {
+                                        Some(value) => spans.push(Span::styled(truncate(&value, value_width), value_style)),
+                                        None if field.default.is_empty() => spans.push(Span::styled("not set", muted)),
+                                        None => spans.push(Span::styled(format!("{} (default)", field.default), muted)),
+                                    },
+                                }
+                                if let FieldKind::Choice(_) = field.kind {
+                                    spans.push(Span::styled("  ⇄", muted));
+                                }
+                                if setting_value(&screen.overlay, target).is_some() {
+                                    spans.push(Span::styled("  overridden", Style::default().fg(Color::Yellow)));
+                                }
+                                Line::from(spans)
+                            }
+                            SettingsRow::Job(name) => {
+                                let mut spans = vec![pointer];
+                                if let Some(job) = config.jobs.iter().find(|job| &job.name == name) {
+                                    spans.push(Span::styled(
+                                        format!("{:<20}", truncate(name, 19)),
+                                        if job.enabled() { label_style } else { muted },
+                                    ));
+                                    let mut summary = vec![
+                                        job.directory.clone().or(job.local_dir.clone()).unwrap_or_else(|| "—".into()),
+                                    ];
+                                    if let Some(seasons) = job_setting_text(job, "seasons") {
+                                        summary.push(format!("seasons {seasons}"));
+                                    }
+                                    if let Some(episodes) = job_setting_text(job, "episodes") {
+                                        summary.push(format!("episodes {episodes}"));
+                                    }
+                                    if job.unwatched == Some(true) {
+                                        summary.push("unwatched only".into());
+                                    }
+                                    spans.push(Span::styled(
+                                        truncate(&summary.join(" · "), value_width),
+                                        if job.enabled() { value_style } else { muted },
+                                    ));
+                                    if !job.enabled() {
+                                        spans.push(Span::styled("  disabled", Style::default().fg(Color::Yellow)));
+                                    }
+                                }
+                                Line::from(spans)
+                            }
+                            SettingsRow::AddJob => match &screen.new_job {
+                                Some(new_job) => {
+                                    let directories = library_directories(&config);
+                                    Line::from(vec![
+                                        pointer,
+                                        Span::styled(format!("{:<20}", "New job"), label_style),
+                                        Span::styled(
+                                            format!("{}▏", new_job.name),
+                                            Style::default().fg(Color::Black).bg(Color::Cyan),
+                                        ),
+                                        Span::styled("   in ", muted),
+                                        Span::styled(
+                                            format!("◂ {} ▸", directories[new_job.directory.min(directories.len() - 1)]),
+                                            Style::default().fg(Color::Magenta),
+                                        ),
+                                    ])
+                                }
+                                None => Line::from(vec![pointer, Span::styled("+ Add a job…", value_style)]),
+                            },
+                            SettingsRow::OpenEditor => Line::from(vec![
+                                pointer,
+                                Span::styled("Open the config in $EDITOR…", value_style),
+                                Span::styled("  directories, rsync details, anything else", muted),
+                            ]),
+                        });
+                    }
+                    while lines.len() < visible {
+                        lines.push(Line::from(""));
+                    }
+                    lines.push(Line::from(""));
+                    let focused_row = rows.get(screen.cursor);
+                    lines.push(if let Some(error) = &screen.error {
+                        Line::from(Span::styled(truncate(error, usize::from(inner.width)), Style::default().fg(Color::Red)))
+                    } else if let Some(name) = &screen.confirm_delete {
+                        Line::from(vec![
+                            Span::styled(format!("Delete job {name}? "), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                            Span::styled("Downloaded files stay on disk.  y delete · n / Esc cancel", Style::default().fg(Color::Gray)),
+                        ])
+                    } else {
+                        let help = match focused_row {
+                            Some(SettingsRow::Field(index)) => GLOBAL_FIELDS[*index].help,
+                            Some(SettingsRow::Job(_)) => "Enter edit sync settings · Space enable/disable · d delete",
+                            Some(SettingsRow::AddJob) if screen.new_job.is_some() => "type the show or movie title · Tab/←/→ library folder · Enter add · Esc cancel",
+                            Some(SettingsRow::AddJob) => "track another show or movie; set its filters afterwards",
+                            Some(SettingsRow::OpenEditor) => "for options without a field here, e.g. the directories maps",
+                            _ => "",
+                        };
+                        Line::from(Span::styled(help, Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)))
+                    });
+                    lines.push(Line::from(Span::styled(
+                        if config_is_writable(&config_path) {
+                            format!("Edits are saved to {}", tilde_path(&config_path))
+                        } else {
+                            format!(
+                                "Config is read-only; edits go to {}",
+                                state_config_path().map(|path| tilde_path(&path)).unwrap_or_default()
+                            )
+                        },
+                        muted,
+                    )));
+                    let title = if screen.input.is_some() {
+                        "Settings · Enter save · Esc cancel · empty clears"
+                    } else {
+                        "Settings · ↑/↓ · Enter edit · Del clear · r reset · a add job · E editor · Esc"
+                    };
+                    frame.render_widget(Clear, popup);
+                    frame.render_widget(
+                        Paragraph::new(lines)
+                            .block(panel_block(title, true))
+                            .style(Style::default().fg(Color::White)),
+                        popup,
+                    );
+                }
                 if show_job_config {
                     let mut lines = Vec::new();
                     let mut title = "Job configuration · i / Esc close".to_string();
@@ -4289,7 +5006,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     } else {
                         shortcuts.extend([("s", "sync"), ("i", "config")]);
                     }
-                    shortcuts.extend([("b", "browse"), ("?", "more"), ("q", "quit")]);
+                    shortcuts.extend([("b", "browse"), (",", "settings"), ("?", "more"), ("q", "quit")]);
                     for (index, (key, label)) in shortcuts.into_iter().enumerate() {
                         if index > 0 {
                             shortcut_spans.push(key_sep());
@@ -4583,7 +5300,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     );
                 }
                 if show_help {
-                    let help_popup = centered_rect(84, 30, area);
+                    let help_popup = centered_rect(84, 32, area);
                     let help_lines = vec![
                         Line::from(Span::styled(
                             "Main view",
@@ -4596,6 +5313,8 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         Line::from("  s / S             sync selected / all jobs"),
                         Line::from("  b                 browse the Jellyfin library"),
                         Line::from("  i                 job configuration and sync settings (Jobs focused)"),
+                        Line::from("  ,                 settings: all options, add / disable / delete jobs"),
+                        Line::from("  E                 open the config (or its overlay) in $EDITOR"),
                         Line::from("  i / Enter         file media info (Files focused)"),
                         Line::from("  p / double-click  play selected file"),
                         Line::from("  Space             pause / resume selected download"),
@@ -4756,6 +5475,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     } else if confirm_clear.is_none()
                         && !show_help
                         && !show_job_config
+                        && settings.is_none()
                         && file_info.is_none()
                     {
                         match mouse.kind {
@@ -4891,6 +5611,223 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     }
                     file_info = None;
                     file_meta = None;
+                } else if settings.is_some() && !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    let rows = settings_rows(&config.jobs);
+                    let overlay_path = state_config_path();
+                    // A save to perform, with the label for its notice.
+                    let mut saved: Option<(Result<PathBuf>, String)> = None;
+                    let mut close = false;
+                    let mut open_job: Option<String> = None;
+                    let mut launch_editor = false;
+                    let screen = settings.as_mut().expect("settings screen is open");
+                    let row = rows.get(screen.cursor).cloned();
+                    if let Some(name) = screen.confirm_delete.clone() {
+                        match key.code {
+                            KeyCode::Char('y') => {
+                                screen.confirm_delete = None;
+                                saved = Some((
+                                    overlay_path.and_then(|overlay| delete_job(&config_path, &overlay, &name)),
+                                    format!("Deleted job {name}"),
+                                ));
+                            }
+                            KeyCode::Char('n') | KeyCode::Esc => screen.confirm_delete = None,
+                            _ => {}
+                        }
+                    } else if let Some(new_job) = screen.new_job.as_mut() {
+                        let directories = library_directories(&config);
+                        match key.code {
+                            KeyCode::Char(character) => new_job.name.push(character),
+                            KeyCode::Backspace => {
+                                new_job.name.pop();
+                            }
+                            KeyCode::Tab | KeyCode::Right => {
+                                new_job.directory = (new_job.directory + 1) % directories.len();
+                            }
+                            KeyCode::BackTab | KeyCode::Left => {
+                                new_job.directory =
+                                    new_job.directory.checked_sub(1).unwrap_or(directories.len() - 1);
+                            }
+                            KeyCode::Enter => {
+                                let name = new_job.name.trim().to_string();
+                                let directory = directories[new_job.directory.min(directories.len() - 1)].clone();
+                                saved = Some((
+                                    overlay_path.and_then(|overlay| add_job(&config_path, &overlay, &name, &directory)),
+                                    format!("Added job {name}"),
+                                ));
+                            }
+                            KeyCode::Esc => {
+                                screen.new_job = None;
+                                screen.error = None;
+                            }
+                            _ => {}
+                        }
+                    } else if let Some(input) = screen.input.as_mut() {
+                        match key.code {
+                            KeyCode::Char(character) => input.push(character),
+                            KeyCode::Backspace => {
+                                input.pop();
+                            }
+                            KeyCode::Esc => {
+                                screen.input = None;
+                                screen.error = None;
+                            }
+                            KeyCode::Enter => {
+                                if let Some(SettingsRow::Field(index)) = &row {
+                                    let field = &GLOBAL_FIELDS[*index];
+                                    match parse_field_input(field.kind, input) {
+                                        Ok(change) => {
+                                            saved = Some((
+                                                overlay_path.and_then(|overlay| {
+                                                    save_setting(&config_path, &overlay, SettingTarget::Global(field.path), change)
+                                                }),
+                                                format!("Saved {}", field.label),
+                                            ));
+                                        }
+                                        Err(error) => screen.error = Some(format!("{error:#}")),
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        let selectable: Vec<usize> = (0..rows.len()).filter(|index| rows[*index].selectable()).collect();
+                        let position = selectable.iter().position(|index| *index == screen.cursor).unwrap_or(0);
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char(',') => close = true,
+                            KeyCode::Up => {
+                                screen.cursor = selectable[position.checked_sub(1).unwrap_or(selectable.len() - 1)];
+                                screen.error = None;
+                            }
+                            KeyCode::Down => {
+                                screen.cursor = selectable[(position + 1) % selectable.len()];
+                                screen.error = None;
+                            }
+                            KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
+                                screen.cursor = selectable[list_jump(key.code, position, selectable.len(), 10)];
+                            }
+                            KeyCode::Char('E') => launch_editor = true,
+                            KeyCode::Char('a') => {
+                                screen.new_job = Some(NewJob { name: String::new(), directory: 0 });
+                            }
+                            KeyCode::Enter | KeyCode::Char('e') => match &row {
+                                Some(SettingsRow::Field(index)) => {
+                                    let field = &GLOBAL_FIELDS[*index];
+                                    let current = field_display(
+                                        setting_value(&screen.merged, SettingTarget::Global(field.path)).as_ref(),
+                                    );
+                                    if let FieldKind::Choice(choices) = field.kind {
+                                        let current = current.unwrap_or_else(|| field.default.to_string());
+                                        let next = choices
+                                            .iter()
+                                            .position(|choice| *choice == current)
+                                            .map_or(0, |index| (index + 1) % choices.len());
+                                        saved = Some((
+                                            overlay_path.and_then(|overlay| {
+                                                save_setting(
+                                                    &config_path,
+                                                    &overlay,
+                                                    SettingTarget::Global(field.path),
+                                                    SettingChange::Set(choices[next].into()),
+                                                )
+                                            }),
+                                            format!("Set {} to {}", field.label, choices[next]),
+                                        ));
+                                    } else {
+                                        screen.input = Some(current.unwrap_or_default());
+                                        screen.error = None;
+                                    }
+                                }
+                                Some(SettingsRow::Job(name)) => {
+                                    open_job = Some(name.clone());
+                                    close = true;
+                                }
+                                Some(SettingsRow::AddJob) => {
+                                    screen.new_job = Some(NewJob { name: String::new(), directory: 0 });
+                                }
+                                Some(SettingsRow::OpenEditor) => launch_editor = true,
+                                _ => {}
+                            },
+                            KeyCode::Char(' ') => {
+                                if let Some(SettingsRow::Job(name)) = &row
+                                    && let Some(job) = config.jobs.iter().find(|job| &job.name == name)
+                                {
+                                    let enable = !job.enabled();
+                                    saved = Some((
+                                        overlay_path.and_then(|overlay| {
+                                            save_job_setting(
+                                                &config_path,
+                                                &overlay,
+                                                name,
+                                                "enabled",
+                                                SettingChange::Set(enable.into()),
+                                            )
+                                        }),
+                                        format!("{} job {name}", if enable { "Enabled" } else { "Disabled" }),
+                                    ));
+                                }
+                            }
+                            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => match &row {
+                                Some(SettingsRow::Job(name)) => screen.confirm_delete = Some(name.clone()),
+                                Some(SettingsRow::Field(index)) => {
+                                    let field = &GLOBAL_FIELDS[*index];
+                                    saved = Some((
+                                        overlay_path.and_then(|overlay| {
+                                            save_setting(&config_path, &overlay, SettingTarget::Global(field.path), SettingChange::Clear)
+                                        }),
+                                        format!("Cleared {}", field.label),
+                                    ));
+                                }
+                                _ => {}
+                            },
+                            KeyCode::Char('r') => {
+                                if let Some(SettingsRow::Field(index)) = &row {
+                                    let field = &GLOBAL_FIELDS[*index];
+                                    saved = Some((
+                                        overlay_path.and_then(|overlay| {
+                                            save_setting(&config_path, &overlay, SettingTarget::Global(field.path), SettingChange::Reset)
+                                        }),
+                                        format!("Reset {}", field.label),
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some((result, label)) = saved {
+                        match result.and_then(|path| Ok((path, load_config(&config_path)?))) {
+                            Ok((path, reloaded)) => {
+                                config = reloaded;
+                                screen.reload(&config_path);
+                                screen.input = None;
+                                screen.new_job = None;
+                                screen.error = None;
+                                sync_notice = Some((format!("{label} in {}", tilde_path(&path)), true));
+                            }
+                            Err(error) => screen.error = Some(format!("{error:#}")),
+                        }
+                    }
+                    if launch_editor {
+                        sync_notice = Some(edit_config_file(&mut terminal, &config_path, &mut config));
+                        if let Some(screen) = settings.as_mut() {
+                            screen.reload(&config_path);
+                        }
+                    }
+                    if close {
+                        settings = None;
+                    }
+                    if let Some(name) = open_job
+                        && let Some(index) = jobs.iter().position(|job| job.name == name)
+                    {
+                        selected = index;
+                        download_focus = false;
+                        show_job_config = true;
+                        editor = JobEditor {
+                            overrides: state_config_path()
+                                .map(|overlay| overlay_job_keys(&overlay, &name))
+                                .unwrap_or_default(),
+                            ..JobEditor::default()
+                        };
+                    }
                 } else if show_job_config && !key.modifiers.contains(KeyModifiers::CONTROL) {
                     let job = jobs
                         .get(selected)
@@ -4991,7 +5928,13 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 {
                     // Ctrl-C closes the topmost dialog first. Closing one does not count
                     // towards quitting: the next Ctrl-C is the first of the quitting pair.
-                    if show_help || show_job_config || confirm_clear.is_some() || file_info.is_some() {
+                    if show_help
+                        || show_job_config
+                        || settings.is_some()
+                        || confirm_clear.is_some()
+                        || file_info.is_some()
+                    {
+                        settings = None;
                         show_help = false;
                         show_job_config = false;
                         confirm_clear = None;
@@ -5027,7 +5970,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         last_ctrl_c = Some(Instant::now());
                         sync_notice = Some((QUIT_HINT.into(), false));
                     }
-                } else if show_help || show_job_config || file_info.is_some() {
+                } else if show_help || show_job_config || settings.is_some() || file_info.is_some() {
                     // Dialogs are modal: other keys must not act on the view behind them.
                 } else if let Some(browser) = explore.as_mut() {
                     last_ctrl_c = None;
@@ -5252,6 +6195,10 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                     )));
                                 }
                             }
+                        }
+                        KeyCode::Char(',') => settings = Some(SettingsScreen::open(&config_path)),
+                        KeyCode::Char('E') => {
+                            sync_notice = Some(edit_config_file(&mut terminal, &config_path, &mut config));
                         }
                         KeyCode::Char('i') if !jobs.is_empty() => {
                             show_job_config = true;
@@ -7302,5 +8249,160 @@ jobs:
         );
         let job: Job = serde_yaml::from_str("{name: X, seasons: [1, \"3-4\"]}").unwrap();
         assert_eq!(job_setting_text(&job, "seasons").as_deref(), Some("1,3-4"));
+    }
+
+    fn read_only_fixture(name: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir(name);
+        let base = dir.join("config.yaml");
+        let overlay = dir.join("state").join("config.yaml");
+        std::fs::write(&base, BASE_CONFIG).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // As root permissions do not apply; nothing to test then.
+        (!config_is_writable(&base)).then_some((dir, base, overlay))
+    }
+
+    fn cleanup(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(
+            dir.join("config.yaml"),
+            std::fs::Permissions::from_mode(0o644),
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn global_settings_in_overlay_and_config() {
+        if let Some((dir, base, overlay)) = read_only_fixture("global-ro") {
+            let target = SettingTarget::Global(&["jellyfin", "base_url"]);
+            save_setting(
+                &base,
+                &overlay,
+                target,
+                SettingChange::Set("https://tv".into()),
+            )
+            .unwrap();
+            save_setting(
+                &base,
+                &overlay,
+                SettingTarget::Global(&["parallelism"]),
+                SettingChange::Set(5u64.into()),
+            )
+            .unwrap();
+            let config = load_config_with_overlay(&base, &overlay).unwrap();
+            assert_eq!(config.jellyfin.unwrap().base_url, "https://tv");
+            assert_eq!(config.parallelism, 5);
+            let document = read_yaml(&overlay).unwrap();
+            assert_eq!(setting_value(&document, target), Some("https://tv".into()));
+            // Clearing a required option is rejected.
+            let required = SettingTarget::Global(&["remote", "hostname"]);
+            assert!(save_setting(&base, &overlay, required, SettingChange::Clear).is_err());
+            cleanup(&dir);
+        }
+        let dir = temp_dir("global-rw");
+        let base = dir.join("config.yaml");
+        let overlay = dir.join("state.yaml");
+        std::fs::write(&base, BASE_CONFIG).unwrap();
+        save_setting(
+            &base,
+            &overlay,
+            SettingTarget::Global(&["library", "season_pattern"]),
+            SettingChange::Set("S$season_number".into()),
+        )
+        .unwrap();
+        assert!(!overlay.exists());
+        let config = load_config_with_overlay(&base, &overlay).unwrap();
+        assert_eq!(config.library.unwrap().season_pattern, "S$season_number");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn jobs_can_be_added_disabled_and_deleted() {
+        let Some((dir, base, overlay)) = read_only_fixture("jobs-ro") else {
+            return;
+        };
+        add_job(&base, &overlay, " Andor ", "tv").unwrap();
+        assert!(add_job(&base, &overlay, "Andor", "tv").is_err());
+        assert!(add_job(&base, &overlay, "  ", "tv").is_err());
+        let config = load_config_with_overlay(&base, &overlay).unwrap();
+        let andor = config.jobs.iter().find(|job| job.name == "Andor").unwrap();
+        assert_eq!(andor.directory.as_deref(), Some("tv"));
+        // Jobs from the read-only config can only be disabled.
+        assert!(delete_job(&base, &overlay, "Silo").is_err());
+        save_job_setting(
+            &base,
+            &overlay,
+            "Silo",
+            "enabled",
+            SettingChange::Set(false.into()),
+        )
+        .unwrap();
+        let config = load_config_with_overlay(&base, &overlay).unwrap();
+        let names: Vec<_> = selected_jobs(&config, &[])
+            .unwrap()
+            .into_iter()
+            .map(|job| job.name)
+            .collect();
+        assert_eq!(names, ["Fallout", "Andor"]);
+        // Disabled jobs still run when named.
+        assert_eq!(selected_jobs(&config, &["Silo".into()]).unwrap().len(), 1);
+        // Overlay-only jobs can be deleted.
+        delete_job(&base, &overlay, "Andor").unwrap();
+        let config = load_config_with_overlay(&base, &overlay).unwrap();
+        assert!(config.jobs.iter().all(|job| job.name != "Andor"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn deleting_from_a_writable_config() {
+        let dir = temp_dir("delete-rw");
+        let base = dir.join("config.yaml");
+        let overlay = dir.join("state.yaml");
+        std::fs::write(&base, BASE_CONFIG).unwrap();
+        std::fs::write(&overlay, "jobs: [{name: Silo, unwatched: true}]").unwrap();
+        delete_job(&base, &overlay, "Silo").unwrap();
+        let config = load_config_with_overlay(&base, &overlay).unwrap();
+        let names: Vec<_> = config.jobs.iter().map(|job| job.name.as_str()).collect();
+        // Gone from both files, so the overlay entry does not resurrect it.
+        assert_eq!(names, ["Fallout"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn field_input_parsing() {
+        assert_eq!(
+            parse_field_input(FieldKind::Number, "4").unwrap(),
+            SettingChange::Set(4u64.into())
+        );
+        assert!(parse_field_input(FieldKind::Number, "four").is_err());
+        assert_eq!(
+            parse_field_input(FieldKind::List, " -a  --partial ").unwrap(),
+            SettingChange::Set(serde_yaml::Value::Sequence(vec![
+                "-a".into(),
+                "--partial".into()
+            ]))
+        );
+        assert_eq!(
+            parse_field_input(FieldKind::Text, "").unwrap(),
+            SettingChange::Clear
+        );
+        let flags: serde_yaml::Value = serde_yaml::from_str("[-a, -v]").unwrap();
+        assert_eq!(field_display(Some(&flags)).as_deref(), Some("-a -v"));
+        assert_eq!(field_display(Some(&serde_yaml::Value::Null)), None);
+    }
+
+    #[test]
+    fn settings_rows_group_fields_and_jobs() {
+        let config = parse_config(serde_yaml::from_str(BASE_CONFIG).unwrap()).unwrap();
+        let rows = settings_rows(&config.jobs);
+        assert_eq!(rows[0], SettingsRow::Header("General".into()));
+        assert!(rows[1].selectable());
+        let fields = rows
+            .iter()
+            .filter(|row| matches!(row, SettingsRow::Field(_)))
+            .count();
+        assert_eq!(fields, GLOBAL_FIELDS.len());
+        assert!(rows.contains(&SettingsRow::Job("Silo".into())));
+        assert_eq!(rows.last(), Some(&SettingsRow::OpenEditor));
     }
 }

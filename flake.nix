@@ -329,6 +329,12 @@
                         description = "Enable wildcard matching (*name*).";
                       };
 
+                      enabled = mkOption {
+                        type = types.nullOr types.bool;
+                        default = null;
+                        description = "Set to false to skip this job when syncing all jobs (it can still be synced by name).";
+                      };
+
                       unwatched = mkOption {
                         type = types.nullOr types.bool;
                         default = null;

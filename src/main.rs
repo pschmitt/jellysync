@@ -68,6 +68,25 @@ const HELP_STYLES: clap::builder::Styles = {
         .error(AnsiColor::Red.on_default().effects(Effects::BOLD))
 };
 
+/// The CLI as completions see it. clap_complete's static generators ignore
+/// `hide`, so hidden (internal) subcommands are left out explicitly.
+fn completion_command() -> clap::Command {
+    use clap::CommandFactory as _;
+    let full = Cli::command();
+    let mut command = clap::Command::new("jellysync")
+        .version(version_string())
+        .args(full.get_arguments().cloned())
+        .subcommands(
+            full.get_subcommands()
+                .filter(|sub| !sub.is_hide_set())
+                .cloned(),
+        );
+    if let Some(about) = full.get_about() {
+        command = command.about(about.clone());
+    }
+    command
+}
+
 /// Git revision from build.rs: empty on a tagged release, otherwise the short
 /// commit, with `-dirty` for uncommitted changes.
 const GIT_REVISION: &str = env!("JELLYSYNC_REVISION");
@@ -98,7 +117,7 @@ fn format_version(version: &str, revision: &str) -> String {
 )]
 struct Cli {
     /// Config file (default: $JELLYSYNC_CONFIG, ./jellysync.yaml, ~/.config/jellysync/config.yaml)
-    #[arg(short, long, global = true, value_name = "FILE")]
+    #[arg(short, long, global = true, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
     config: Option<PathBuf>,
     /// Number of jobs downloaded concurrently (overrides the config)
     #[arg(
@@ -142,6 +161,11 @@ enum Commands {
     Config,
     /// Print the version (same as --version / -V)
     Version,
+    /// Print a shell completion script (the Nix package installs them)
+    Completions {
+        /// Shell to generate the completion script for
+        shell: clap_complete::Shell,
+    },
     /// Start the jellysync user service
     Start,
     /// Stop the jellysync user service
@@ -7557,6 +7581,11 @@ async fn main() -> Result<()> {
     }
     match cli.command {
         Some(Commands::Status) => status(cli.json),
+        // Needs no config, so packaging can run it in a build sandbox.
+        Some(Commands::Completions { shell }) => {
+            clap_complete::generate(shell, &mut completion_command(), "jellysync", &mut stdout());
+            Ok(())
+        }
         Some(Commands::Version) => {
             if cli.json {
                 println!(
@@ -7640,7 +7669,8 @@ async fn main() -> Result<()> {
                     | Commands::Start
                     | Commands::Stop
                     | Commands::Tui
-                    | Commands::Version,
+                    | Commands::Version
+                    | Commands::Completions { .. },
                 ) => {
                     unreachable!()
                 }
@@ -8456,5 +8486,32 @@ jobs:
             format_version("1.1.0", "135343d-dirty"),
             "1.1.0-135343d-dirty"
         );
+    }
+
+    #[test]
+    fn completions_cover_the_cli() {
+        let shells = [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+        ];
+        for shell in shells {
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut completion_command(), "jellysync", &mut script);
+            let script = String::from_utf8(script).unwrap();
+            for word in ["download", "fetch", "prune", "completions"] {
+                assert!(script.contains(word), "{shell}: {word}");
+            }
+            for option in ["config", "json", "version"] {
+                // fish declares long options as `-l name`.
+                let spelled = match shell {
+                    clap_complete::Shell::Fish => format!("-l {option}"),
+                    _ => format!("--{option}"),
+                };
+                assert!(script.contains(&spelled), "{shell}: {spelled}");
+            }
+            // The internal worker command stays hidden.
+            assert!(!script.contains("worker"), "{shell}");
+        }
     }
 }

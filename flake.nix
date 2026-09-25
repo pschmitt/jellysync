@@ -453,10 +453,20 @@
           # For --version (see build.rs): the source has no .git in the Nix build.
           # Tags are not visible to flakes, so Nix builds always name the commit.
           env.JELLYSYNC_GIT_REV = self.shortRev or self.dirtyShortRev or "";
-          nativeBuildInputs = [ pkgs.makeWrapper ];
+          nativeBuildInputs = [
+            pkgs.installShellFiles
+            pkgs.makeWrapper
+          ];
           postInstall = ''
             wrapProgram $out/bin/jellysync \
               --prefix PATH : ${pkgs.lib.makeBinPath runtimeInputs}
+          ''
+          # The binary generates its own completions, which needs to run it.
+          + pkgs.lib.optionalString (pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform) ''
+            installShellCompletion --cmd jellysync \
+              --bash <($out/bin/jellysync completions bash) \
+              --fish <($out/bin/jellysync completions fish) \
+              --zsh <($out/bin/jellysync completions zsh)
           '';
 
           meta = {

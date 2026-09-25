@@ -4039,16 +4039,17 @@ fn status(json_output: bool) -> Result<()> {
                 .map(String::as_str),
         );
         let message = summary.or(message);
-        let (icon, color) = match state.to_ascii_lowercase().as_str() {
-            "success" | "complete" | "completed" => ("●", TerminalColor::Green),
-            "running" => ("◐", TerminalColor::Yellow),
-            "downloading" => ("◐", TerminalColor::Cyan),
-            "queued" => ("◌", TerminalColor::Blue),
-            "paused" => ("⏸", TerminalColor::DarkGrey),
-            "failed" | "error" | "skipped" => ("✕", TerminalColor::Red),
-            "interrupted" | "cleared" => ("◆", TerminalColor::Magenta),
-            _ => ("○", TerminalColor::DarkGrey),
+        let color = match state.to_ascii_lowercase().as_str() {
+            "success" | "complete" | "completed" => TerminalColor::Green,
+            "running" => TerminalColor::Yellow,
+            "downloading" => TerminalColor::Cyan,
+            "queued" => TerminalColor::Blue,
+            "paused" => TerminalColor::DarkGrey,
+            "failed" | "error" | "skipped" => TerminalColor::Red,
+            "interrupted" | "cleared" => TerminalColor::Magenta,
+            _ => TerminalColor::DarkGrey,
         };
+        let icon = state_icon(state);
         println!(
             "  {} {:<28} {} {}",
             icon.with(color),
@@ -4114,7 +4115,7 @@ fn status(json_output: bool) -> Result<()> {
         };
         println!(
             "  {} {} {}",
-            "↳".with(state_color),
+            state_icon(&state).with(state_color),
             filename.bold(),
             label.with(TerminalColor::DarkGrey)
         );
@@ -4145,7 +4146,7 @@ fn status(json_output: bool) -> Result<()> {
     } else if let Some(rate) = total_rate {
         println!(
             "  {} {}",
-            "total".with(TerminalColor::DarkGrey),
+            format!("{} total", icon::DOWNLOAD).with(TerminalColor::DarkGrey),
             format!("{}/s", format_bytes(rate)).with(TerminalColor::Grey)
         );
     }
@@ -5436,12 +5437,12 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         .iter()
                         .any(|configured| configured.name == job.name && !configured.enabled());
                     let (kind, kind_style) = if job.adhoc {
-                        ("LIBRARY", Style::default().fg(Color::Magenta))
+                        (format!("{} LIBRARY", icon::LIBRARY), Style::default().fg(Color::Magenta))
                     } else if disabled {
-                        ("DISABLED", Style::default().fg(Color::Yellow))
+                        ("DISABLED".to_string(), Style::default().fg(Color::Yellow))
                     } else {
                         // Regular jobs need no label; only ad-hoc and disabled ones stand out.
-                        ("", Style::default())
+                        (String::new(), Style::default())
                     };
                     let title_style = if job.adhoc {
                         Style::default()
@@ -5470,7 +5471,10 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     ListItem::new(vec![
                         Line::from(vec![
                             Span::raw(POSTER_INDENT),
-                            Span::styled(if job.adhoc { "↳ " } else { "● " }, state_style(state)),
+                            {
+                                let (marker, marker_style) = transfer_marker(state);
+                                Span::styled(format!("{marker} "), marker_style)
+                            },
                             Span::styled(job.name.clone(), title_style),
                             Span::styled(
                                 if kind.is_empty() { String::new() } else { format!("  {kind}") },
@@ -5486,7 +5490,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             ),
                             Span::styled(
                                 if job_rate > 0 {
-                                    format!("  ↓ {}/s", format_bytes(job_rate))
+                                    format!("  {} {}/s", icon::DOWNLOAD, format_bytes(job_rate))
                                 } else {
                                     String::new()
                                 },
@@ -5650,7 +5654,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     let ignored = entry.status == "ignored";
                     let mut subtitle = if ignored {
                         vec![
-                            Span::styled("  ⊘ ignored by sync", Style::default().fg(Color::DarkGray)),
+                            Span::styled(format!("  {} ignored by sync", icon::CANCEL), Style::default().fg(Color::DarkGray)),
                             Span::styled(
                                 if entry.path.exists() { "  file kept · I to sync again" } else { "  I to sync again" },
                                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
@@ -5658,7 +5662,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         ]
                     } else if completed {
                         vec![
-                            Span::styled("  ✓ downloaded", Style::default().fg(Color::Green)),
+                            Span::styled(format!("  {} downloaded", icon::CHECK), Style::default().fg(Color::Green)),
                             Span::styled(format!("  {size}"), Style::default().fg(Color::Gray)),
                         ]
                     } else {
@@ -5773,10 +5777,15 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     );
                     return;
                 }
-                let sync_label = if sync_task.is_some() {
-                    "SYNC RUNNING"
-                } else {
-                    "READY"
+                // One combined state: offline wins, then a running sync, then
+                // the reachability check; otherwise the server is up and idle.
+                let (connection, connection_state) = match online {
+                    Some(Some(false)) => (format!("{} OFFLINE", icon::OFFLINE), "failed"),
+                    _ if sync_task.is_some() => (format!("{} SYNCING", icon::SYNC), "running"),
+                    Some(None) => ("CHECKING".to_string(), "stopped"),
+                    Some(Some(true)) => (format!("{} ONLINE", icon::ONLINE), "success"),
+                    // No reachability check (rsync mode): just idle.
+                    None => (format!("{} READY", icon::CHECK), "success"),
                 };
                 let mut header_segments: Vec<Vec<Span>> = vec![
                     vec![Span::styled(
@@ -5786,36 +5795,10 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             .add_modifier(Modifier::BOLD),
                     )],
                     vec![Span::styled(
-                        format!("{} mode", config.download.mode),
-                        Style::default().fg(Color::White),
-                    )],
-                    vec![Span::styled(
-                        format!("{} workers", config.parallelism),
-                        Style::default().fg(Color::Gray),
-                    )],
-                    vec![Span::styled(
-                        sync_label,
-                        state_style(if sync_task.is_some() {
-                            "running"
-                        } else {
-                            "success"
-                        })
-                        .add_modifier(Modifier::BOLD),
+                        connection,
+                        state_style(connection_state).add_modifier(Modifier::BOLD),
                     )],
                 ];
-                match online {
-                    None => {}
-                    Some(None) => header_segments
-                        .push(vec![Span::styled("CHECKING", state_style("stopped"))]),
-                    Some(Some(true)) => header_segments.push(vec![Span::styled(
-                        "ONLINE",
-                        state_style("success").add_modifier(Modifier::BOLD),
-                    )]),
-                    Some(Some(false)) => header_segments.push(vec![Span::styled(
-                        "OFFLINE",
-                        state_style("failed").add_modifier(Modifier::BOLD),
-                    )]),
-                }
                 if reconcile_task.is_some() {
                     header_segments.push(vec![Span::styled(
                         "indexing…",
@@ -5842,9 +5825,14 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 if tracked_size > 0 {
                     header_segments.push(vec![Span::styled(
                         if done_size < tracked_size {
-                            format!("{} / {}", format_bytes(done_size), format_bytes(tracked_size))
+                            format!(
+                                "{} {} / {}",
+                                icon::DISK,
+                                format_bytes(done_size),
+                                format_bytes(tracked_size)
+                            )
                         } else {
-                            format_bytes(tracked_size)
+                            format!("{} {}", icon::DISK, format_bytes(tracked_size))
                         },
                         Style::default().fg(Color::Gray),
                     )]);
@@ -5852,21 +5840,17 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 let total_rate: u64 = dashboard.downloads.iter().filter_map(|entry| entry.rate).sum();
                 if total_rate > 0 {
                     header_segments.push(vec![Span::styled(
-                        format!("↓ {}/s", format_bytes(total_rate)),
+                        format!("{} {}/s", downloading_icon(), format_bytes(total_rate)),
                         Style::default().fg(Color::Cyan),
                     )]);
                 }
-                header_segments.push(vec![
-                    Span::styled("timer ", Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        dashboard.timer.clone(),
-                        if dashboard.timer == "active" {
-                            state_style("success")
-                        } else {
-                            state_style("stopped")
-                        },
-                    ),
-                ]);
+                // The timer only deserves attention when it is not running.
+                if !dashboard.timer.is_empty() && dashboard.timer != "active" {
+                    header_segments.push(vec![Span::styled(
+                        format!("{} timer {}", icon::TIMER_OFF, dashboard.timer),
+                        Style::default().fg(Color::Yellow),
+                    )]);
+                }
                 // Segments are separated by whitespace only.
                 let mut header_spans = Vec::new();
                 for (index, segment) in header_segments.into_iter().enumerate() {
@@ -5995,7 +5979,12 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         .filter(|entry| download_complete(&entry.status))
                         .map(|entry| {
                             watched_label(dashboard.watched.get(&entry.item_id), job_grace, now)
-                                .map(|(label, _)| label.trim_start_matches("✓ ").replacen("watched", "yes", 1))
+                                .map(|(label, _)| {
+                                    label
+                                        .trim_start_matches(icon::WATCHED)
+                                        .trim_start()
+                                        .replacen("watched", "yes", 1)
+                                })
                                 .unwrap_or_else(|| "no · w marks it watched".into())
                         });
                     render_job_details(
@@ -6633,7 +6622,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                         .map(|(index, episode)| {
                                             let season = episode.parent_index_number.unwrap_or(0);
                                             let number = episode.index_number.unwrap_or(0);
-                                            let mark = if explore.selected_episodes.contains(&index) { "✓ " } else { "  " };
+                                            let mark = if explore.selected_episodes.contains(&index) { format!("{} ", icon::CHECK) } else { "  ".into() };
                                             ListItem::new(format!(
                                                 "{mark}S{season:02}E{number:02}  {}",
                                                 episode.name
@@ -7974,24 +7963,83 @@ fn job_display_state<'a>(
     )
 }
 
-/// A distinct single-column glyph and colour per file state, so downloading,
-/// queued, paused and ignored files tell apart at a glance.
-fn transfer_marker(state: &str) -> (&'static str, Style) {
-    match state {
-        "complete" | "completed" | "success" => ("●", Style::default().fg(Color::Green)),
-        "downloading" => (
-            "◐",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        "queued" => ("◌", Style::default().fg(Color::Blue)),
-        "paused" => ("○", Style::default().fg(Color::Yellow)),
-        "interrupted" => ("◆", Style::default().fg(Color::Magenta)),
-        "failed" | "error" => ("✕", Style::default().fg(Color::Red)),
-        "ignored" => ("⊘", Style::default().fg(Color::DarkGray)),
-        _ => ("●", state_style(state)),
+/// Nerd Font (Material Design) glyphs; each takes a single terminal cell.
+mod icon {
+    pub const ALERT: &str = "\u{f0026}"; // md-alert
+    pub const AUDIO: &str = "\u{f057e}"; // md-volume_high
+    pub const CANCEL: &str = "\u{f073a}"; // md-cancel
+    pub const CHECK: &str = "\u{f012c}"; // md-check
+    pub const CLOSE: &str = "\u{f0156}"; // md-close
+    pub const DELETE: &str = "\u{f01b4}"; // md-delete
+    pub const DISK: &str = "\u{f02ca}"; // md-harddisk
+    pub const DOWNLOAD: &str = "\u{f01da}"; // md-download
+    pub const DOWNLOAD_OUTLINE: &str = "\u{f0b8f}"; // md-download_outline
+    pub const IDLE: &str = "\u{f0766}"; // md-circle_outline
+    pub const LIBRARY: &str = "\u{f0331}"; // md-library
+    pub const OFFLINE: &str = "\u{f0164}"; // md-cloud_off_outline
+    pub const ONLINE: &str = "\u{f0160}"; // md-cloud_check
+    pub const PAUSE: &str = "\u{f03e4}"; // md-pause
+    pub const QUEUED: &str = "\u{f051f}"; // md-timer_sand
+    pub const SKIP: &str = "\u{f04ad}"; // md-skip_next
+    pub const STAR: &str = "\u{f04ce}"; // md-star
+    pub const SUBTITLES: &str = "\u{f0a16}"; // md-subtitles
+    pub const SYNC: &str = "\u{f04e6}"; // md-sync
+    pub const TIMER_OFF: &str = "\u{f13ac}"; // md-timer_off
+    pub const VIDEO: &str = "\u{f0567}"; // md-video
+    pub const WATCHED: &str = "\u{f0208}"; // md-eye
+}
+
+/// The glyph for a job or file state, shared by `status` and the TUI.
+fn state_icon(state: &str) -> &'static str {
+    match state.to_ascii_lowercase().as_str() {
+        "success" | "complete" | "completed" => icon::CHECK,
+        "running" => icon::SYNC,
+        "downloading" => icon::DOWNLOAD,
+        "queued" => icon::QUEUED,
+        "paused" => icon::PAUSE,
+        "failed" | "error" => icon::CLOSE,
+        "skipped" => icon::SKIP,
+        "interrupted" => icon::ALERT,
+        "cleared" => icon::DELETE,
+        "ignored" => icon::CANCEL,
+        _ => icon::IDLE,
     }
+}
+
+/// The download glyph, pulsing between filled and outlined twice a second
+/// while the TUI redraws.
+fn downloading_icon() -> &'static str {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    if (millis / 500).is_multiple_of(2) {
+        icon::DOWNLOAD
+    } else {
+        icon::DOWNLOAD_OUTLINE
+    }
+}
+
+/// A distinct glyph and colour per job or file state, so downloading, queued,
+/// paused and ignored entries tell apart at a glance; downloads are animated.
+fn transfer_marker(state: &str) -> (&'static str, Style) {
+    let style = match state {
+        "complete" | "completed" | "success" => Style::default().fg(Color::Green),
+        "downloading" => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        "queued" => Style::default().fg(Color::Blue),
+        "paused" => Style::default().fg(Color::Yellow),
+        "interrupted" => Style::default().fg(Color::Magenta),
+        "failed" | "error" => Style::default().fg(Color::Red),
+        "ignored" | "skipped" => Style::default().fg(Color::DarkGray),
+        _ => state_style(state),
+    };
+    let glyph = if state == "downloading" {
+        downloading_icon()
+    } else {
+        state_icon(state)
+    };
+    (glyph, style)
 }
 
 fn message_style(state: &str, message: &str) -> Style {
@@ -8048,7 +8096,7 @@ async fn jellyfin_file_meta(api: JellyfinApi, item_id: String, picker: Picker) -
     }
     let mut rating = Vec::new();
     if let Some(score) = number("CommunityRating") {
-        rating.push(format!("★ {score:.1}"));
+        rating.push(format!("{} {score:.1}", icon::STAR));
     }
     if let Some(official) = text("OfficialRating") {
         rating.push(official);
@@ -8129,7 +8177,7 @@ async fn jellyfin_job_details(
     });
     let mut facts = Vec::new();
     if let Some(score) = number("CommunityRating") {
-        facts.push(format!("★ {score:.1}"));
+        facts.push(format!("{} {score:.1}", icon::STAR));
     }
     if let Some(rating) = text("OfficialRating") {
         facts.push(rating);
@@ -8418,7 +8466,7 @@ fn render_job_details(
         }
         fact_spans.push(Span::styled(
             fact.clone(),
-            if fact.starts_with('★') {
+            if fact.starts_with(icon::STAR) {
                 Style::default().fg(Color::Yellow)
             } else {
                 Style::default().fg(Color::White)
@@ -8589,9 +8637,13 @@ fn media_badges(probe: &serde_json::Value) -> Vec<String> {
     };
     let mut badges = Vec::new();
     if let Some(video) = of_type("video").first() {
-        badges.push(resolution_label(
-            number(video, "width").unwrap_or(0),
-            number(video, "height").unwrap_or(0),
+        badges.push(format!(
+            "{} {}",
+            icon::VIDEO,
+            resolution_label(
+                number(video, "width").unwrap_or(0),
+                number(video, "height").unwrap_or(0),
+            )
         ));
         if let Some(codec) = text(video, "codec_name") {
             badges.push(match codec.as_str() {
@@ -8612,23 +8664,23 @@ fn media_badges(probe: &serde_json::Value) -> Vec<String> {
         .find(|stream| disposition(stream, "default"))
         .or(audio.first())
     {
-        badges.push(format!(
-            "{} {}",
+        let mut badge = format!(
+            "{} {} {}",
+            icon::AUDIO,
             text(track, "codec_name")
                 .unwrap_or_else(|| "?".into())
                 .to_uppercase(),
             channel_label(number(track, "channels"))
-        ));
-    }
-    if audio.len() > 1 {
-        badges.push(format!("{} audio", audio.len()));
+        );
+        // Other audio tracks besides the default one.
+        if audio.len() > 1 {
+            badge.push_str(&format!(" +{}", audio.len() - 1));
+        }
+        badges.push(badge);
     }
     let subtitles = of_type("subtitle").len();
     if subtitles > 0 {
-        badges.push(format!(
-            "{subtitles} {}",
-            if subtitles == 1 { "sub" } else { "subs" }
-        ));
+        badges.push(format!("{} {subtitles}", icon::SUBTITLES));
     }
     badges
 }
@@ -9071,7 +9123,7 @@ fn watched_label(
     now: i64,
 ) -> Option<(String, bool)> {
     let state = state.filter(|state| state.played)?;
-    let mut label = "✓ watched".to_string();
+    let mut label = format!("{} watched", icon::WATCHED);
     if state.pending {
         label.push_str(" (not synced)");
     }
@@ -9369,7 +9421,13 @@ mod tests {
         });
         assert_eq!(
             media_badges(&probe),
-            ["4K", "HEVC", "HDR10", "EAC3 5.1", "2 audio", "1 sub"]
+            [
+                "\u{f0567} 4K",
+                "HEVC",
+                "HDR10",
+                "\u{f057e} EAC3 5.1 +1",
+                "\u{f0a16} 1"
+            ]
         );
         let rows = media_summary(&probe);
         assert!(
@@ -10304,9 +10362,9 @@ jobs:
             played_at: Some(played_at.into()),
         };
         let (label, soon) = watched_label(Some(&state), Some(grace), played + 86_400).unwrap();
-        assert_eq!(label, "✓ watched (not synced) · deleted in 6d");
+        assert_eq!(label, "\u{f0208} watched (not synced) · deleted in 6d");
         let (label, _) = watched_label(Some(&state), Some(grace), played + 60).unwrap();
-        assert_eq!(label, "✓ watched (not synced) · deleted in 7d");
+        assert_eq!(label, "\u{f0208} watched (not synced) · deleted in 7d");
         assert!(!soon);
         let (label, soon) = watched_label(Some(&state), Some(grace), played + 8 * 86_400).unwrap();
         assert!(label.ends_with("deleted at next sync") && soon);
@@ -10318,7 +10376,7 @@ jobs:
         assert!(watched_label(Some(&unwatched), Some(grace), played).is_none());
         assert_eq!(
             watched_label(Some(&state), None, played).unwrap().0,
-            "✓ watched (not synced)"
+            "\u{f0208} watched (not synced)"
         );
     }
 

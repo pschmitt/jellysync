@@ -635,6 +635,10 @@ jellysync prune --watched
 jellysync --config /path/to/config.yaml config
 ```
 
+`jellysync status` and the TUI draw their state icons with
+[Nerd Font](https://www.nerdfonts.com/) (Material Design) glyphs, so use a
+terminal font patched with them.
+
 ## Options
 
 - `-c, --config FILE`: Specify config file path (default: `jellysync.yaml`)
@@ -695,7 +699,7 @@ auto job's limits and library.
 jellysync keeps the Jellyfin user's played state for every tracked file in its
 state database, so the TUI shows it offline too:
 
-- file rows show `✓ watched`, season headings `N watched`, and job rows
+- file rows show a watched (eye) icon, season headings `N watched`, and job rows
   `N/M watched`; the Details panel has a *Watched* line;
 - `w` toggles the focused file watched (in the Jobs list: the whole job) and
   `W` its season. Marks made offline are shown as *not synced* and sent to

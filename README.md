@@ -227,7 +227,8 @@ clippy, and `just check` runs everything.
 `just screenshot` retakes `docs/screenshot.png` on the build host (it needs
 Docker there): it starts a throwaway Jellyfin container holding only Creative
 Commons media, syncs it with a throwaway config and captures the TUI in a real
-kitty under a virtual X server. The default font is JetBrains Mono. To use a
+kitty under a virtual X server. The default font is JetBrainsMono Nerd Font
+(the TUI draws its icons with Nerd Font glyphs). To use a
 font that can't live in this repository, pass its family and a local font
 directory, e.g. `just screenshot rofl-13 "ComicCode Nerd Font" ~/fonts/comic-code`.
 

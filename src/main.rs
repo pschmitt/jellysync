@@ -5991,9 +5991,9 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 frame.render_widget(Paragraph::new(header_text), header);
 
                 let jobs_title = if job_search.is_empty() {
-                    format!("Jobs · {}", jobs.len())
+                    format!("{} Jobs · {}", icon::LIST, jobs.len())
                 } else {
-                    format!("Jobs · {} of {total_jobs}", jobs.len())
+                    format!("{} Jobs · {} of {total_jobs}", icon::LIST, jobs.len())
                 };
                 if let Some(search_area) = job_search_area {
                     let mut spans = vec![
@@ -6019,10 +6019,11 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     .filter(|entry| entry.status != "ignored")
                     .fold(0u64, |total, entry| total.saturating_add(entry.total.unwrap_or(entry.bytes)));
                 let downloads_title = match selected_job {
-                    None => "Files · no job selected".to_string(),
+                    None => format!("{} Files · no job selected", icon::FILES),
                     Some(job) => {
                         let mut title = format!(
-                            "Files: {} · {} {}",
+                            "{} Files: {} · {} {}",
+                            icon::FILES,
                             job.name.trim_start_matches("library:"),
                             file_count,
                             if file_count == 1 { "file" } else { "files" }
@@ -6551,10 +6552,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 } else {
                     let mut shortcut_spans = Vec::new();
                     // Hints follow the focused panel so every key shown does something.
-                    let mut shortcuts = vec![("Tab", "focus")];
-                    if area.width >= 110 {
-                        shortcuts.push(("↑/↓", "move"));
-                    }
+                    let mut shortcuts = Vec::new();
                     if download_focus && !downloads.is_empty() {
                         shortcuts.extend([("p", "play"), ("w", "watched"), ("i", "info"), ("x", "clear")]);
                     } else {

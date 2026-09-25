@@ -11,7 +11,8 @@
 # protocol) under a virtual X server with software OpenGL.
 #
 # Environment:
-#   FONT_FAMILY    kitty font (default: JetBrains Mono)
+#   FONT_FAMILY    kitty font (default: JetBrainsMono Nerd Font; the TUI
+#                  draws its icons with Nerd Font glyphs)
 #   FONT_DIR       extra font directory to make FONT_FAMILY available
 #   JELLYFIN_PORT  loopback port for the throwaway server (default: any free one)
 #   OUTPUT         image path (default: docs/screenshot.png)
@@ -25,7 +26,7 @@ WINDOW_HEIGHT=920
 
 WORK_DIR="$PWD/.screenshot"
 CONTAINER="jellysync-screenshot-$$"
-FONT_FAMILY="${FONT_FAMILY:-JetBrains Mono}"
+FONT_FAMILY="${FONT_FAMILY:-JetBrainsMono Nerd Font}"
 FONT_DIR="${FONT_DIR:-}"
 JELLYFIN_PORT="${JELLYFIN_PORT:-}"
 OUTPUT="${OUTPUT:-docs/screenshot.png}"
@@ -257,7 +258,7 @@ write_kitty_config() {
   then
     font_dirs="<dir>$FONT_DIR</dir>"
   else
-    font_dirs="<dir>$(nix_path jetbrains-mono)/share/fonts</dir>"
+    font_dirs="<dir>$(nix_path nerd-fonts.jetbrains-mono)/share/fonts</dir>"
   fi
   # DejaVu covers symbols the main font may lack (★ ◆ ✓ ▸).
   cat > "$WORK_DIR/fonts.conf" <<EOF

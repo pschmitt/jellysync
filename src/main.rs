@@ -142,9 +142,16 @@ enum Commands {
     /// Download all jobs, or only the given ones
     #[command(visible_aliases = ["fetch", "sync"])]
     Download {
-        /// Job names to download (default: all jobs)
+        /// Job names to download (default: all jobs); `auto` works without a
+        /// configured auto job: the newest unwatched items in Jellyfin
         #[arg(value_name = "JOB")]
         target: Vec<String>,
+        /// Item limit for auto jobs (overrides their max_items)
+        #[arg(long, value_name = "N")]
+        max_items: Option<usize>,
+        /// Size budget for auto jobs in GiB (overrides their max_size)
+        #[arg(long, value_name = "GIB")]
+        max_size: Option<f64>,
     },
     /// Show recent job status and the timer state
     Status,
@@ -301,16 +308,94 @@ struct Job {
     /// Per-job grace period, overriding `cleanup.delete_watched_after`.
     #[serde(default, deserialize_with = "duration_spec")]
     delete_watched_after: Option<String>,
+    /// Instead of a title: the newest unwatched movies and/or episodes in
+    /// Jellyfin (`true`/`all`, `movies`, `shows`), up to `max_items` (5 when no
+    /// limit is set) and/or `max_size`.
+    #[serde(default, deserialize_with = "auto_kind")]
+    auto: Option<AutoKind>,
+    #[serde(default)]
+    max_items: Option<usize>,
+    /// Size budget in GiB.
+    #[serde(default)]
+    max_size: Option<f64>,
+    /// Restrict an auto job to one Jellyfin library (by name).
+    #[serde(default)]
+    library: Option<String>,
 }
+
+/// What an auto job picks from.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AutoKind {
+    All,
+    Movies,
+    Shows,
+}
+
+impl AutoKind {
+    fn item_types(self) -> &'static str {
+        match self {
+            AutoKind::All => "Movie,Episode",
+            AutoKind::Movies => "Movie",
+            AutoKind::Shows => "Episode",
+        }
+    }
+}
+
+/// `auto: true`/`all`, `movies` or `shows` (`false` or absent: not an auto job).
+fn auto_kind<'de, D>(deserializer: D) -> std::result::Result<Option<AutoKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Spec {
+        Flag(bool),
+        Kind(String),
+    }
+    match Option::<Spec>::deserialize(deserializer)? {
+        None | Some(Spec::Flag(false)) => Ok(None),
+        Some(Spec::Flag(true)) => Ok(Some(AutoKind::All)),
+        Some(Spec::Kind(kind)) => match kind.trim().to_lowercase().as_str() {
+            "all" | "true" | "yes" => Ok(Some(AutoKind::All)),
+            "movies" | "movie" => Ok(Some(AutoKind::Movies)),
+            "shows" | "show" | "tv" | "series" | "episodes" => Ok(Some(AutoKind::Shows)),
+            "false" | "no" | "" => Ok(None),
+            other => Err(serde::de::Error::custom(format!(
+                "auto must be true, all, movies or shows, not '{other}'"
+            ))),
+        },
+    }
+}
+
+/// max_items for auto jobs that set no limit at all.
+const DEFAULT_AUTO_MAX_ITEMS: usize = 5;
 
 impl Job {
     fn enabled(&self) -> bool {
         self.enabled != Some(false)
     }
 
+    fn is_auto(&self) -> bool {
+        self.auto.is_some()
+    }
+
+    /// An auto job's item limit: its own, or the default when it sets no limit.
+    fn auto_max_items(&self) -> Option<usize> {
+        match (self.max_items, self.max_size) {
+            (None, None) => Some(DEFAULT_AUTO_MAX_ITEMS),
+            (max_items, _) => max_items,
+        }
+    }
+
+    /// Auto jobs delete watched files unless told otherwise; others only on request.
+    fn deletes_watched(&self) -> bool {
+        self.delete_watched.unwrap_or(self.is_auto())
+    }
+
     /// Grace period before this job's watched files are deleted, if it deletes them.
     fn watched_grace(&self, config: &Config) -> Option<Duration> {
-        if self.delete_watched != Some(true) {
+        if !self.deletes_watched() {
             return None;
         }
         let spec = self
@@ -482,6 +567,20 @@ fn parse_config(value: serde_yaml::Value) -> Result<Config> {
     {
         parse_duration(spec).context("cleanup.delete_watched_after")?;
     }
+    for job in config.jobs.iter().filter(|job| job.is_auto()) {
+        if job
+            .max_size
+            .is_some_and(|size| !size.is_finite() || size <= 0.0)
+        {
+            bail!(
+                "auto job '{}': max_size must be a positive number of GiB",
+                job.name
+            );
+        }
+        if config.download.mode != "jellyfin" {
+            bail!("auto job '{}' needs Jellyfin download mode", job.name);
+        }
+    }
     for job in &config.jobs {
         if let Some(spec) = job.delete_watched_after.as_deref() {
             parse_duration(spec)
@@ -523,6 +622,11 @@ enum SettingKind {
     Filter,
     Toggle,
     Duration,
+    /// Enter cycles through the values; the first one clears the setting.
+    Choice(&'static [&'static str]),
+    Number,
+    /// A size in GiB.
+    Gib,
 }
 
 /// A job setting that the TUI can edit.
@@ -534,7 +638,60 @@ struct JobSetting {
     help: &'static str,
 }
 
-fn job_settings(mode: &str) -> Vec<JobSetting> {
+const AUTO_SETTING: JobSetting = JobSetting {
+    key: "auto",
+    label: "Auto (newest)",
+    kind: SettingKind::Choice(&["off", "all", "movies", "shows"]),
+    help: "instead of a title: the newest unwatched movies and/or episodes in Jellyfin",
+};
+
+/// Settings of an auto job: what it picks and its limits, plus cleanup.
+fn auto_job_settings() -> Vec<JobSetting> {
+    vec![
+        AUTO_SETTING,
+        JobSetting {
+            key: "max_items",
+            label: "Max items",
+            kind: SettingKind::Number,
+            help: "keep at most this many of the newest items (5 when no limit is set)",
+        },
+        JobSetting {
+            key: "max_size",
+            label: "Max size (GiB)",
+            kind: SettingKind::Gib,
+            help: "keep the newest items that fit this size budget, e.g. 30 or 7.5",
+        },
+        JobSetting {
+            key: "library",
+            label: "Library",
+            kind: SettingKind::Text,
+            help: "only pick from this Jellyfin library (by name); empty: all libraries",
+        },
+        JobSetting {
+            key: "enabled",
+            label: "Enabled",
+            kind: SettingKind::Toggle,
+            help: "disabled jobs are skipped when syncing all jobs",
+        },
+        JobSetting {
+            key: "delete_watched",
+            label: "Delete watched",
+            kind: SettingKind::Toggle,
+            help: "auto jobs delete watched files after the grace period unless this is off",
+        },
+        JobSetting {
+            key: "delete_watched_after",
+            label: "Keep watched for",
+            kind: SettingKind::Duration,
+            help: "grace period before watched files are deleted, e.g. 7d, 12h (default: cleanup setting, 7d)",
+        },
+    ]
+}
+
+fn job_settings(mode: &str, job: &Job) -> Vec<JobSetting> {
+    if job.is_auto() {
+        return auto_job_settings();
+    }
     let mut settings = vec![
         JobSetting {
             key: "jellyfin_name",
@@ -587,6 +744,8 @@ fn job_settings(mode: &str) -> Vec<JobSetting> {
             kind: SettingKind::Toggle,
             help: "match the remote directory as *name*",
         });
+    } else {
+        settings.push(AUTO_SETTING);
     }
     settings
 }
@@ -616,6 +775,17 @@ fn job_setting_text(job: &Job, key: &str) -> Option<String> {
     match key {
         "jellyfin_name" => job.jellyfin_name.clone(),
         "delete_watched_after" => job.delete_watched_after.clone(),
+        "auto" => job.auto.map(|kind| {
+            match kind {
+                AutoKind::All => "all",
+                AutoKind::Movies => "movies",
+                AutoKind::Shows => "shows",
+            }
+            .to_string()
+        }),
+        "max_items" => job.max_items.map(|max| max.to_string()),
+        "max_size" => job.max_size.map(|max| format!("{max}")),
+        "library" => job.library.clone(),
         "seasons" => yaml(job.seasons.as_ref()),
         "episodes" => yaml(job.episodes.as_ref()),
         _ => None,
@@ -627,7 +797,7 @@ fn job_setting_bool(job: &Job, key: &str) -> Option<bool> {
         "unwatched" => job.unwatched,
         "wildcard" => job.wildcard,
         "enabled" => Some(job.enabled()),
-        "delete_watched" => job.delete_watched,
+        "delete_watched" => Some(job.deletes_watched()),
         _ => None,
     }
 }
@@ -644,6 +814,23 @@ fn parse_setting_input(kind: SettingKind, input: &str) -> Result<SettingChange> 
             parse_duration(input)?;
             Ok(SettingChange::Set(input.into()))
         }
+        SettingKind::Number => Ok(SettingChange::Set(
+            input
+                .parse::<u64>()
+                .with_context(|| format!("'{input}' is not a whole number"))?
+                .into(),
+        )),
+        SettingKind::Gib => {
+            let size: f64 = input
+                .parse()
+                .with_context(|| format!("'{input}' is not a size in GiB"))?;
+            if !size.is_finite() || size <= 0.0 {
+                bail!("the size must be a positive number of GiB");
+            }
+            Ok(SettingChange::Set(size.into()))
+        }
+        // Chosen by cycling, not typed.
+        SettingKind::Choice(_) => Ok(SettingChange::Set(input.into())),
         SettingKind::Filter => {
             let value = match input.parse::<u64>() {
                 Ok(number) => serde_yaml::Value::from(number),
@@ -1721,6 +1908,16 @@ struct MediaItem {
     parent_index_number: Option<u32>,
     index_number: Option<u32>,
     user_data: Option<UserData>,
+    #[serde(default)]
+    series_name: Option<String>,
+    #[serde(default)]
+    media_sources: Option<Vec<MediaSource>>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MediaSource {
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 type PosterFetch = Result<Option<(Vec<u8>, StatefulProtocol)>>;
@@ -2040,6 +2237,7 @@ async fn jellyfin_job_poster_catalog(
     let mut poster_jobs: Vec<(String, String)> = config
         .jobs
         .iter()
+        .filter(|job| !job.is_auto())
         .map(|job| {
             (
                 job.name.clone(),
@@ -2320,6 +2518,8 @@ async fn library_worker(config: &Config, job: &str) -> Result<()> {
                     parent_index_number: None,
                     index_number: None,
                     user_data: None,
+                    series_name: None,
+                    media_sources: None,
                 };
                 let id = item.id.clone();
                 (
@@ -2722,9 +2922,55 @@ async fn jellyfin_job(
     slots: Arc<Semaphore>,
     quiet: bool,
 ) -> Result<()> {
-    let (api, movie_mode, items) = jellyfin_job_items(config, job).await?;
-    if items.is_empty() {
-        let message = if job.unwatched == Some(true) {
+    let pattern = config
+        .library
+        .as_ref()
+        .map(|l| l.season_pattern.clone())
+        .unwrap_or_else(default_season_pattern);
+    let (api, planned) = if job.is_auto() {
+        let (api, planned, rotated) = auto_job_plan(config, job, &pattern).await?;
+        // Newer items pushed these out of the window; free their space first.
+        if !rotated.is_empty() {
+            let removed = clear_tracked(config, &rotated, false)?;
+            if !quiet {
+                say!(
+                    "{} {}  {}",
+                    "▸".with(TerminalColor::DarkGrey),
+                    job.name.clone().with(TerminalColor::Grey).bold(),
+                    format!("removed {removed} item(s) that newer ones replaced")
+                        .with(TerminalColor::DarkGrey)
+                );
+            }
+        }
+        (api, planned)
+    } else {
+        let (api, movie_mode, items) = jellyfin_job_items(config, job).await?;
+        let destination = PathBuf::from(resolved_path(config, job, false)?);
+        let planned = items
+            .into_iter()
+            .filter_map(|item| {
+                let output =
+                    item_destination(&item, &destination, &pattern, &job.name, movie_mode).ok()?;
+                Some((item, output))
+            })
+            .collect();
+        (api, planned)
+    };
+    download_planned(&api, job, planned, slots, quiet).await
+}
+
+/// Download planned items (with their destinations) for a job and record its status.
+async fn download_planned(
+    api: &JellyfinApi,
+    job: &Job,
+    planned: Vec<(MediaItem, PathBuf)>,
+    slots: Arc<Semaphore>,
+    quiet: bool,
+) -> Result<()> {
+    if planned.is_empty() {
+        let message = if job.is_auto() {
+            "Nothing new within the limits".to_string()
+        } else if job.unwatched == Some(true) {
             "No new episodes (unwatched-only)".to_string()
         } else {
             "No media matched current filters".to_string()
@@ -2740,7 +2986,7 @@ async fn jellyfin_job(
         }
         return Ok(());
     }
-    let count = items.len();
+    let count = planned.len();
     if !quiet {
         say!(
             "{} {}  {}",
@@ -2749,30 +2995,21 @@ async fn jellyfin_job(
             format!("{count} item(s)").with(TerminalColor::DarkGrey)
         );
     }
-    let destination = PathBuf::from(resolved_path(config, job, false)?);
-    std::fs::create_dir_all(&destination)?;
     update_job(&job.name, "running", &format!("{count} item(s)"))?;
-    let pattern = config
-        .library
-        .as_ref()
-        .map(|l| l.season_pattern.clone())
-        .unwrap_or_else(default_season_pattern);
     // Record every pending item up front so ones waiting for a worker slot show as queued.
-    for item in &items {
-        if let Ok(output) = item_destination(item, &destination, &pattern, &job.name, movie_mode) {
-            mark_queued(&job.name, item, &output)?;
+    for (item, output) in &planned {
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        mark_queued(&job.name, item, output)?;
     }
     let mut tasks = JoinSet::new();
-    for item in items {
+    for (item, output) in planned {
         let api = api.clone();
         let name = job.name.clone();
-        let destination = destination.clone();
-        let pattern = pattern.clone();
         let permit = slots.clone().acquire_owned().await?;
         tasks.spawn(async move {
             let _permit = permit;
-            let output = item_destination(&item, &destination, &pattern, &name, movie_mode)?;
             jellyfin_download(&api, &name, &item, &output, quiet).await
         });
     }
@@ -2794,6 +3031,190 @@ async fn jellyfin_job(
     }
     update_job(&job.name, "success", &format!("{count} item(s) downloaded"))?;
     Ok(())
+}
+
+/// The id of the user's Jellyfin library (view) with this name.
+async fn jellyfin_library_id(api: &JellyfinApi, name: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct View {
+        id: String,
+        name: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Views {
+        items: Vec<View>,
+    }
+    let views: Views = api
+        .client
+        .get(format!("{}/Users/{}/Views", api.base, api.user_id))
+        .header("Authorization", jellyfin_authorization(&api.token))
+        .send()
+        .await
+        .context("query Jellyfin libraries")?
+        .error_for_status()
+        .context("Jellyfin library query failed")?
+        .json()
+        .await
+        .context("parse Jellyfin libraries")?;
+    let names: Vec<String> = views.items.iter().map(|view| view.name.clone()).collect();
+    views
+        .items
+        .into_iter()
+        .find(|view| view.name.eq_ignore_ascii_case(name))
+        .map(|view| view.id)
+        .with_context(|| {
+            format!(
+                "no Jellyfin library named '{name}' (have: {})",
+                names.join(", ")
+            )
+        })
+}
+
+/// Pick the newest items that fit: at most `max_items`, and a total size of at
+/// most `max_bytes`. Candidates come newest first; one too big for the space
+/// left is skipped so smaller, older ones can still fill it. Items of unknown
+/// size count as zero bytes.
+fn select_auto_items(
+    candidates: &[(String, Option<u64>)],
+    max_items: Option<usize>,
+    max_bytes: Option<u64>,
+) -> Vec<String> {
+    let mut selected = Vec::new();
+    let mut used = 0u64;
+    for (id, size) in candidates {
+        if max_items.is_some_and(|max| selected.len() >= max) {
+            break;
+        }
+        let size = size.unwrap_or(0);
+        if max_bytes.is_some_and(|max| used.saturating_add(size) > max) {
+            continue;
+        }
+        used = used.saturating_add(size);
+        selected.push(id.clone());
+    }
+    selected
+}
+
+/// Plan an auto job: the newest unwatched movies and episodes within its limits,
+/// with destinations laid out like ad-hoc downloads, and the tracked items that
+/// newer ones pushed out of the window (to delete). Watched items are left to
+/// the watched cleanup and its grace period.
+async fn auto_job_plan(
+    config: &Config,
+    job: &Job,
+    pattern: &str,
+) -> Result<(JellyfinApi, Vec<(MediaItem, PathBuf)>, Vec<DownloadEntry>)> {
+    let credentials = config
+        .jellyfin
+        .as_ref()
+        .context("auto jobs require Jellyfin credentials")?;
+    let api = jellyfin_login(credentials).await?;
+    let kind = job.auto.unwrap_or(AutoKind::All);
+    let mut query = vec![
+        ("Recursive", "true".to_string()),
+        ("IncludeItemTypes", kind.item_types().to_string()),
+        ("SortBy", "DateCreated,SortName".to_string()),
+        ("SortOrder", "Descending".to_string()),
+        (
+            "Fields",
+            "Path,UserData,MediaSources,ParentIndexNumber,IndexNumber,ProductionYear".to_string(),
+        ),
+        ("Limit", "500".to_string()),
+    ];
+    if let Some(library) = job.library.as_deref() {
+        query.push(("ParentId", jellyfin_library_id(&api, library).await?));
+    }
+    let query: Vec<(&str, &str)> = query
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect();
+    let items = jellyfin_items(&api, &query).await?;
+    let server_played: Vec<_> = items
+        .iter()
+        .filter_map(|item| {
+            let data = item.user_data.as_ref()?;
+            Some((
+                item.id.clone(),
+                data.is_played?,
+                data.last_played_date.as_deref().and_then(jellyfin_datetime),
+            ))
+        })
+        .collect();
+    let conn = db()?;
+    record_server_watched(&conn, &server_played)?;
+    let local = watched_states(&conn)?;
+    let played = |item: &MediaItem| match local.get(&item.id) {
+        Some(state) if state.pending => state.played,
+        _ => item.user_data.as_ref().and_then(|data| data.is_played) == Some(true),
+    };
+    let ignored = ignored_items()?;
+    // Items another job already tracks are on disk already; claiming them would
+    // let this job's rotation delete files that job wants (and it would download
+    // them again).
+    let tracked = tracked_downloads()?;
+    let owned_elsewhere: HashSet<&str> = tracked
+        .iter()
+        .filter(|entry| entry.job != job.name && entry.status != "cleared")
+        .map(|entry| entry.item_id.as_str())
+        .collect();
+    let unwatched_only = job.unwatched != Some(false);
+    let eligible: Vec<&MediaItem> = items
+        .iter()
+        .filter(|item| item.path.is_some())
+        .filter(|item| !ignored.contains(&item.id))
+        .filter(|item| !owned_elsewhere.contains(item.id.as_str()))
+        .filter(|item| !unwatched_only || !played(item))
+        .collect();
+    let candidates: Vec<(String, Option<u64>)> = eligible
+        .iter()
+        .map(|item| {
+            let size = item
+                .media_sources
+                .as_ref()
+                .and_then(|sources| sources.first())
+                .and_then(|source| source.size);
+            (item.id.clone(), size)
+        })
+        .collect();
+    let max_bytes = job
+        .max_size
+        .map(|gib| (gib * 1024.0 * 1024.0 * 1024.0) as u64);
+    let window: HashSet<String> = select_auto_items(&candidates, job.auto_max_items(), max_bytes)
+        .into_iter()
+        .collect();
+    let root = PathBuf::from(&config.local.root);
+    let mut planned = Vec::new();
+    for item in eligible
+        .into_iter()
+        .filter(|item| window.contains(&item.id))
+    {
+        let movie = item.item_type.as_deref() == Some("Movie");
+        let (folder, show) = if movie {
+            (
+                root.join("Movies").join(safe_component(&item.name)),
+                item.name.clone(),
+            )
+        } else {
+            let series = item
+                .series_name
+                .clone()
+                .unwrap_or_else(|| item.name.clone());
+            (root.join("TV Shows").join(safe_component(&series)), series)
+        };
+        if let Ok(output) = item_destination(item, &folder, pattern, &show, movie) {
+            planned.push((item.clone(), output));
+        }
+    }
+    let rotated = tracked
+        .into_iter()
+        .filter(|entry| entry.job == job.name)
+        .filter(|entry| !matches!(entry.status.as_str(), "ignored" | "downloading"))
+        .filter(|entry| !window.contains(&entry.item_id))
+        .filter(|entry| !local.get(&entry.item_id).is_some_and(|state| state.played))
+        .collect();
+    Ok((api, planned, rotated))
 }
 
 async fn jellyfin_job_items(
@@ -3376,6 +3797,41 @@ async fn run_sync_mode(
     }
     Ok(())
 }
+/// Apply `download`'s auto options: a target named `auto` without a configured
+/// job of that name gets an implicit auto job (all media), and `--max-items` /
+/// `--max-size` override the limits of the auto jobs being synced.
+fn with_auto_target(
+    mut config: Config,
+    targets: &[String],
+    max_items: Option<usize>,
+    max_size: Option<f64>,
+) -> Result<Config> {
+    if targets.iter().any(|target| target == "auto")
+        && config.jobs.iter().all(|job| job.name != "auto")
+    {
+        config
+            .jobs
+            .push(serde_yaml::from_str("{name: auto, auto: true}")?);
+    }
+    if max_items.is_none() && max_size.is_none() {
+        return Ok(config);
+    }
+    let mut applied = false;
+    for job in &mut config.jobs {
+        if job.is_auto() && (targets.is_empty() || targets.contains(&job.name)) {
+            // A single CLI limit replaces both of the job's limits, so
+            // `--max-size 20` is not still capped by a configured max_items.
+            job.max_items = max_items;
+            job.max_size = max_size;
+            applied = true;
+        }
+    }
+    if !applied {
+        bail!("--max-items and --max-size only apply to auto jobs (try `jellysync download auto`)");
+    }
+    parse_config(serde_yaml::to_value(&config)?)
+}
+
 fn selected_jobs(config: &Config, targets: &[String]) -> Result<Vec<Job>> {
     let jobs: Vec<Job> = if targets.is_empty() {
         if config.jobs.is_empty() {
@@ -3718,7 +4174,8 @@ async fn prune(
             )
             .await?;
             let tracked = tracked_downloads()?;
-            for job in &jobs {
+            // Auto jobs rotate their own items out; they have no title to check.
+            for job in jobs.iter().filter(|job| !job.is_auto()) {
                 let current = jellyfin_item_ids(&api, job).await?;
                 doomed.extend(
                     tracked
@@ -4050,7 +4507,8 @@ async fn reconcile_existing(config: &Config) -> Result<usize> {
         .map(|library| library.season_pattern.clone())
         .unwrap_or_else(default_season_pattern);
     let mut indexed = 0;
-    for job in &config.jobs {
+    // Auto jobs have no title to look up; their files are tracked as they download.
+    for job in config.jobs.iter().filter(|job| !job.is_auto()) {
         let mut scan_job = job.clone();
         scan_job.seasons = None;
         scan_job.episodes = None;
@@ -5569,7 +6027,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                 Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
                             )),
                         ]);
-                        let settings = job_settings(&config.download.mode);
+                        let settings = job_settings(&config.download.mode, job);
                         let cursor = editor.cursor.min(settings.len() - 1);
                         let value_width = usize::from(area.width.min(84).saturating_sub(34));
                         for (index, setting) in settings.iter().enumerate() {
@@ -5581,6 +6039,13 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                 }
                                 _ => job_setting_text(job, setting.key).unwrap_or_else(|| match setting.key {
                                     "jellyfin_name" => format!("{} (job name)", job.name),
+                                    "auto" => "off".into(),
+                                    "max_items" if job.max_size.is_none() => {
+                                        format!("{DEFAULT_AUTO_MAX_ITEMS} (default)")
+                                    }
+                                    "max_items" | "max_size" => "no limit".into(),
+                                    "library" => "all libraries".into(),
+                                    "delete_watched_after" => "cleanup setting".into(),
                                     _ => "all".into(),
                                 }),
                             };
@@ -5590,7 +6055,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                     Style::default().fg(Color::Cyan),
                                 ),
                                 Span::styled(
-                                    format!("{:<16}", setting.label),
+                                    format!("{:<18}", setting.label),
                                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
@@ -6597,8 +7062,8 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         .get(selected)
                         .and_then(|selected| config.jobs.iter().find(|job| job.name == selected.name))
                         .cloned();
-                    let settings = job_settings(&config.download.mode);
-                    let setting = settings.get(editor.cursor.min(settings.len() - 1)).copied();
+                    let settings = job.as_ref().map_or_else(Vec::new, |job| job_settings(&config.download.mode, job));
+                    let setting = settings.get(editor.cursor.min(settings.len().saturating_sub(1))).copied();
                     // The change to save, if this key produced one.
                     let mut change = None;
                     match (&job, editor.input.as_mut()) {
@@ -6636,6 +7101,17 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                     if setting.kind == SettingKind::Toggle {
                                         let current = job_setting_bool(job, setting.key).unwrap_or(false);
                                         change = Some(SettingChange::Set(serde_yaml::Value::Bool(!current)));
+                                    } else if let SettingKind::Choice(choices) = setting.kind {
+                                        let current = job_setting_text(job, setting.key).unwrap_or_default();
+                                        let next = choices
+                                            .iter()
+                                            .position(|choice| *choice == current)
+                                            .map_or(1, |index| (index + 1) % choices.len());
+                                        change = Some(if next == 0 {
+                                            SettingChange::Clear
+                                        } else {
+                                            SettingChange::Set(choices[next].into())
+                                        });
                                     } else if key.code != KeyCode::Char(' ') {
                                         editor.input = Some(job_setting_text(job, setting.key).unwrap_or_default());
                                         editor.error = None;
@@ -7553,8 +8029,22 @@ fn file_rows(downloads: &mut [DownloadEntry], details: Option<&JobDetails>) -> V
     if !grouped {
         return (0..downloads.len()).map(FileRow::File).collect();
     }
+    // The show (or movie) folder: above the season folder for episodes. Auto
+    // jobs mix several; then headings name the show and shows sort together.
+    let show_of = |entry: &DownloadEntry| {
+        let folder = entry.path.parent()?;
+        let show = if season_of(entry).is_some() {
+            folder.parent()?
+        } else {
+            folder
+        };
+        Some(show.file_name()?.to_string_lossy().into_owned())
+    };
+    let shows: HashSet<_> = downloads.iter().map(show_of).collect();
+    let several_shows = shows.len() > 1;
     downloads.sort_by_cached_key(|entry| {
         (
+            several_shows.then(|| show_of(entry)).flatten(),
             season_of(entry).unwrap_or(u32::MAX),
             entry.path.parent().map(Path::to_path_buf),
             episode_of(entry).unwrap_or(u32::MAX),
@@ -7572,7 +8062,11 @@ fn file_rows(downloads: &mut [DownloadEntry], details: Option<&JobDetails>) -> V
                 .and_then(Path::file_name)
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            rows.push(FileRow::Season(season_label(key.0, &folder)));
+            let label = match (several_shows, key.0, show_of(entry)) {
+                (true, Some(_), Some(show)) => format!("{show} · {}", season_label(key.0, &folder)),
+                _ => season_label(key.0, &folder),
+            };
+            rows.push(FileRow::Season(label));
             current = Some(key);
         }
         rows.push(FileRow::File(index));
@@ -8114,6 +8608,10 @@ fn job_directory(config: &Config, job_name: &str) -> Result<PathBuf> {
         .iter()
         .find(|job| job.name == job_name)
         .with_context(|| format!("unknown job {job_name}"))?;
+    // Auto jobs spread over Movies/ and TV Shows/ under the download root.
+    if job.is_auto() {
+        return Ok(PathBuf::from(&config.local.root));
+    }
     let path = PathBuf::from(expand_home(&resolved_path(config, job, false)?));
     if !path.is_dir() {
         bail!("{} does not exist yet", path.display());
@@ -8442,7 +8940,12 @@ async fn main() -> Result<()> {
                 bail!("parallelism must be at least 1");
             }
             match command {
-                Some(Commands::Download { target }) => {
+                Some(Commands::Download {
+                    target,
+                    max_items,
+                    max_size,
+                }) => {
+                    let config = with_auto_target(config, &target, max_items, max_size)?;
                     let result =
                         run_sync_mode(config.clone(), target.clone(), parallelism, cli.json).await;
                     if target.is_empty() {
@@ -8888,6 +9391,8 @@ jobs: []",
             parent_index_number: Some(2),
             index_number: Some(3),
             user_data: None,
+            series_name: None,
+            media_sources: None,
         }
     }
 
@@ -9573,5 +10078,130 @@ cleanup: {delete_watched_after: soon}",
         for job in &config.jobs {
             validate_job_filters(job).unwrap();
         }
+    }
+
+    #[test]
+    fn auto_selection_respects_both_limits() {
+        let gib = 1024 * 1024 * 1024;
+        let candidates: Vec<(String, Option<u64>)> = vec![
+            ("new".into(), Some(2 * gib)),
+            ("huge".into(), Some(40 * gib)),
+            ("mid".into(), Some(3 * gib)),
+            ("old".into(), Some(gib)),
+            ("oldest".into(), None),
+        ];
+        assert_eq!(
+            select_auto_items(&candidates, Some(2), None),
+            ["new", "huge"]
+        );
+        // Too big for what is left is skipped; smaller, older items fill up.
+        assert_eq!(
+            select_auto_items(&candidates, None, Some(6 * gib)),
+            ["new", "mid", "old", "oldest"]
+        );
+        assert_eq!(
+            select_auto_items(&candidates, Some(2), Some(6 * gib)),
+            ["new", "mid"]
+        );
+        assert!(select_auto_items(&candidates, Some(0), None).is_empty());
+    }
+
+    #[test]
+    fn auto_jobs_parse() {
+        let jobs: Vec<Job> = serde_yaml::from_str(
+            "[{name: a, auto: true}, {name: b, auto: movies, max_items: 10},
+              {name: c, auto: shows, max_size: 30}, {name: d, auto: false}, {name: e}]",
+        )
+        .unwrap();
+        assert_eq!(jobs[0].auto, Some(AutoKind::All));
+        assert_eq!(jobs[1].auto, Some(AutoKind::Movies));
+        assert_eq!(jobs[2].auto, Some(AutoKind::Shows));
+        assert!(!jobs[3].is_auto() && !jobs[4].is_auto());
+        // No limit at all: 5 items; a size limit alone means no item limit.
+        assert_eq!(jobs[0].auto_max_items(), Some(5));
+        assert_eq!(jobs[1].auto_max_items(), Some(10));
+        assert_eq!(jobs[2].auto_max_items(), None);
+        // Auto jobs clean up watched files unless told not to.
+        assert!(jobs[0].deletes_watched() && !jobs[4].deletes_watched());
+        assert!(serde_yaml::from_str::<Job>("{name: x, auto: sometimes}").is_err());
+    }
+
+    #[test]
+    fn auto_target_from_the_command_line() {
+        let config = parse_config(serde_yaml::from_str(BASE_CONFIG).unwrap()).unwrap();
+        let config = with_auto_target(config, &["auto".into()], None, Some(20.0)).unwrap();
+        let auto = config.jobs.iter().find(|job| job.name == "auto").unwrap();
+        assert_eq!(auto.auto, Some(AutoKind::All));
+        assert_eq!((auto.max_items, auto.max_size), (None, Some(20.0)));
+        // Limits without any auto job to apply them to are an error.
+        let config = parse_config(serde_yaml::from_str(BASE_CONFIG).unwrap()).unwrap();
+        assert!(with_auto_target(config, &["Pioneer One".into()], Some(3), None).is_err());
+        // rsync mode cannot run auto jobs.
+        let rsync =
+            BASE_CONFIG.replace("mode: jellyfin", "mode: rsync") + "  - {name: new, auto: true}\n";
+        assert!(parse_config(serde_yaml::from_str(&rsync).unwrap()).is_err());
+    }
+
+    #[test]
+    fn auto_job_files_group_by_show() {
+        let mut files = vec![
+            entry("m", "/v/Movies/Sintel/Sintel.mkv"),
+            entry(
+                "b2",
+                "/v/TV Shows/Pioneer One/Season 1/Pioneer One - S01E02.mkv",
+            ),
+            entry(
+                "a1",
+                "/v/TV Shows/Another Show/Season 1/Another Show - S01E01.mkv",
+            ),
+            entry(
+                "b1",
+                "/v/TV Shows/Pioneer One/Season 1/Pioneer One - S01E01.mkv",
+            ),
+        ];
+        let rows = file_rows(&mut files, None);
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|row| match row {
+                FileRow::Season(label) => label.clone(),
+                FileRow::File(index) => files[*index].item_id.clone(),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Another Show · Season 1",
+                "a1",
+                "Pioneer One · Season 1",
+                "b1",
+                "b2",
+                "Sintel",
+                "m"
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_jobs_edit_their_limits() {
+        let auto: Job = serde_yaml::from_str("{name: new, auto: shows}").unwrap();
+        let keys: Vec<_> = job_settings("jellyfin", &auto)
+            .iter()
+            .map(|setting| setting.key)
+            .collect();
+        assert!(
+            keys.contains(&"max_items") && keys.contains(&"max_size") && !keys.contains(&"seasons")
+        );
+        let normal: Job = serde_yaml::from_str("{name: x, directory: tv}").unwrap();
+        let keys: Vec<_> = job_settings("jellyfin", &normal)
+            .iter()
+            .map(|setting| setting.key)
+            .collect();
+        assert!(keys.contains(&"auto") && !keys.contains(&"max_items"));
+        assert_eq!(
+            parse_setting_input(SettingKind::Gib, "7.5").unwrap(),
+            SettingChange::Set(7.5.into())
+        );
+        assert!(parse_setting_input(SettingKind::Gib, "-1").is_err());
+        assert!(parse_setting_input(SettingKind::Number, "ten").is_err());
     }
 }

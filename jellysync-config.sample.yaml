@@ -141,6 +141,16 @@ jobs:
     directory: movies
     enabled: false
 
+  # Auto jobs: whatever is new in Jellyfin (newest unwatched first), within
+  # limits; items pushed out by newer ones are deleted on the next sync.
+  - name: New movies
+    auto: movies # or shows, or true for both
+    max_items: 10
+
+  - name: New episodes
+    auto: shows
+    max_size: 30 # GiB
+
   # Sync using wildcards (resolves to first match)
   - name: "Pioneer One (2010)"
     remote_dir: "$tv_shows/Pioneer One*"

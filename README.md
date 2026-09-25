@@ -157,6 +157,7 @@ schedule = "Mon *-*-* 02:00:00";
 ```console
 jellysync                     # Open the TUI (same as `jellysync tui`)
 jellysync download [JOB]...   # Download all jobs or selected ones (aliases: fetch, sync)
+jellysync download auto       # Download the newest unwatched items (--max-items, --max-size)
 jellysync status              # Show recent job status and timer state
 jellysync prune [JOB]...      # Delete removed media and watched files past their grace period
 jellysync prune --dry-run     # Only show what prune would delete (also -k, --dryrun)
@@ -494,6 +495,10 @@ Each job defines a sync operation.
 | `enabled` | No | boolean | `false` skips the job when syncing all jobs; it still runs when named (default `true`) |
 | `delete_watched` | No | boolean | Delete downloaded files once watched, after the grace period; watched items are not downloaded again |
 | `delete_watched_after` | No | duration | Grace period for this job, overriding `cleanup.delete_watched_after` (e.g. `3d`, `12h`, `0`) |
+| `auto` | No | `true`/`all`, `movies`, `shows` | Instead of a title: the newest unwatched movies and/or episodes (see [Auto jobs](#auto-jobs)) |
+| `max_items` | No | number | Auto jobs: keep at most this many items (5 when no limit is set) |
+| `max_size` | No | number | Auto jobs: size budget in GiB |
+| `library` | No | string | Auto jobs: only pick from this Jellyfin library |
 
 **Season Filtering:**
 
@@ -642,6 +647,48 @@ jellysync --config /path/to/config.yaml config
 - `tui`: Select a job to see its files; `s` syncs that job, `S` syncs all jobs, `b` opens Jellyfin Explore, and `o` opens the job's download directory. Explore searches the library, renders posters with `ratatui-image` (including Kitty graphics protocol support), shows a series' episodes in the details pane (`Tab` to focus, `Space`/`a` to select), and downloads movies or selected episodes with `d`. In the main view, `x` deletes the focused file (a later sync may download it again), `X` deletes it and makes syncs ignore it, and `c` deletes and ignores the whole show (all after a `y` confirmation); `x` on an ad-hoc job in the Jobs list removes it. `I` toggles ignoring the focused file without deleting it. `w` toggles the focused file watched (in the Jobs list: the whole job) and `W` its season (see [Watched state and cleanup](#watched-state-and-cleanup)). `p` or a double-click plays a file. `i` opens the job configuration, where its sync settings can be edited (see [Settings overlay](#settings-overlay-editing-from-the-tui)), or, with a file selected, `i`/`Enter` show a short `ffprobe` summary (container, duration, size, bitrate, video/audio/subtitle streams), plus the episode still, title, air date, rating, runtime, watched state and overview from Jellyfin when online; `p` plays the file from there. Mouse clicks and scrolling select rows.
 - `-h, --help`: Show help message
 - `--version`: Show version
+
+## Auto jobs
+
+An auto job downloads whatever is new in Jellyfin instead of a named title: the
+newest unwatched movies and/or episodes by date added, up to `max_items`
+and/or `max_size` (GiB). Without either limit it keeps 5 items. Several auto
+jobs can split the work, each with its own limits:
+
+```yaml
+jobs:
+  - name: New movies
+    auto: movies
+    max_items: 10
+
+  - name: New episodes
+    auto: shows        # or `true` / `all` for both
+    max_size: 30       # GiB
+    library: TV Shows  # optional: only this Jellyfin library
+```
+
+- Items are picked newest first; one too big for the space left is skipped so
+  smaller, older items can still fill it.
+- Files land where ad-hoc downloads go: `<local.root>/Movies/<Title>/…` and
+  `<local.root>/TV Shows/<Series>/Season N/…`.
+- When newer items push one out of the window, its file is deleted on the next
+  sync. Watched items leave through the watched cleanup instead: auto jobs
+  delete watched files after the grace period unless `delete_watched: false`.
+- Items another job already downloads are skipped, so jobs never fight over a
+  file. Ignored items are skipped too.
+
+`jellysync download auto` works without any configuration: it syncs a job
+named `auto` if there is one, and otherwise an implicit auto job for all media.
+`--max-items N` and `--max-size GIB` override the limits of the auto jobs
+being synced (one CLI limit replaces both configured ones):
+
+```bash
+jellysync download auto --max-items 3
+jellysync download "New episodes" --max-size 50
+```
+
+In the TUI, `i` on a job toggles **Auto** (off/all/movies/shows) and edits an
+auto job's limits and library.
 
 ## Watched state and cleanup
 

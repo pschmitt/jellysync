@@ -362,6 +362,42 @@
                         example = "3d";
                       };
 
+                      auto = mkOption {
+                        type = types.nullOr (
+                          types.either types.bool (
+                            types.enum [
+                              "all"
+                              "movies"
+                              "shows"
+                            ]
+                          )
+                        );
+                        default = null;
+                        description = "Instead of a title: the newest unwatched movies and/or episodes in Jellyfin (true/all, movies, shows).";
+                        example = "movies";
+                      };
+
+                      max_items = mkOption {
+                        type = types.nullOr types.ints.unsigned;
+                        default = null;
+                        description = "Auto jobs: keep at most this many of the newest items (5 when no limit is set).";
+                        example = 10;
+                      };
+
+                      max_size = mkOption {
+                        type = types.nullOr types.number;
+                        default = null;
+                        description = "Auto jobs: size budget in GiB.";
+                        example = 30;
+                      };
+
+                      library = mkOption {
+                        type = types.nullOr types.str;
+                        default = null;
+                        description = "Auto jobs: only pick from this Jellyfin library (by name).";
+                        example = "Kids";
+                      };
+
                       enabled = mkOption {
                         type = types.nullOr types.bool;
                         default = null;

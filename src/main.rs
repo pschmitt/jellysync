@@ -1055,6 +1055,67 @@ fn tmux_active_client() -> Option<String> {
     viewers.into_iter().max().map(|(_, name)| name)
 }
 
+/// How often to re-check the viewing tmux client's cell size.
+const CELL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Inside tmux the cell-size query is answered by tmux with the size of some
+/// client, which is wrong when clients with different fonts or DPI view the
+/// session (e.g. a HiDPI laptop plus an SSH client): kitty then shows images
+/// too large and crops them. Use the cell size of the client actually looking at
+/// this pane instead.
+fn with_viewer_cell_size(picker: Picker) -> Picker {
+    let Some(cell) = tmux_viewer_cell_size() else {
+        return picker;
+    };
+    if cell == picker.font_size() {
+        return picker;
+    }
+    let protocol = picker.protocol_type();
+    let mut updated = Picker::from_fontsize(cell);
+    updated.set_protocol_type(protocol);
+    updated
+}
+
+fn tmux_viewer_cell_size() -> Option<(u16, u16)> {
+    let pane = env::var("TMUX_PANE").ok()?;
+    env::var_os("TMUX")?;
+    let tmux = |args: &[&str]| {
+        std::process::Command::new("tmux")
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let window = tmux(&["display-message", "-p", "-t", &pane, "#{window_id}"])?;
+    let clients = tmux(&[
+        "list-clients",
+        "-F",
+        "#{client_activity}\t#{window_id}\t#{client_cell_width}\t#{client_cell_height}",
+    ])?;
+    viewer_cell_size(&clients, window.trim())
+}
+
+/// Cell size of the most recently active client viewing `window`, from
+/// `list-clients` output (activity, window id, cell width, cell height).
+fn viewer_cell_size(clients: &str, window: &str) -> Option<(u16, u16)> {
+    clients
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let [activity, window_id, width, height] = fields[..] else {
+                return None;
+            };
+            let (width, height): (u16, u16) = (width.parse().ok()?, height.parse().ok()?);
+            (window_id == window && width > 0 && height > 0)
+                .then_some((activity.parse::<u64>().ok()?, (width, height)))
+        })
+        .max_by_key(|(activity, _)| *activity)
+        .map(|(_, cell)| cell)
+}
+
 /// The image-capability query is passed through to every tmux client viewing this
 /// window. Their terminals' replies count as input, so with `window-size latest` another
 /// (smaller) client becomes the latest and the window shrinks until the user presses a
@@ -2482,6 +2543,8 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
         let tmux_client = tmux_active_client();
         let query_started = Instant::now();
         let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
+        let mut picker = with_viewer_cell_size(picker);
+        let mut cell_checked_at = Instant::now();
         if let Some(client) = tmux_client {
             reclaim_tmux_window(client);
         }
@@ -2553,6 +2616,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
         let mut poster_task: Option<PosterTask> = None;
         let mut sync_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
         let mut sync_notice: Option<(String, bool)> = None;
+        let mut reply_filter = ReplyFilter::default();
         let mut notice_seen: Option<(String, Instant)> = None;
         let mut last_ctrl_c: Option<Instant> = None;
         let mut last_download_click: Option<(usize, Instant)> = None;
@@ -2569,6 +2633,44 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
         let mut dashboard_refreshed_at = Instant::now();
         loop {
             terminal.autoresize()?;
+            if cell_checked_at.elapsed() >= CELL_CHECK_INTERVAL {
+                cell_checked_at = Instant::now();
+                let updated = with_viewer_cell_size(picker.clone());
+                if updated.font_size() != picker.font_size() {
+                    // Images are encoded for a cell size; re-render them all for the new one.
+                    picker = updated;
+                    for (_, task) in job_poster_tasks.drain() {
+                        task.abort();
+                    }
+                    job_poster_protocols.clear();
+                    for (_, task) in job_details_tasks.drain() {
+                        task.abort();
+                    }
+                    job_details.clear();
+                    for (_, task) in explore_poster_tasks.drain() {
+                        task.abort();
+                    }
+                    explore_poster_protocols.clear();
+                    if let Some(task) = poster_task.take() {
+                        task.abort();
+                    }
+                    poster_protocol.empty_protocol();
+                    if let Some(browser) = explore.as_mut() {
+                        browser.poster_id = None;
+                        browser.poster_loading = false;
+                        browser.poster_loaded = false;
+                    }
+                    if online != Some(Some(false)) && config.jellyfin.is_some() {
+                        if let Some(task) = job_poster_catalog_task.take() {
+                            task.abort();
+                        }
+                        let config = config.clone();
+                        job_poster_catalog_task = Some(tokio::spawn(async move {
+                            jellyfin_job_poster_catalog(&config).await
+                        }));
+                    }
+                }
+            }
             if dashboard_task
                 .as_ref()
                 .is_some_and(|task| task.is_finished())
@@ -3160,10 +3262,11 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                                 Style::default().fg(Color::Gray),
                             ),
                             Span::styled(
-                                if time.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!("  {time}")
+                                // The DB stores UTC; show how long ago instead.
+                                match status_age(time) {
+                                    Some(age) => format!("  updated {age}"),
+                                    None if time.is_empty() => String::new(),
+                                    None => format!("  {time} UTC"),
                                 },
                                 Style::default()
                                     .fg(Color::DarkGray)
@@ -4127,9 +4230,19 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
             );
             if event::poll(Duration::from_millis(250))? {
                 let input = event::read()?;
+                if let Event::Key(key) = &input
+                    && reply_filter.swallow(key)
+                {
+                    continue;
+                }
                 if let Event::Resize(_, _) = input {
                     terminal.autoresize()?;
                     terminal.clear()?;
+                    // Switching tmux clients resizes the window; the new viewer may
+                    // have a different cell size.
+                    cell_checked_at = Instant::now()
+                        .checked_sub(CELL_CHECK_INTERVAL)
+                        .unwrap_or(cell_checked_at);
                     continue;
                 }
                 if let Event::Mouse(mouse) = &input {
@@ -5777,6 +5890,41 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
+/// Swallows late terminal replies that crossterm hands us as keystrokes.
+///
+/// The startup image-protocol query gives up after a second; when kitty's answer
+/// (`ESC _Gi=31;OK ESC \`, often slow through tmux) arrives later, it would be
+/// read as typed keys and its `i` opened the job configuration. crossterm
+/// reports the APC introducer `ESC _` as Alt+`_` and the terminator `ESC \` as
+/// Alt+`\`; everything in between belongs to the reply.
+#[derive(Default)]
+struct ReplyFilter {
+    since: Option<Instant>,
+}
+
+impl ReplyFilter {
+    /// A reply arrives in one burst; give up on a missing terminator after this.
+    const TIMEOUT: Duration = Duration::from_millis(500);
+
+    fn swallow(&mut self, key: &crossterm::event::KeyEvent) -> bool {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if let Some(since) = self.since {
+            if since.elapsed() <= Self::TIMEOUT {
+                if (alt && key.code == KeyCode::Char('\\')) || key.code == KeyCode::Esc {
+                    self.since = None;
+                }
+                return true;
+            }
+            self.since = None;
+        }
+        if alt && key.code == KeyCode::Char('_') {
+            self.since = Some(Instant::now());
+            return true;
+        }
+        false
+    }
+}
+
 /// New index after PgUp/PgDn/Home/End in a list of `len` items.
 fn list_jump(code: KeyCode, index: usize, len: usize, page: usize) -> usize {
     let last = len.saturating_sub(1);
@@ -5786,6 +5934,46 @@ fn list_jump(code: KeyCode, index: usize, len: usize, page: usize) -> usize {
         KeyCode::PageUp => index.saturating_sub(page.max(1)),
         KeyCode::PageDown => (index + page.max(1)).min(last),
         _ => index,
+    }
+}
+
+/// Seconds since the epoch for an SQLite `datetime('now')` value (UTC,
+/// `YYYY-MM-DD HH:MM:SS`).
+fn sqlite_utc_seconds(value: &str) -> Option<i64> {
+    let (date, time) = value.trim().split_once(' ')?;
+    let mut date = date.splitn(3, '-').map(str::parse::<i64>);
+    let (year, month, day) = (date.next()?.ok()?, date.next()?.ok()?, date.next()?.ok()?);
+    let mut time = time.splitn(3, ':').map(str::parse::<i64>);
+    let (hour, minute, second) = (time.next()?.ok()?, time.next()?.ok()?, time.next()?.ok()?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// "just now", "5 min ago", "3 h ago", "2 d ago" for a status timestamp.
+fn status_age(value: &str) -> Option<String> {
+    let then = sqlite_utc_seconds(value)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(format_age(now - then))
+}
+
+fn format_age(seconds: i64) -> String {
+    match seconds.max(0) {
+        0..60 => "just now".into(),
+        seconds @ 60..3600 => format!("{} min ago", seconds / 60),
+        seconds @ 3600..86_400 => format!("{} h ago", seconds / 3600),
+        seconds => format!("{} d ago", seconds / 86_400),
     }
 }
 
@@ -6370,5 +6558,51 @@ jobs: []",
         assert_eq!(parse_content_range_total("bytes 0-9/10"), Some(10));
         assert_eq!(parse_content_range_total("bytes */1234"), Some(1234));
         assert_eq!(parse_content_range_total("bytes 0-9/*"), None);
+    }
+
+    #[test]
+    fn late_terminal_replies_are_not_keystrokes() {
+        use crossterm::event::KeyEvent;
+        let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let alt = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        let mut filter = ReplyFilter::default();
+        // ESC _ G i = 3 1 ; O K ESC \
+        assert!(filter.swallow(&alt('_')));
+        for c in "Gi=31;OK".chars() {
+            assert!(filter.swallow(&key(c)), "{c}");
+        }
+        assert!(filter.swallow(&alt('\\')));
+        // Typing afterwards works normally.
+        assert!(!filter.swallow(&key('i')));
+        assert!(!filter.swallow(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn cell_size_comes_from_the_active_viewer() {
+        let clients = "100\t@1\t19\t39\n200\t@1\t12\t24\n300\t@2\t8\t16\n";
+        assert_eq!(viewer_cell_size(clients, "@1"), Some((12, 24)));
+        assert_eq!(viewer_cell_size(clients, "@2"), Some((8, 16)));
+        assert_eq!(viewer_cell_size(clients, "@3"), None);
+        // Older tmux without cell sizes reports empty or zero fields.
+        assert_eq!(viewer_cell_size("100\t@1\t\t\n200\t@1\t0\t0\n", "@1"), None);
+    }
+
+    #[test]
+    fn status_timestamps() {
+        assert_eq!(sqlite_utc_seconds("1970-01-01 00:00:00"), Some(0));
+        assert_eq!(
+            sqlite_utc_seconds("2026-09-24 22:00:00"),
+            Some(1_790_287_200)
+        );
+        assert_eq!(
+            sqlite_utc_seconds("2024-02-29 12:00:00"),
+            Some(1_709_208_000)
+        );
+        assert_eq!(sqlite_utc_seconds("garbage"), None);
+        assert_eq!(format_age(5), "just now");
+        assert_eq!(format_age(-30), "just now");
+        assert_eq!(format_age(125), "2 min ago");
+        assert_eq!(format_age(7200), "2 h ago");
+        assert_eq!(format_age(3 * 86_400), "3 d ago");
     }
 }

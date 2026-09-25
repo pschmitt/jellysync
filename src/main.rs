@@ -3980,6 +3980,59 @@ async fn sync_job(config: Config, job: Job, slots: Arc<Semaphore>, quiet: bool) 
     }
     Ok(())
 }
+/// A short, one-line summary of what a job syncs, e.g.
+/// `tv_shows · seasons latest · unwatched only · deletes watched after 7d`.
+fn job_summary(job: &Job, config: &Config) -> String {
+    let mut parts = Vec::new();
+    if let Some(kind) = job.auto {
+        let kind = match kind {
+            AutoKind::All => "all",
+            AutoKind::Movies => "movies",
+            AutoKind::Shows => "shows",
+        };
+        parts.push(format!("auto: {kind}"));
+        match (job.auto_max_items(), job.max_size) {
+            (Some(items), Some(size)) => parts.push(format!("max {items} items, {size} GiB")),
+            (Some(items), None) => parts.push(format!("max {items} items")),
+            (None, Some(size)) => parts.push(format!("max {size} GiB")),
+            (None, None) => {}
+        }
+        if let Some(library) = &job.library {
+            parts.push(format!("library {library}"));
+        }
+    } else {
+        if let Some(directory) = job.directory.clone().or(job.local_dir.clone()) {
+            parts.push(directory);
+        }
+        if let Some(seasons) = job_setting_text(job, "seasons") {
+            parts.push(format!("seasons {seasons}"));
+        }
+        if let Some(episodes) = job_setting_text(job, "episodes") {
+            parts.push(format!("episodes {episodes}"));
+        }
+        if job.unwatched == Some(true) {
+            parts.push("unwatched only".into());
+        }
+        if job.wildcard == Some(true) {
+            parts.push("wildcard".into());
+        }
+    }
+    if let Some(grace) = job.watched_grace(config) {
+        parts.push(if grace.is_zero() {
+            "deletes watched".into()
+        } else {
+            format!(
+                "deletes watched after {}",
+                format_duration_short(grace.as_secs())
+            )
+        });
+    }
+    if !job.enabled() {
+        parts.push("disabled".into());
+    }
+    parts.join(" · ")
+}
+
 /// Terminal width for `status` output, or None when stdout is not a terminal.
 fn status_width() -> Option<usize> {
     if !std::io::IsTerminal::is_terminal(&stdout()) {
@@ -3990,10 +4043,12 @@ fn status_width() -> Option<usize> {
         .map(|(columns, _)| usize::from(columns))
 }
 
-fn status(json_output: bool) -> Result<()> {
+/// `config` is optional: status still works when the config cannot be loaded,
+/// just without the per-job summaries.
+fn status(json_output: bool, config: Option<&Config>) -> Result<()> {
     let conn = db()?;
     if json_output {
-        return status_json(&conn);
+        return status_json(&conn, config);
     }
     println!("\n{} {}", "◆".with(TerminalColor::Cyan), "Jellysync".bold());
     println!("{}", "─".repeat(48).with(TerminalColor::DarkGrey));
@@ -4007,15 +4062,88 @@ fn status(json_output: bool) -> Result<()> {
         );
     }
     println!("{}", "JOBS".with(TerminalColor::Magenta).bold());
-    let mut file_states: HashMap<String, Vec<String>> = HashMap::new();
-    let mut statement =
-        conn.prepare("SELECT job,status FROM transfers WHERE status IN ('queued','downloading')")?;
+    // Active downloads, shown under their job.
+    type Active = (String, String, u64, Option<u64>, Option<u64>);
+    let mut active: BTreeMap<String, Vec<Active>> = BTreeMap::new();
+    let mut statement = conn.prepare(&format!("SELECT job,path,status,bytes,total,{LIVE_RATE_SQL} FROM transfers WHERE status IN ('queued','downloading','interrupted','paused') ORDER BY job,path"))?;
     for row in statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            (
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, Option<u64>>(4)?,
+                row.get::<_, Option<u64>>(5)?,
+            ),
+        ))
     })? {
-        let (job, state) = row?;
-        file_states.entry(job).or_default().push(state);
+        let (job, download) = row?;
+        active.entry(job).or_default().push(download);
     }
+    let file_states: HashMap<&str, Vec<&str>> = active
+        .iter()
+        .map(|(job, downloads)| {
+            let states = downloads
+                .iter()
+                .map(|(_, state, ..)| state.as_str())
+                .filter(|state| matches!(*state, "queued" | "downloading"))
+                .collect();
+            (job.as_str(), states)
+        })
+        .collect();
+    let width = status_width();
+    let summary_width = width.map_or(88, |width| width.saturating_sub(6).max(20));
+    let configured_summary = |name: &str| {
+        let config = config?;
+        match config.jobs.iter().find(|job| job.name == name) {
+            Some(job) => Some(job_summary(job, config)),
+            None if name.starts_with("library:") => Some("ad-hoc download".into()),
+            None => None,
+        }
+    };
+    let mut total_rate: Option<u64> = None;
+    let mut print_downloads = |job: &str| {
+        for (path, state, bytes, total, rate) in active.get(job).into_iter().flatten() {
+            let (filled, track, percent) = download_progress(*bytes, *total, 20);
+            let filename = Path::new(path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            let state_color = match state.as_str() {
+                "downloading" => TerminalColor::Cyan,
+                "queued" => TerminalColor::Blue,
+                "paused" => TerminalColor::DarkGrey,
+                "interrupted" => TerminalColor::Red,
+                _ => TerminalColor::DarkGrey,
+            };
+            // Like the TUI: ellipsize near the end so the episode tag and
+            // extension stay visible (full names when piped).
+            let filename = match width {
+                Some(width) => truncate_near_end(&filename, width.saturating_sub(8).max(20)),
+                None => filename.into_owned(),
+            };
+            println!("      {} {}", "↳".with(state_color), filename);
+            if state == "queued" {
+                // Nothing transferred yet: no progress bar or unknown percentage.
+                println!("        {}", state.to_uppercase().with(state_color));
+            } else {
+                println!(
+                    "        {}{} {}  {}  {}",
+                    filled.with(state_color),
+                    track.with(TerminalColor::DarkGrey),
+                    percent.with(state_color),
+                    state.to_uppercase().with(state_color),
+                    rate.map(|rate| format_throughput(rate, *bytes, *total))
+                        .unwrap_or_default()
+                        .with(TerminalColor::Grey)
+                );
+            }
+            if let Some(rate) = rate {
+                total_rate = Some(total_rate.unwrap_or(0) + rate);
+            }
+        }
+    };
     let mut statement =
         conn.prepare("SELECT name,status,message,updated_at FROM jobs ORDER BY name")?;
     let rows = statement.query_map([], |row| {
@@ -4026,18 +4154,29 @@ fn status(json_output: bool) -> Result<()> {
             row.get::<_, String>(3)?,
         ))
     })?;
-    let mut job_count = 0;
-    for row in rows {
-        let (name, state, message, time) = row?;
-        job_count += 1;
+    let mut history: Vec<(String, String, Option<String>, String)> =
+        rows.collect::<rusqlite::Result<_>>()?;
+    // Configured jobs that never ran, and jobs known only from their downloads.
+    for name in config
+        .map_or(&[][..], |config| config.jobs.as_slice())
+        .iter()
+        .map(|job| job.name.clone())
+        .chain(active.keys().cloned())
+    {
+        if !history.iter().any(|(known, ..)| *known == name) {
+            history.push((name, "not run".into(), None, String::new()));
+        }
+    }
+    for (name, state, message, time) in &history {
         let (state, summary) = job_display_state(
-            &state,
+            state,
             file_states
-                .get(&name)
+                .get(name.as_str())
                 .into_iter()
                 .flatten()
-                .map(String::as_str),
+                .copied(),
         );
+<<<<<<< Updated upstream
         let message = summary.or(message);
         let color = match state.to_ascii_lowercase().as_str() {
             "success" | "complete" | "completed" => TerminalColor::Green,
@@ -4050,70 +4189,44 @@ fn status(json_output: bool) -> Result<()> {
             _ => TerminalColor::DarkGrey,
         };
         let icon = state_icon(state);
+=======
+        let message = summary.or(message.clone());
+        let (icon, color) = match state.to_ascii_lowercase().as_str() {
+            "success" | "complete" | "completed" => ("●", TerminalColor::Green),
+            "running" => ("◐", TerminalColor::Yellow),
+            "downloading" => ("◐", TerminalColor::Cyan),
+            "queued" => ("◌", TerminalColor::Blue),
+            "paused" => ("⏸", TerminalColor::DarkGrey),
+            "failed" | "error" | "skipped" => ("✕", TerminalColor::Red),
+            "interrupted" | "cleared" => ("◆", TerminalColor::Magenta),
+            _ => ("○", TerminalColor::DarkGrey),
+        };
+        // Pad before styling: styled text ignores the width.
+>>>>>>> Stashed changes
         println!(
-            "  {} {:<28} {} {}",
+            "  {} {} {} {}",
             icon.with(color),
-            truncate_near_end(&name, 28).bold(),
+            format!("{:<28}", truncate_near_end(name, 28)).bold(),
             state.to_uppercase().with(color),
-            if time.is_empty() {
-                String::new().dim()
-            } else {
-                time.dim()
-            }
+            time.as_str().dim()
         );
+        if let Some(summary) = configured_summary(name).filter(|summary| !summary.is_empty()) {
+            println!("      {}", truncate(&summary, summary_width).dim());
+        }
         if let Some(message) = message.filter(|message| !message.is_empty()) {
             println!(
                 "      {}",
-                truncate(&message, 88).with(TerminalColor::DarkGrey)
+                truncate(&message, summary_width).with(TerminalColor::DarkGrey)
             );
         }
+        print_downloads(name);
     }
-    if job_count == 0 {
+    if history.is_empty() {
         println!("  {}", "No jobs have run yet".with(TerminalColor::DarkGrey));
     }
-    println!(
-        "\n{}",
-        "ACTIVE DOWNLOADS".with(TerminalColor::Magenta).bold()
-    );
-    let mut statement = conn.prepare(&format!("SELECT job,path,status,bytes,total,{LIVE_RATE_SQL} FROM transfers WHERE status IN ('queued','downloading','interrupted','paused') ORDER BY job,path"))?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, u64>(3)?,
-            row.get::<_, Option<u64>>(4)?,
-            row.get::<_, Option<u64>>(5)?,
-        ))
-    })?;
-    let mut download_count = 0;
-    let mut total_rate: Option<u64> = None;
-    for row in rows {
-        let (job, path, state, bytes, total, rate) = row?;
-        download_count += 1;
-        let (filled, track, percent) = download_progress(bytes, total, 20);
-        let filename = Path::new(&path)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        let state_color = match state.as_str() {
-            "downloading" => TerminalColor::Cyan,
-            "queued" => TerminalColor::Blue,
-            "paused" => TerminalColor::DarkGrey,
-            "interrupted" => TerminalColor::Red,
-            _ => TerminalColor::DarkGrey,
-        };
-        // Like the TUI: ellipsize near the end so the episode tag and extension
-        // stay visible, and use the terminal's width (full names when piped).
-        let label = format!("({})", truncate_near_end(&job, 30));
-        let filename = match status_width() {
-            Some(width) => truncate_near_end(
-                &filename,
-                width.saturating_sub(label.chars().count() + 5).max(20),
-            ),
-            None => filename.into_owned(),
-        };
+    if let Some(rate) = total_rate {
         println!(
+<<<<<<< Updated upstream
             "  {} {} {}",
             state_icon(&state).with(state_color),
             filename.bold(),
@@ -4148,6 +4261,11 @@ fn status(json_output: bool) -> Result<()> {
             "  {} {}",
             format!("{} total", icon::DOWNLOAD).with(TerminalColor::DarkGrey),
             format!("{}/s", format_bytes(rate)).with(TerminalColor::Grey)
+=======
+            "\n{} {}",
+            "DOWNLOADING".with(TerminalColor::Magenta).bold(),
+            format!("{}/s in total", format_bytes(rate)).with(TerminalColor::Grey)
+>>>>>>> Stashed changes
         );
     }
     if let Ok(output) = std::process::Command::new("systemctl")
@@ -4168,13 +4286,24 @@ fn status(json_output: bool) -> Result<()> {
     }
     Ok(())
 }
-fn status_json(conn: &Connection) -> Result<()> {
+fn status_json(conn: &Connection, config: Option<&Config>) -> Result<()> {
+    let summary = |name: &str| {
+        config.and_then(
+            |config| match config.jobs.iter().find(|job| job.name == name) {
+                Some(job) => Some(job_summary(job, config)),
+                None if name.starts_with("library:") => Some("ad-hoc download".into()),
+                None => None,
+            },
+        )
+    };
     let mut statement =
         conn.prepare("SELECT name,status,message,updated_at FROM jobs ORDER BY name")?;
     let jobs = statement
         .query_map([], |row| {
+            let name = row.get::<_, String>(0)?;
             Ok(json!({
-                "name": row.get::<_, String>(0)?,
+                "config": summary(&name),
+                "name": name,
                 "status": row.get::<_, String>(1)?,
                 "message": row.get::<_, Option<String>>(2)?,
                 "updated_at": row.get::<_, String>(3)?,
@@ -6098,20 +6227,11 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                         format!("{:<20}", truncate(name, 19)),
                                         if job.enabled() { label_style } else { muted },
                                     ));
-                                    let mut summary = vec![
-                                        job.directory.clone().or(job.local_dir.clone()).unwrap_or_else(|| "—".into()),
-                                    ];
-                                    if let Some(seasons) = job_setting_text(job, "seasons") {
-                                        summary.push(format!("seasons {seasons}"));
-                                    }
-                                    if let Some(episodes) = job_setting_text(job, "episodes") {
-                                        summary.push(format!("episodes {episodes}"));
-                                    }
-                                    if job.unwatched == Some(true) {
-                                        summary.push("unwatched only".into());
-                                    }
+                                    // "disabled" gets its own highlighted marker below.
+                                    let summary = job_summary(job, &config);
+                                    let summary = summary.trim_end_matches(" · disabled").trim_end_matches("disabled");
                                     spans.push(Span::styled(
-                                        truncate(&summary.join(" · "), value_width),
+                                        truncate(summary, value_width),
                                         if job.enabled() { value_style } else { muted },
                                     ));
                                     if !job.enabled() {
@@ -9225,7 +9345,13 @@ async fn main() -> Result<()> {
         crossterm::style::force_color_output(false);
     }
     match cli.command {
-        Some(Commands::Status) => status(cli.json),
+        Some(Commands::Status) => {
+            // Best effort: status is also for when the config is broken.
+            let config = config_path(cli.config)
+                .ok()
+                .and_then(|path| load_config(&path).ok());
+            status(cli.json, config.as_ref())
+        }
         // Needs no config, so packaging can run it in a build sandbox.
         Some(Commands::Completions { shell }) => {
             use std::io::Write as _;
@@ -10613,5 +10739,36 @@ cleanup: {delete_watched_after: soon}",
         );
         assert!(parse_setting_input(SettingKind::Gib, "-1").is_err());
         assert!(parse_setting_input(SettingKind::Number, "ten").is_err());
+    }
+
+    #[test]
+    fn job_summaries_are_short() {
+        let config = parse_config(
+            serde_yaml::from_str(
+                "remote: {hostname: h, username: u, root: /r}
+local: {root: /l}
+jobs:
+  - {name: a, directory: tv_shows, seasons: latest, unwatched: true, delete_watched: true}
+  - {name: b, auto: shows, max_size: 30, library: Kids}
+  - {name: c, auto: movies}
+  - {name: d, directory: movies, enabled: false}",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let summaries: Vec<String> = config
+            .jobs
+            .iter()
+            .map(|job| job_summary(job, &config))
+            .collect();
+        assert_eq!(
+            summaries,
+            [
+                "tv_shows · seasons latest · unwatched only · deletes watched after 7d",
+                "auto: shows · max 30 GiB · library Kids · deletes watched after 7d",
+                "auto: movies · max 5 items · deletes watched after 7d",
+                "movies · disabled",
+            ]
+        );
     }
 }

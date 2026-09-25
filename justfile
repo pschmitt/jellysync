@@ -69,10 +69,25 @@ check: lint test nix-build
 # with Creative Commons media, the TUI in a real kitty (see scripts/screenshot.sh).
 # font_dir is an optional local font directory for font_family (e.g. a non-free
 # font that cannot live in this repository).
-screenshot host=default-host font_family="JetBrains Mono" font_dir="":
+screenshot host=default-host font_family="ComicCode Nerd Font" font_dir="":
     #!/usr/bin/env bash
     set -euo pipefail
     host="{{ host }}"
+    font_family="{{ font_family }}"
+    font_dir="{{ font_dir }}"
+    # Without a font directory, take the family from this machine's fonts
+    # (e.g. a non-free font); fall back to the script's default font.
+    if [[ -z "$font_dir" ]]
+    then
+      font_file="$(fc-list --format '%{file}\n' ":family=$font_family" 2>/dev/null | head -1)"
+      if [[ -n "$font_file" ]]
+      then
+        font_dir="$(dirname -- "$font_file")"
+      else
+        echo "Font '$font_family' not found locally; using the default font" >&2
+        font_family=""
+      fi
+    fi
     remote_dir="$(ssh -- "$host" "mkdir -p {{ remote-build-base }} && mktemp -d {{ remote-build-base }}/screenshot.XXXXXX")"
     cleanup() {
       ssh -- "$host" rm -rf -- "$remote_dir"
@@ -80,14 +95,18 @@ screenshot host=default-host font_family="JetBrains Mono" font_dir="":
     trap cleanup EXIT
     rsync -az --delete --exclude target --exclude result --exclude .git --exclude .screenshot ./ "$host:$remote_dir/"
     font_env=""
-    if [[ -n "{{ font_dir }}" ]]
+    if [[ -n "$font_dir" ]]
     then
       ssh -- "$host" mkdir -p "$remote_dir/.screenshot/fonts"
       # Nix store fonts are read-only; keep the copy removable.
-      rsync -a --chmod=u+w "{{ font_dir }}/" "$host:$remote_dir/.screenshot/fonts/"
+      rsync -a --chmod=u+w "$font_dir/" "$host:$remote_dir/.screenshot/fonts/"
       font_env="FONT_DIR=$remote_dir/.screenshot/fonts"
     fi
-    ssh -- "$host" "cd '$remote_dir' && $font_env FONT_FAMILY='{{ font_family }}' scripts/screenshot.sh"
+    if [[ -n "$font_family" ]]
+    then
+      font_env="$font_env FONT_FAMILY='$font_family'"
+    fi
+    ssh -- "$host" "cd '$remote_dir' && $font_env scripts/screenshot.sh"
     rsync -az "$host:$remote_dir/docs/screenshot.png" docs/screenshot.png
     echo "Updated docs/screenshot.png"
 

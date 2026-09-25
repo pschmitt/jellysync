@@ -95,8 +95,24 @@ jobs:
         run: cd dist && sha256sum -- *.tar.gz > SHA256SUMS
       - name: Verify release assets
         run: cd dist && sha256sum --check SHA256SUMS
+      - uses: actions/checkout@v7
+        with:
+          path: source
+      # Notes: the README screenshot as of this tag, then the tag's message;
+      # GitHub appends the generated changelog.
+      - name: Write release notes
+        env:
+          TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          git -C source fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          {
+            printf '![jellysync TUI](https://raw.githubusercontent.com/%s/%s/docs/screenshot.png)\n\n' "$REPOSITORY" "$TAG"
+            git -C source tag --list --format='%(contents:body)' "$TAG"
+          } > notes.md
       - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
+          body_path: notes.md
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}

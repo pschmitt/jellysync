@@ -4825,6 +4825,8 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
         // Details panel height once dragged by the user (default: sized to fit).
         let mut details_height: Option<u16> = None;
         let mut resizing_details = false;
+        // The last mouse-drag resize; posters wait for the layout to settle.
+        let mut last_drag: Option<Instant> = None;
         let mut confirm_clear: Option<ClearRequest> = None;
         let mut show_help = false;
         // Filter for the Jobs list; typing goes into it while `job_search_input`.
@@ -6138,6 +6140,11 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                 })
                                 .unwrap_or_else(|| "no · w marks it watched".into())
                         });
+                    // Re-encoding the poster for every intermediate size makes
+                    // drag-resizing choppy; draw it once the size has settled.
+                    let settling = resizing_split
+                        || resizing_details
+                        || last_drag.is_some_and(|at| at.elapsed() < Duration::from_millis(250));
                     render_job_details(
                         frame,
                         details_area,
@@ -6148,6 +6155,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         file_label.filter(|_| !still_downloading),
                         file_watched,
                         probe,
+                        !settling,
                     );
                 }
                 frame.render_stateful_widget(download_list, downloads_area, &mut downloads_state);
@@ -6751,6 +6759,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                     None,
                                     None,
                                     None,
+                                    true,
                                 );
                                 frame.render_widget(
                                     Paragraph::new(hint),
@@ -7079,11 +7088,13 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                 let relative = mouse.column.saturating_sub(body.x);
                                 let ratio = relative.saturating_mul(100) / body.width.max(1);
                                 main_split = ratio.clamp(20, 80);
+                                last_drag = Some(Instant::now());
                             }
                             MouseEventKind::Drag(MouseButton::Left) if resizing_details => {
                                 if let Some(details) = details_area {
                                     // Clamped to the available room when laid out.
                                     details_height = Some(mouse.row.saturating_sub(details.y) + 1);
+                                    last_drag = Some(Instant::now());
                                 }
                             }
                             MouseEventKind::Up(MouseButton::Left) => {
@@ -8648,6 +8659,8 @@ fn render_job_details(
     file_label: Option<String>,
     file_watched: Option<String>,
     probe: Option<&std::result::Result<MediaProbe, String>>,
+    // false keeps the poster's space but skips drawing (and re-encoding) it.
+    show_poster: bool,
 ) {
     let title = format!("{} Details", icon::INFO);
     let block = panel_block(&title, false);
@@ -8684,6 +8697,7 @@ fn render_job_details(
     };
     if let Some(poster) = poster
         && poster_width > 0
+        && show_poster
     {
         frame.render_stateful_widget(
             StatefulImage::default().resize(Resize::Fit(Some(FilterType::Triangle))),

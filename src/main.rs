@@ -5411,6 +5411,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     let total_size = job_files.iter().fold(0u64, |total, entry| {
                         total.saturating_add(entry.total.unwrap_or(entry.bytes))
                     });
+                    let job_rate: u64 = job_files.iter().filter_map(|entry| entry.rate).sum();
                     let seen = job_files
                         .iter()
                         .filter(|entry| {
@@ -5430,6 +5431,14 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             Span::styled(
                                 format!("  {}", format_bytes(total_size)),
                                 Style::default().fg(Color::Gray),
+                            ),
+                            Span::styled(
+                                if job_rate > 0 {
+                                    format!("  ↓ {}/s", format_bytes(job_rate))
+                                } else {
+                                    String::new()
+                                },
+                                Style::default().fg(Color::Cyan),
                             ),
                             Span::styled(
                                 if seen > 0 {

@@ -10302,7 +10302,7 @@ jobs: []",
         assert_eq!(format_throughput(1024 * 1024, 0, None), "1.0 MiB/s");
         assert_eq!(
             format_throughput(1024 * 1024, 0, Some(120 * 1024 * 1024)),
-            "1.0 MiB/s · 2m left"
+            "1.0 MiB/s · ETA 2m"
         );
         assert_eq!(format_throughput(1024, 10, Some(10)), "1.0 KiB/s");
     }

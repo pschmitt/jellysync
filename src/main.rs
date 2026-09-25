@@ -3220,12 +3220,10 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
             let entries: Vec<ListItem> = jobs
                 .iter()
                 .map(|job| {
-                    let (state, message, time) = history
+                    let (state, message) = history
                         .get(&job.name)
-                        .map(|(state, message, time)| {
-                            (state.as_str(), message.as_str(), time.as_str())
-                        })
-                        .unwrap_or(("not run", "Waiting for first sync", ""));
+                        .map(|(state, message, _)| (state.as_str(), message.as_str()))
+                        .unwrap_or(("not run", "Waiting for first sync"));
                     let (kind, kind_style) = if job.adhoc {
                         ("LIBRARY", Style::default().fg(Color::Magenta))
                     } else {
@@ -3260,17 +3258,6 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                             Span::styled(
                                 format!("  {}", format_bytes(total_size)),
                                 Style::default().fg(Color::Gray),
-                            ),
-                            Span::styled(
-                                // The DB stores UTC; show how long ago instead.
-                                match status_age(time) {
-                                    Some(age) => format!("  updated {age}"),
-                                    None if time.is_empty() => String::new(),
-                                    None => format!("  {time} UTC"),
-                                },
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::ITALIC),
                             ),
                         ]),
                         Line::from(vec![
@@ -3668,12 +3655,18 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     let still_downloading = selected_entry.is_some_and(|entry| !download_complete(&entry.status));
                     let loading = job_details_tasks.contains_key(&job.name)
                         || job_poster_catalog_task.is_some();
+                    // The DB stores UTC; show how long ago instead.
+                    let last_sync = history.get(&job.name).and_then(|(state, _, time)| {
+                        let age = status_age(time)?;
+                        Some((state.clone(), age))
+                    });
                     render_job_details(
                         frame,
                         details_area,
                         &job.name,
                         job_details.get_mut(&job.name),
                         loading,
+                        last_sync,
                         file_label.filter(|_| !still_downloading),
                         probe,
                     );
@@ -5306,6 +5299,7 @@ fn render_job_details(
     job_name: &str,
     details: Option<&mut JobDetails>,
     loading: bool,
+    last_sync: Option<(String, String)>,
     file_label: Option<String>,
     probe: Option<&std::result::Result<MediaProbe, String>>,
 ) {
@@ -5408,6 +5402,14 @@ fn render_job_details(
                 .fg(Color::Gray)
                 .add_modifier(Modifier::ITALIC),
         )));
+    }
+    if let Some((state, age)) = last_sync {
+        lines.push(Line::from(vec![
+            Span::styled("Last sync  ", Style::default().fg(Color::Cyan)),
+            Span::styled(age, Style::default().fg(Color::White)),
+            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+            Span::styled(state.to_lowercase(), state_style(&state)),
+        ]));
     }
     if let Some(label) = file_label {
         lines.push(Line::from(""));

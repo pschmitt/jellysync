@@ -2515,7 +2515,7 @@ async fn library_worker(config: &Config, job: &str) -> Result<()> {
     let credentials = config
         .jellyfin
         .as_ref()
-        .context("ad-hoc downloads require Jellyfin credentials")?;
+        .context("on-demand downloads require Jellyfin credentials")?;
     let mut attempted = HashSet::new();
     loop {
         let lock = std::fs::OpenOptions::new()
@@ -2573,7 +2573,7 @@ async fn library_worker(config: &Config, job: &str) -> Result<()> {
         }
         let mut failures = Vec::new();
         while let Some(result) = tasks.join_next().await {
-            let (item_id, result) = result.context("ad-hoc transfer worker failed")?;
+            let (item_id, result) = result.context("on-demand transfer worker failed")?;
             if let Err(error) = result {
                 attempted.insert(item_id);
                 failures.push(format!("{error:#}"));
@@ -2600,7 +2600,7 @@ async fn finish_library_jobs(config: &Config) {
     let jobs = match pending_library_jobs() {
         Ok(jobs) => jobs,
         Err(error) => {
-            eprintln!("Could not list pending ad-hoc downloads: {error:#}");
+            eprintln!("Could not list pending on-demand downloads: {error:#}");
             return;
         }
     };
@@ -2747,7 +2747,7 @@ fn spawn_library_worker(config_path: &Path, job: &str) -> Result<()> {
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
-        .context("start ad-hoc download worker")?;
+        .context("start on-demand download worker")?;
     // Reap the worker if it finishes while we are still running.
     std::thread::spawn(move || child.wait());
     Ok(())
@@ -4108,7 +4108,7 @@ fn status(json_output: bool, config: Option<&Config>) -> Result<()> {
         let config = config?;
         match config.jobs.iter().find(|job| job.name == name) {
             Some(job) => Some(job_summary(job, config)),
-            None if name.starts_with("library:") => Some("ad-hoc download".into()),
+            None if name.starts_with("library:") => Some("on-demand download".into()),
             None => None,
         }
     };
@@ -4199,7 +4199,7 @@ fn status(json_output: bool, config: Option<&Config>) -> Result<()> {
         println!(
             "  {} {} {}",
             icon.with(color),
-            format!("{:<28}", truncate_near_end(name, 28)).bold(),
+            format!("{:<28}", truncate_near_end(display_job_name(name), 28)).bold(),
             time.as_str().dim()
         );
         if let Some(summary) = configured_summary(name).filter(|summary| !summary.is_empty()) {
@@ -4248,7 +4248,7 @@ fn status_json(conn: &Connection, config: Option<&Config>) -> Result<()> {
         config.and_then(
             |config| match config.jobs.iter().find(|job| job.name == name) {
                 Some(job) => Some(job_summary(job, config)),
-                None if name.starts_with("library:") => Some("ad-hoc download".into()),
+                None if name.starts_with("library:") => Some("on-demand download".into()),
                 None => None,
             },
         )
@@ -4827,6 +4827,9 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
         let mut resizing_details = false;
         let mut confirm_clear: Option<ClearRequest> = None;
         let mut show_help = false;
+        // Filter for the Jobs list; typing goes into it while `job_search_input`.
+        let mut job_search = String::new();
+        let mut job_search_input = false;
         let mut show_job_config = false;
         let mut editor = JobEditor::default();
         let mut settings: Option<SettingsScreen> = None;
@@ -5028,7 +5031,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     }
                     if let Err(error) = resume_library_workers(&config_path) {
                         sync_notice =
-                            Some((format!("Could not resume ad-hoc downloads: {error:#}"), false));
+                            Some((format!("Could not resume on-demand downloads: {error:#}"), false));
                     }
                     if !reconciled && reconcile_task.is_none() {
                         let config = config.clone();
@@ -5418,6 +5421,11 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     });
                 }
             }
+            let total_jobs = jobs.len();
+            if !job_search.is_empty() {
+                let query = job_search.to_lowercase();
+                jobs.retain(|job| display_job_name(&job.name).to_lowercase().contains(&query));
+            }
             // Follow the selected job when jobs are added or removed around it, unless
             // input moved the selection since the last frame.
             if let (Some((index, name)), _) = &selection_anchor
@@ -5539,7 +5547,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         .iter()
                         .any(|configured| configured.name == job.name && !configured.enabled());
                     let (kind, kind_style) = if job.adhoc {
-                        (format!("{} LIBRARY", icon::LIBRARY), Style::default().fg(Color::Magenta))
+                        (format!("{} ON DEMAND", icon::ON_DEMAND), Style::default().fg(Color::Magenta))
                     } else if disabled {
                         ("DISABLED".to_string(), Style::default().fg(Color::Yellow))
                     } else {
@@ -5578,7 +5586,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                 let (marker, marker_style) = transfer_marker(state);
                                 Span::styled(format!("{marker} "), marker_style)
                             },
-                            Span::styled(job.name.clone(), title_style),
+                            Span::styled(display_job_name(&job.name).to_string(), title_style),
                             Span::styled(
                                 if kind.is_empty() { String::new() } else { format!("  {kind}") },
                                 kind_style,
@@ -5676,6 +5684,16 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
                     .areas(body);
                 (jobs_area, downloads_area)
+            };
+            // The search bar sits above the Jobs list while searching or filtered.
+            let (job_search_area, jobs_area) = if job_search_input || !job_search.is_empty() {
+                let [search_area, jobs_area] = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(4)])
+                    .areas(jobs_area);
+                (Some(search_area), jobs_area)
+            } else {
+                (None, jobs_area)
             };
             // Metadata for the selected job sits above its files when there is room.
             let (details_area, downloads_area) = if selected_job.is_some() && downloads_area.height >= 22 {
@@ -5972,7 +5990,27 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 let header_text = Line::from(header_spans);
                 frame.render_widget(Paragraph::new(header_text), header);
 
-                let jobs_title = format!("Jobs · {}", jobs.len());
+                let jobs_title = if job_search.is_empty() {
+                    format!("Jobs · {}", jobs.len())
+                } else {
+                    format!("Jobs · {} of {total_jobs}", jobs.len())
+                };
+                if let Some(search_area) = job_search_area {
+                    let mut spans = vec![
+                        Span::styled(format!("{} ", icon::SEARCH), Style::default().fg(Color::Cyan)),
+                        Span::styled(job_search.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    ];
+                    if job_search_input {
+                        spans.push(Span::styled("▏", Style::default().fg(Color::Cyan)));
+                    }
+                    frame.render_widget(
+                        Paragraph::new(Line::from(spans)).block(panel_block(
+                            if job_search_input { "Search · Enter keep · Esc clear" } else { "Search · / edit · Esc clear" },
+                            job_search_input,
+                        )),
+                        search_area,
+                    );
+                }
                 let seasons = rows.iter().filter(|row| matches!(row, FileRow::Season(_))).count();
                 let ignored_count = downloads.iter().filter(|entry| entry.status == "ignored").count();
                 let file_count = downloads.len() - ignored_count;
@@ -6575,7 +6613,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             )),
                             Line::from(Span::styled(
                                 if request.targets.is_empty() {
-                                    "Removes this ad-hoc job from the list."
+                                    "Removes this on-demand job from the list."
                                 } else if !request.ignore {
                                     "Deletes these files from disk.  y confirm · n / Esc cancel"
                                 } else {
@@ -6832,7 +6870,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     );
                 }
                 if show_help {
-                    let help_popup = centered_rect(84, 34, area);
+                    let help_popup = centered_rect(84, 36, area);
                     let help_lines = vec![
                         Line::from(Span::styled(
                             "Main view",
@@ -6843,6 +6881,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         Line::from("  Tab / ← / →       switch focus"),
                         Line::from("  Mouse drag        resize Jobs/Files split (wide terminals)"),
                         Line::from("                    and the Details/Files split"),
+                        Line::from("  /                 search jobs (Enter keep, Esc clear)"),
                         Line::from("  s / S             sync selected / all jobs"),
                         Line::from("  b                 browse the Jellyfin library"),
                         Line::from("  i                 job configuration and sync settings (Jobs focused)"),
@@ -7725,6 +7764,26 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 } else {
                     last_ctrl_c = None;
                     match key.code {
+                        // While searching, text goes to the job filter; arrows still move.
+                        KeyCode::Char(c) if job_search_input && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            job_search.push(c);
+                            selected = 0;
+                            selected_download = 0;
+                        }
+                        KeyCode::Backspace if job_search_input => {
+                            job_search.pop();
+                            selected = 0;
+                            selected_download = 0;
+                        }
+                        KeyCode::Enter if job_search_input => job_search_input = false,
+                        KeyCode::Esc if job_search_input || !job_search.is_empty() => {
+                            job_search.clear();
+                            job_search_input = false;
+                        }
+                        KeyCode::Char('/') => {
+                            job_search_input = true;
+                            download_focus = false;
+                        }
                         // Esc closes dialogs; quitting from the main view takes q or Ctrl-C twice.
                         KeyCode::Char('q') => break,
                         KeyCode::Char('i') | KeyCode::Enter if download_focus && !downloads.is_empty() => {
@@ -8137,6 +8196,8 @@ mod icon {
     pub const DOWNLOAD: &str = "\u{f01da}"; // md-download
     pub const DOWNLOAD_OUTLINE: &str = "\u{f0b8f}"; // md-download_outline
     pub const IDLE: &str = "\u{f0766}"; // md-circle_outline
+    pub const SEARCH: &str = "\u{f0349}"; // md-magnify
+    pub const ON_DEMAND: &str = "\u{f140b}"; // md-lightning_bolt
     pub const LIBRARY: &str = "\u{f0331}"; // md-library
     pub const OFFLINE: &str = "\u{f0164}"; // md-cloud_off_outline
     pub const ONLINE: &str = "\u{f0160}"; // md-cloud_check
@@ -8185,6 +8246,12 @@ fn labelled(label: &str) -> String {
         Some(glyph) => format!("{glyph} {label}"),
         None => format!("  {label}"),
     }
+}
+
+/// A job's name for display: ad-hoc downloads are stored as "library:<title>"
+/// but carry an ON DEMAND badge instead of the prefix.
+fn display_job_name(name: &str) -> &str {
+    name.strip_prefix("library:").unwrap_or(name)
 }
 
 /// The glyph for a job or file state, shared by `status` and the TUI.

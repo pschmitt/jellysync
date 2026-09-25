@@ -399,4 +399,8 @@ main() {
   log "wrote $OUTPUT"
 }
 
-main "$@"
+# Sourcing the script (e.g. for manual end-to-end tests) only defines functions.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]
+then
+  main "$@"
+fi

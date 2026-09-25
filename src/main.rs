@@ -3947,6 +3947,16 @@ async fn sync_job(config: Config, job: Job, slots: Arc<Semaphore>, quiet: bool) 
     }
     Ok(())
 }
+/// Terminal width for `status` output, or None when stdout is not a terminal.
+fn status_width() -> Option<usize> {
+    if !std::io::IsTerminal::is_terminal(&stdout()) {
+        return None;
+    }
+    crossterm::terminal::size()
+        .ok()
+        .map(|(columns, _)| usize::from(columns))
+}
+
 fn status(json_output: bool) -> Result<()> {
     let conn = db()?;
     if json_output {
@@ -4009,7 +4019,7 @@ fn status(json_output: bool) -> Result<()> {
         println!(
             "  {} {:<28} {} {}",
             icon.with(color),
-            truncate(&name, 28).bold(),
+            truncate_near_end(&name, 28).bold(),
             state.to_uppercase().with(color),
             if time.is_empty() {
                 String::new().dim()
@@ -4059,11 +4069,21 @@ fn status(json_output: bool) -> Result<()> {
             "interrupted" => TerminalColor::Red,
             _ => TerminalColor::DarkGrey,
         };
+        // Like the TUI: ellipsize near the end so the episode tag and extension
+        // stay visible, and use the terminal's width (full names when piped).
+        let label = format!("({})", truncate_near_end(&job, 30));
+        let filename = match status_width() {
+            Some(width) => truncate_near_end(
+                &filename,
+                width.saturating_sub(label.chars().count() + 5).max(20),
+            ),
+            None => filename.into_owned(),
+        };
         println!(
             "  {} {} {}",
             "↳".with(state_color),
-            truncate(&filename, 42).bold(),
-            format!("({job})").with(TerminalColor::DarkGrey)
+            filename.bold(),
+            label.with(TerminalColor::DarkGrey)
         );
         if state == "queued" {
             // Nothing transferred yet: no progress bar or unknown percentage.

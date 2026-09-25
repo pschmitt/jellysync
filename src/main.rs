@@ -2002,6 +2002,9 @@ type JobPosterCatalogTask =
 // cells wide. The indent leaves one blank column between poster and text.
 const POSTER_WIDTH: u16 = 6;
 const POSTER_INDENT: &str = "       ";
+/// Lines per job in the Jobs list: three of text and one blank (the poster is
+/// four rows tall), plus one more blank line to space the jobs apart.
+const JOB_ROW_HEIGHT: u16 = 5;
 
 struct ExploreState {
     api: Option<JellyfinApi>,
@@ -5591,6 +5594,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             ),
                         ]),
                         Line::from(Span::raw(POSTER_INDENT)),
+                        Line::from(""),
                     ])
                 })
                 .collect();
@@ -5821,7 +5825,8 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             ));
                         }
                     }
-                    ListItem::new(vec![Line::from(first), Line::from(subtitle), third_line])
+                    // A blank line keeps consecutive files apart.
+                    ListItem::new(vec![Line::from(first), Line::from(subtitle), third_line, Line::from("")])
                 })
                 .collect();
             let selected_row = rows
@@ -5884,12 +5889,12 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 ];
                 if reconcile_task.is_some() {
                     header_segments.push(vec![Span::styled(
-                        "indexing…",
+                        format!("{} indexing…", icon::FILES),
                         Style::default().fg(Color::Gray),
                     )]);
                 } else if let Some(count) = indexed.filter(|count| *count > 0) {
                     header_segments.push(vec![Span::styled(
-                        format!("{count} indexed"),
+                        format!("{} {count}", icon::FILES),
                         Style::default().fg(Color::Gray),
                     )]);
                 }
@@ -6000,7 +6005,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 if jobs_area.width >= 20 {
                     let offset = jobs_state.offset();
                     for (visible_index, job) in jobs.iter().skip(offset).enumerate() {
-                        let y = jobs_area.y + 1 + (visible_index as u16 * 4);
+                        let y = jobs_area.y + 1 + (visible_index as u16 * JOB_ROW_HEIGHT);
                         if y + 4 > jobs_area.y + jobs_area.height.saturating_sub(1) {
                             break;
                         }
@@ -6133,7 +6138,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         };
                         lines.push(match row {
                             SettingsRow::Header(title) => Line::from(Span::styled(
-                                title.clone(),
+                                labelled(title).trim_start().to_string(),
                                 Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
                             )),
                             SettingsRow::Field(field_index) => {
@@ -6240,9 +6245,9 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         muted,
                     )));
                     let title = if screen.input.is_some() {
-                        "Settings · Enter save · Esc cancel · empty clears"
+                        "\u{f0493} Settings · Enter save · Esc cancel · empty clears"
                     } else {
-                        "Settings · ↑/↓ · Enter edit · Del clear · r reset · a add job · E editor · Esc"
+                        "\u{f0493} Settings · ↑/↓ · Enter edit · Del clear · r reset · a add job · E editor · Esc"
                     };
                     frame.render_widget(Clear, popup);
                     frame.render_widget(
@@ -6254,7 +6259,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 }
                 if show_job_config {
                     let mut lines = Vec::new();
-                    let mut title = "Job configuration · i / Esc close".to_string();
+                    let mut title = format!("{} Job configuration · i / Esc close", icon::FILE_COG);
                     if let Some(job) = jobs
                         .get(selected)
                         .and_then(|selected| config.jobs.iter().find(|job| job.name == selected.name))
@@ -6336,9 +6341,9 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         };
                         lines.push(Line::from(Span::styled(target, Style::default().fg(Color::DarkGray))));
                         title = if editor.input.is_some() {
-                            "Job configuration · Enter save · Esc cancel · empty clears".into()
+                            format!("{} Job configuration · Enter save · Esc cancel · empty clears", icon::FILE_COG)
                         } else {
-                            "Job configuration · ↑/↓ · Enter edit/toggle · Del clear · r reset · Esc".into()
+                            format!("{} Job configuration · ↑/↓ · Enter edit/toggle · Del clear · r reset · Esc", icon::FILE_COG)
                         };
                     } else if let Some(job) = jobs.get(selected) {
                         lines.extend([
@@ -6389,7 +6394,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     let title = truncate_near_end(name, usize::from(popup.width.saturating_sub(24)));
                     frame.render_widget(Clear, popup);
                     frame.render_widget(
-                        panel_block(&format!("{title} · p play · i / Esc close"), true),
+                        panel_block(&format!("{} {title} · p play · i / Esc close", icon::INFO), true),
                         popup,
                     );
                     // A 16:9 still at 9 rows is ~32 cells wide with 1:2 cells.
@@ -6568,7 +6573,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             Paragraph::new("Loading Jellyfin library…")
                                 .style(Style::default().fg(Color::Gray))
                                 .alignment(ratatui::layout::Alignment::Center)
-                                .block(panel_block("Library", true)),
+                                .block(panel_block(&format!("{} Library", icon::LIBRARY), true)),
                             explore_list_area,
                         );
                     } else {
@@ -6670,7 +6675,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                         Paragraph::new("Loading show contents…")
                                             .style(Style::default().fg(Color::DarkGray))
                                             .alignment(ratatui::layout::Alignment::Center)
-                                            .block(panel_block("Contents", false)),
+                                            .block(panel_block(&format!("{} Contents", icon::LIST), false)),
                                         content_area,
                                     );
                                 } else {
@@ -6724,7 +6729,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                             Style::default().fg(Color::Gray),
                                         )),
                                     ])
-                                    .block(panel_block("Contents", false)),
+                                    .block(panel_block(&format!("{} Contents", icon::LIST), false)),
                                     content_area,
                                 );
                             }
@@ -6813,7 +6818,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     frame.render_widget(Clear, help_popup);
                     frame.render_widget(
                         Paragraph::new(help_lines)
-                            .block(panel_block("Keyboard shortcuts · ? / Esc close", true))
+                            .block(panel_block(&format!("{} Keyboard shortcuts · ? / Esc close", icon::KEYBOARD), true))
                             .style(Style::default().fg(Color::White)),
                         help_popup,
                     );
@@ -6992,7 +6997,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                     mouse.row,
                                     jobs_state.offset(),
                                     jobs.len(),
-                                    4,
+                                    usize::from(JOB_ROW_HEIGHT),
                                 ) {
                                     selected = index;
                                     selected_download = 0;
@@ -7773,7 +7778,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         }
                         KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
                             if download_focus {
-                                let page = usize::from(downloads_area.height.saturating_sub(2)) / 3;
+                                let page = usize::from(downloads_area.height.saturating_sub(2)) / file_row_height(&FileRow::File(0));
                                 selected_download = list_jump(key.code, selected_download, downloads.len(), page);
                             } else {
                                 let page = usize::from(jobs_area.height.saturating_sub(2)) / 4;
@@ -8049,6 +8054,25 @@ mod icon {
     pub const CLOSE: &str = "\u{f0156}"; // md-close
     pub const DELETE: &str = "\u{f01b4}"; // md-delete
     pub const DISK: &str = "\u{f02ca}"; // md-harddisk
+    pub const FILES: &str = "\u{f0222}"; // md-file_multiple
+    pub const BROOM: &str = "\u{f00e2}"; // md-broom
+    pub const CALENDAR: &str = "\u{f00ed}"; // md-calendar
+    pub const CLOCK: &str = "\u{f0150}"; // md-clock_outline
+    pub const COG: &str = "\u{f0493}"; // md-cog
+    pub const FILE: &str = "\u{f0214}"; // md-file
+    pub const FILE_COG: &str = "\u{f107b}"; // md-file_cog
+    pub const FILE_VIDEO: &str = "\u{f022b}"; // md-file_video
+    pub const FOLDER: &str = "\u{f024b}"; // md-folder
+    pub const FOLDER_HOME: &str = "\u{f10b5}"; // md-folder_home
+    pub const INFO: &str = "\u{f02fd}"; // md-information_outline
+    pub const KEYBOARD: &str = "\u{f030c}"; // md-keyboard
+    pub const LIST: &str = "\u{f0279}"; // md-format_list_bulleted
+    pub const MOVIE: &str = "\u{f0381}"; // md-movie
+    pub const SERIES: &str = "\u{f0502}"; // md-television
+    pub const SERVER: &str = "\u{f048d}"; // md-server_network
+    pub const SHAPE: &str = "\u{f0831}"; // md-shape
+    pub const TAG: &str = "\u{f04f9}"; // md-tag
+    pub const TITLE: &str = "\u{f05f4}"; // md-format_title
     pub const DOWNLOAD: &str = "\u{f01da}"; // md-download
     pub const DOWNLOAD_OUTLINE: &str = "\u{f0b8f}"; // md-download_outline
     pub const IDLE: &str = "\u{f0766}"; // md-circle_outline
@@ -8064,6 +8088,42 @@ mod icon {
     pub const TIMER_OFF: &str = "\u{f13ac}"; // md-timer_off
     pub const VIDEO: &str = "\u{f0567}"; // md-video
     pub const WATCHED: &str = "\u{f0208}"; // md-eye
+}
+
+/// The glyph for a row label in the details panel and dialogs, if any.
+fn label_icon(label: &str) -> Option<&'static str> {
+    Some(match label {
+        "Aired" => icon::CALENDAR,
+        "Audio" => icon::AUDIO,
+        "Cleanup" => icon::BROOM,
+        "Configured" => icon::FILE_COG,
+        "Directory" => icon::FOLDER,
+        "File" => icon::FILE,
+        "General" => icon::COG,
+        "Jellyfin" => icon::SERIES,
+        "Jobs" => icon::LIST,
+        "Last sync" => icon::SYNC,
+        "Local" => icon::DISK,
+        "Local dir" => icon::FOLDER_HOME,
+        "Name" => icon::TAG,
+        "Rating" => icon::STAR,
+        "Remote (rsync)" | "Remote dir" => icon::SERVER,
+        "Runtime" => icon::CLOCK,
+        "Subtitles" => icon::SUBTITLES,
+        "Title" => icon::TITLE,
+        "Type" => icon::SHAPE,
+        "Video" => icon::VIDEO,
+        "Watched" => icon::WATCHED,
+        _ => return None,
+    })
+}
+
+/// "󰕧 Video" for labels with an icon; others are indented to line up.
+fn labelled(label: &str) -> String {
+    match label_icon(label) {
+        Some(glyph) => format!("{glyph} {label}"),
+        None => format!("  {label}"),
+    }
 }
 
 /// The glyph for a job or file state, shared by `status` and the TUI.
@@ -8461,7 +8521,8 @@ fn render_job_details(
     file_watched: Option<String>,
     probe: Option<&std::result::Result<MediaProbe, String>>,
 ) {
-    let block = panel_block("Details", false);
+    let title = format!("{} Details", icon::INFO);
+    let block = panel_block(&title, false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 10 || inner.height < 2 {
@@ -8529,8 +8590,14 @@ fn render_job_details(
     lines.push(Line::from(title_spans));
     let mut fact_spans = Vec::new();
     match series {
-        Some(true) => fact_spans.push(Span::styled("SERIES", Style::default().fg(Color::Magenta))),
-        Some(false) => fact_spans.push(Span::styled("MOVIE", Style::default().fg(Color::Magenta))),
+        Some(true) => fact_spans.push(Span::styled(
+            format!("{} SERIES", icon::SERIES),
+            Style::default().fg(Color::Magenta),
+        )),
+        Some(false) => fact_spans.push(Span::styled(
+            format!("{} MOVIE", icon::MOVIE),
+            Style::default().fg(Color::Magenta),
+        )),
         None if loading => fact_spans.push(Span::styled(
             "loading details…",
             Style::default().fg(Color::DarkGray),
@@ -8563,7 +8630,10 @@ fn render_job_details(
     }
     if let Some((state, age)) = last_sync {
         lines.push(Line::from(vec![
-            Span::styled("Last sync  ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{}  ", labelled("Last sync")),
+                Style::default().fg(Color::Cyan),
+            ),
             Span::styled(age, Style::default().fg(Color::White)),
             Span::styled(" · ", Style::default().fg(Color::DarkGray)),
             Span::styled(state.to_lowercase(), state_style(&state)),
@@ -8572,7 +8642,10 @@ fn render_job_details(
     if let Some(label) = file_label {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{} ", icon::FILE_VIDEO),
+                Style::default().fg(Color::Cyan),
+            ),
             Span::styled(
                 truncate_near_end(&label, width.saturating_sub(2)),
                 Style::default()
@@ -8583,10 +8656,10 @@ fn render_job_details(
         if let Some(watched) = file_watched {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  {:<11}", "Watched"),
+                    format!("  {:<12}", labelled("Watched")),
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::raw(truncate(&watched, width.saturating_sub(13))),
+                Span::raw(truncate(&watched, width.saturating_sub(14))),
             ]));
         }
         match probe {
@@ -8596,8 +8669,11 @@ fn render_job_details(
                 for label in order {
                     for (name, value) in probe.rows.iter().filter(|(name, _)| name == label) {
                         lines.push(Line::from(vec![
-                            Span::styled(format!("  {name:<11}"), Style::default().fg(Color::Cyan)),
-                            Span::raw(truncate(value, width.saturating_sub(13))),
+                            Span::styled(
+                                format!("  {:<12}", labelled(name)),
+                                Style::default().fg(Color::Cyan),
+                            ),
+                            Span::raw(truncate(value, width.saturating_sub(14))),
                         ]));
                     }
                 }
@@ -8828,10 +8904,7 @@ fn media_summary(probe: &serde_json::Value) -> MediaSummary {
             Some("arib-std-b67") => parts.push("HLG".into()),
             _ => {}
         }
-        rows.push((
-            "Video".to_string(),
-            format!("{} {}", icon::VIDEO, parts.join(", ")),
-        ));
+        rows.push(("Video".to_string(), parts.join(", ")));
     }
     let audio: Vec<String> = of_type("audio")
         .into_iter()
@@ -8849,10 +8922,7 @@ fn media_summary(probe: &serde_json::Value) -> MediaSummary {
         })
         .collect();
     if !audio.is_empty() {
-        rows.push((
-            "Audio".to_string(),
-            format!("{} {}", icon::AUDIO, audio.join(", ")),
-        ));
+        rows.push(("Audio".to_string(), audio.join(", ")));
     }
     let subtitles: Vec<String> = of_type("subtitle")
         .into_iter()
@@ -8869,10 +8939,7 @@ fn media_summary(probe: &serde_json::Value) -> MediaSummary {
         })
         .collect();
     if !subtitles.is_empty() {
-        rows.push((
-            "Subtitles".to_string(),
-            format!("{} {}", icon::SUBTITLES, subtitles.join(", ")),
-        ));
+        rows.push(("Subtitles".to_string(), subtitles.join(", ")));
     }
     rows
 }
@@ -8880,7 +8947,7 @@ fn media_summary(probe: &serde_json::Value) -> MediaSummary {
 fn config_line(label: &str, value: impl Into<String>) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("{label:<14}"),
+            format!("{:<16}", labelled(label)),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -9234,7 +9301,7 @@ fn path_within_roots(path: &Path, roots: &[PathBuf]) -> Result<bool> {
 fn file_row_height(row: &FileRow) -> usize {
     match row {
         FileRow::Season(_) => 1,
-        FileRow::File(_) => 3,
+        FileRow::File(_) => 4,
     }
 }
 
@@ -9593,12 +9660,13 @@ mod tests {
             FileRow::File(1),
         ];
         let area = Rect::new(0, 0, 40, 20);
-        // Line 1 is the heading, lines 2-4 the first file, 5-7 the second.
+        // Line 1 is the heading, lines 2-5 the first file (with its blank
+        // spacer), 6-9 the second.
         assert_eq!(file_row_at(area, 5, 1, 0, &rows), None);
         assert_eq!(file_row_at(area, 5, 2, 0, &rows), Some(0));
-        assert_eq!(file_row_at(area, 5, 4, 0, &rows), Some(0));
-        assert_eq!(file_row_at(area, 5, 5, 0, &rows), Some(1));
-        assert_eq!(file_row_at(area, 5, 8, 0, &rows), None);
+        assert_eq!(file_row_at(area, 5, 5, 0, &rows), Some(0));
+        assert_eq!(file_row_at(area, 5, 6, 0, &rows), Some(1));
+        assert_eq!(file_row_at(area, 5, 10, 0, &rows), None);
         assert_eq!(file_row_at(area, 5, 1, 2, &rows), Some(1));
         // Borders are not rows.
         assert_eq!(file_row_at(area, 5, 0, 0, &rows), None);

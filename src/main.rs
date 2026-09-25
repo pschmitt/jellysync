@@ -4812,6 +4812,9 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
         let mut download_focus = false;
         let mut main_split = 50u16;
         let mut resizing_split = false;
+        // Details panel height once dragged by the user (default: sized to fit).
+        let mut details_height: Option<u16> = None;
+        let mut resizing_details = false;
         let mut confirm_clear: Option<ClearRequest> = None;
         let mut show_help = false;
         let mut show_job_config = false;
@@ -5635,7 +5638,9 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
             };
             // Metadata for the selected job sits above its files when there is room.
             let (details_area, downloads_area) = if selected_job.is_some() && downloads_area.height >= 22 {
-                let height = (downloads_area.height * 2 / 5).clamp(10, 16);
+                let height = details_height
+                    .unwrap_or_else(|| (downloads_area.height * 2 / 5).clamp(10, 16))
+                    .clamp(6, downloads_area.height.saturating_sub(6));
                 let [details_area, downloads_area] = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(height), Constraint::Min(6)])
@@ -5752,11 +5757,17 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     };
                     if completed && let Some(Ok(probe)) = probe_cache.get(&entry.path) {
                         let used: usize = subtitle.iter().map(|span| span.content.chars().count()).sum();
-                        let badges = probe.badges.join(" · ");
-                        subtitle.push(Span::styled(
-                            format!("  {}", truncate(&badges, download_text_width.saturating_sub(used + 2))),
-                            Style::default().fg(Color::Blue),
-                        ));
+                        // Resolution, then the codec in its own colour.
+                        let mut room = download_text_width.saturating_sub(used);
+                        for (index, badge) in probe.badges.iter().enumerate() {
+                            let text = format!(" {}", truncate(badge, room.saturating_sub(1)));
+                            room = room.saturating_sub(text.chars().count());
+                            let color = if index == 0 { Color::Blue } else { codec_color(badge) };
+                            subtitle.push(Span::styled(text, Style::default().fg(color)));
+                            if room <= 1 {
+                                break;
+                            }
+                        }
                     }
                     // Queued files have no progress yet: skip the bar and its "?".
                     let third_line = if !completed && !ignored && entry.status != "queued" {
@@ -5882,30 +5893,15 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         Style::default().fg(Color::Gray),
                     )]);
                 }
-                // Everything tracked across all jobs; while files are still
-                // pending, show how much of it is already on disk.
-                let (done_size, tracked_size) = dashboard
+                // What tracked files (and partial downloads) use on disk now.
+                let disk_size = dashboard
                     .downloads
                     .iter()
                     .filter(|entry| entry.status != "ignored")
-                    .fold((0u64, 0u64), |(done, tracked), entry| {
-                        (
-                            done.saturating_add(entry.bytes),
-                            tracked.saturating_add(entry.total.unwrap_or(entry.bytes).max(entry.bytes)),
-                        )
-                    });
-                if tracked_size > 0 {
+                    .fold(0u64, |total, entry| total.saturating_add(entry.bytes));
+                if disk_size > 0 {
                     header_segments.push(vec![Span::styled(
-                        if done_size < tracked_size {
-                            format!(
-                                "{} {} / {}",
-                                icon::DISK,
-                                format_bytes(done_size),
-                                format_bytes(tracked_size)
-                            )
-                        } else {
-                            format!("{} {}", icon::DISK, format_bytes(tracked_size))
-                        },
+                        format!("{} {}", icon::DISK, format_bytes(disk_size)),
                         Style::default().fg(Color::Gray),
                     )]);
                 }
@@ -6780,6 +6776,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         Line::from("  PgUp/PgDn Home/End  jump through the list"),
                         Line::from("  Tab / ← / →       switch focus"),
                         Line::from("  Mouse drag        resize Jobs/Files split (wide terminals)"),
+                        Line::from("                    and the Details/Files split"),
                         Line::from("  s / S             sync selected / all jobs"),
                         Line::from("  b                 browse the Jellyfin library"),
                         Line::from("  i                 job configuration and sync settings (Jobs focused)"),
@@ -6963,13 +6960,30 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             {
                                 resizing_split = true;
                             }
+                            // The border between the Details panel and the Files list.
+                            MouseEventKind::Down(MouseButton::Left)
+                                if details_area.is_some()
+                                    && (mouse.row == downloads_area.y
+                                        || mouse.row + 1 == downloads_area.y)
+                                    && mouse.column >= downloads_area.x
+                                    && mouse.column < downloads_area.x + downloads_area.width =>
+                            {
+                                resizing_details = true;
+                            }
                             MouseEventKind::Drag(MouseButton::Left) if resizing_split => {
                                 let relative = mouse.column.saturating_sub(body.x);
                                 let ratio = relative.saturating_mul(100) / body.width.max(1);
                                 main_split = ratio.clamp(20, 80);
                             }
+                            MouseEventKind::Drag(MouseButton::Left) if resizing_details => {
+                                if let Some(details) = details_area {
+                                    // Clamped to the available room when laid out.
+                                    details_height = Some(mouse.row.saturating_sub(details.y) + 1);
+                                }
+                            }
                             MouseEventKind::Up(MouseButton::Left) => {
                                 resizing_split = false;
+                                resizing_details = false;
                             }
                             MouseEventKind::Down(MouseButton::Left) => {
                                 if let Some(index) = list_index_at(
@@ -8698,6 +8712,8 @@ fn media_badges(probe: &serde_json::Value) -> Vec<String> {
             .filter(|stream| !disposition(stream, "attached_pic"))
             .collect()
     };
+    // Only what tells files apart at a glance; audio, subtitles and HDR are
+    // in the Details panel.
     let mut badges = Vec::new();
     if let Some(video) = of_type("video").first() {
         badges.push(format!(
@@ -8715,37 +8731,18 @@ fn media_badges(probe: &serde_json::Value) -> Vec<String> {
                 other => other.to_uppercase(),
             });
         }
-        match text(video, "color_transfer").as_deref() {
-            Some("smpte2084") => badges.push("HDR10".into()),
-            Some("arib-std-b67") => badges.push("HLG".into()),
-            _ => {}
-        }
-    }
-    let audio = of_type("audio");
-    if let Some(track) = audio
-        .iter()
-        .find(|stream| disposition(stream, "default"))
-        .or(audio.first())
-    {
-        let mut badge = format!(
-            "{} {} {}",
-            icon::AUDIO,
-            text(track, "codec_name")
-                .unwrap_or_else(|| "?".into())
-                .to_uppercase(),
-            channel_label(number(track, "channels"))
-        );
-        // Other audio tracks besides the default one.
-        if audio.len() > 1 {
-            badge.push_str(&format!(" +{}", audio.len() - 1));
-        }
-        badges.push(badge);
-    }
-    let subtitles = of_type("subtitle").len();
-    if subtitles > 0 {
-        badges.push(format!("{} {subtitles}", icon::SUBTITLES));
     }
     badges
+}
+
+/// Codecs in distinct colours so e.g. H.264 stands out next to HEVC.
+fn codec_color(codec: &str) -> Color {
+    match codec {
+        "HEVC" => Color::Green,
+        "H.264" => Color::Yellow,
+        "AV1" => Color::Magenta,
+        _ => Color::Gray,
+    }
 }
 
 fn media_summary(probe: &serde_json::Value) -> MediaSummary {
@@ -8831,7 +8828,10 @@ fn media_summary(probe: &serde_json::Value) -> MediaSummary {
             Some("arib-std-b67") => parts.push("HLG".into()),
             _ => {}
         }
-        rows.push(("Video".to_string(), parts.join(", ")));
+        rows.push((
+            "Video".to_string(),
+            format!("{} {}", icon::VIDEO, parts.join(", ")),
+        ));
     }
     let audio: Vec<String> = of_type("audio")
         .into_iter()
@@ -8849,7 +8849,10 @@ fn media_summary(probe: &serde_json::Value) -> MediaSummary {
         })
         .collect();
     if !audio.is_empty() {
-        rows.push(("Audio".to_string(), audio.join(", ")));
+        rows.push((
+            "Audio".to_string(),
+            format!("{} {}", icon::AUDIO, audio.join(", ")),
+        ));
     }
     let subtitles: Vec<String> = of_type("subtitle")
         .into_iter()
@@ -8866,7 +8869,10 @@ fn media_summary(probe: &serde_json::Value) -> MediaSummary {
         })
         .collect();
     if !subtitles.is_empty() {
-        rows.push(("Subtitles".to_string(), subtitles.join(", ")));
+        rows.push((
+            "Subtitles".to_string(),
+            format!("{} {}", icon::SUBTITLES, subtitles.join(", ")),
+        ));
     }
     rows
 }
@@ -9488,16 +9494,7 @@ mod tests {
                 {"codec_type": "subtitle", "codec_name": "subrip"}
             ]
         });
-        assert_eq!(
-            media_badges(&probe),
-            [
-                "\u{f0567} 4K",
-                "HEVC",
-                "HDR10",
-                "\u{f057e} EAC3 5.1 +1",
-                "\u{f0a16} 1"
-            ]
-        );
+        assert_eq!(media_badges(&probe), ["\u{f0567} 4K", "HEVC"]);
         let rows = media_summary(&probe);
         assert!(
             rows.iter()

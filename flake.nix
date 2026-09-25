@@ -61,6 +61,9 @@
               rsyncConfig = lib.optionalAttrs (cfg.settings.rsync != null) {
                 inherit (cfg.settings) rsync;
               };
+              cleanupConfig = lib.optionalAttrs (cfg.settings.cleanup != null) {
+                inherit (cfg.settings) cleanup;
+              };
               transferConfig = {
                 download = {
                   mode = cfg.settings.downloadMode;
@@ -76,7 +79,7 @@
                   { };
             in
             yamlFormat.generate "jellysync-config.yaml" (
-              baseConfig // libConfig // rsyncConfig // transferConfig // jobsConfig
+              baseConfig // libConfig // rsyncConfig // cleanupConfig // transferConfig // jobsConfig
             );
         in
         {
@@ -248,6 +251,23 @@
                 description = "Library organization settings.";
               };
 
+              cleanup = mkOption {
+                type = types.nullOr (
+                  types.submodule {
+                    options = {
+                      delete_watched_after = mkOption {
+                        type = types.str;
+                        default = "7d";
+                        description = "Grace period before watched files of jobs with delete_watched are deleted (e.g. 7d, 12h, 0).";
+                        example = "3d";
+                      };
+                    };
+                  }
+                );
+                default = null;
+                description = "Automatic removal of watched downloads.";
+              };
+
               rsync = mkOption {
                 type = types.nullOr (
                   types.submodule {
@@ -327,6 +347,19 @@
                         type = types.nullOr types.bool;
                         default = null;
                         description = "Enable wildcard matching (*name*).";
+                      };
+
+                      delete_watched = mkOption {
+                        type = types.nullOr types.bool;
+                        default = null;
+                        description = "Delete downloaded files once watched (after the grace period) and do not download watched items again.";
+                      };
+
+                      delete_watched_after = mkOption {
+                        type = types.nullOr types.str;
+                        default = null;
+                        description = "Per-job grace period before watched files are deleted (overrides cleanup.delete_watched_after).";
+                        example = "3d";
                       };
 
                       enabled = mkOption {

@@ -158,8 +158,8 @@ schedule = "Mon *-*-* 02:00:00";
 jellysync                     # Open the TUI (same as `jellysync tui`)
 jellysync download [JOB]...   # Download all jobs or selected ones (aliases: fetch, sync)
 jellysync status              # Show recent job status and timer state
-jellysync prune [JOB]...      # Preview stale managed downloads
-jellysync prune --apply       # Apply the prune
+jellysync prune [JOB]...      # Delete removed media and watched files past their grace period
+jellysync prune --dry-run     # Only show what prune would delete (also -k, --dryrun)
 jellysync start               # Start the user systemd service
 jellysync stop                # Stop the user systemd service
 jellysync config              # Print the parsed config
@@ -317,7 +317,7 @@ jobs:
   # Sync season 13 and any later seasons
   - name: Example Soap
     directory: tv_shows
-    seasons: "13-9999"
+    seasons: "13+"
 
   # Sync specific seasons (list)
   - name: Example Drama
@@ -492,6 +492,8 @@ Each job defines a sync operation.
 | `wildcard` | No | boolean | If `true`, adds `*name*` pattern to remote path |
 | `unwatched` | No | boolean | If `true`, syncs episodes marked unplayed by the configured Jellyfin user |
 | `enabled` | No | boolean | `false` skips the job when syncing all jobs; it still runs when named (default `true`) |
+| `delete_watched` | No | boolean | Delete downloaded files once watched, after the grace period; watched items are not downloaded again |
+| `delete_watched_after` | No | duration | Grace period for this job, overriding `cleanup.delete_watched_after` (e.g. `3d`, `12h`, `0`) |
 
 **Season Filtering:**
 
@@ -502,6 +504,9 @@ The `seasons` option allows selective syncing of TV show seasons:
 | String (latest) | `"latest"` | Syncs only the most recent season |
 | String (latest-N) | `"latest-3"` | Syncs the latest 3 seasons |
 | String (range) | `"1-10"` | Syncs seasons 1 through 10 (inclusive) |
+| String (open range) | `"13+"` (or `"13-"`) | Syncs season 13 and every later one |
+| String (up to) | `"-5"` | Syncs seasons up to 5 |
+| String (several) | `"1, 3-4, 10+"` | Combines the forms above |
 | Array (list) | `[1, 2, 5]` | Syncs only seasons 1, 2, and 5 |
 
 **Notes:**
@@ -620,8 +625,8 @@ jellysync download "Pioneer One"
 jellysync download "Pioneer One" Sintel
 jellysync status
 jellysync tui
-jellysync prune
-jellysync prune --apply
+jellysync prune --dry-run
+jellysync prune --watched
 jellysync --config /path/to/config.yaml config
 ```
 
@@ -633,11 +638,50 @@ jellysync --config /path/to/config.yaml config
 - `status`: Show latest job state and systemd timer state
 - `version` (also `--version`, `-V`): Print the version: `1.1.0` for a tagged release, `1.1.0-<commit>` otherwise and `1.1.0-<commit>-dirty` with uncommitted changes to the sources (Nix builds always name the commit; flakes cannot see tags). `--json version` prints it as JSON.
 - `completions <SHELL>`: Print a completion script for bash, zsh, fish, elvish or powershell. The Nix package installs the bash, zsh and fish completions, so they work out of the box with the Home Manager module; elsewhere, e.g. `jellysync completions zsh > ~/.zfunc/_jellysync`.
-- `completions <SHELL>`: Print a completion script for bash, zsh, fish, elvish or powershell. The Nix package installs the bash, zsh and fish completions, so they work out of the box with the Home Manager module; elsewhere, e.g. `jellysync completions zsh > ~/.zfunc/_jellysync`.
-- `prune [--apply] [JOB...]`: Preview deletions, or apply them
-- `tui`: Select a job to see its files; `s` syncs that job, `S` syncs all jobs, `b` opens Jellyfin Explore, and `o` opens the job's download directory. Explore searches the library, renders posters with `ratatui-image` (including Kitty graphics protocol support), shows a series' episodes in the details pane (`Tab` to focus, `Space`/`a` to select), and downloads movies or selected episodes with `d`. In the main view, `x` (file), `X` (season), `c` (show), then `y` clears media; `x` on an ad-hoc job removes it. `p` or a double-click plays a file. `i` opens the job configuration, where its sync settings can be edited (see [Settings overlay](#settings-overlay-editing-from-the-tui)), or, with a file selected, `i`/`Enter` show a short `ffprobe` summary (container, duration, size, bitrate, video/audio/subtitle streams), plus the episode still, title, air date, rating, runtime, watched state and overview from Jellyfin when online; `p` plays the file from there. Mouse clicks and scrolling select rows.
+- `prune [-k|--dry-run] [--watched] [JOB...]`: Delete tracked files whose media is gone from Jellyfin, and watched files past their grace period in jobs with `delete_watched` (`--watched`: in every selected job). `-k`/`--dry-run`/`--dryrun` only lists what would be deleted, plus watched files still in their grace period. Without Jellyfin it works from the local watched state and skips the removed-media check. **prune deletes by default now**; the old `--apply` flag is accepted and ignored.
+- `tui`: Select a job to see its files; `s` syncs that job, `S` syncs all jobs, `b` opens Jellyfin Explore, and `o` opens the job's download directory. Explore searches the library, renders posters with `ratatui-image` (including Kitty graphics protocol support), shows a series' episodes in the details pane (`Tab` to focus, `Space`/`a` to select), and downloads movies or selected episodes with `d`. In the main view, `x` deletes the focused file (a later sync may download it again), `X` deletes it and makes syncs ignore it, and `c` deletes and ignores the whole show (all after a `y` confirmation); `x` on an ad-hoc job in the Jobs list removes it. `I` toggles ignoring the focused file without deleting it. `w` toggles the focused file watched (in the Jobs list: the whole job) and `W` its season (see [Watched state and cleanup](#watched-state-and-cleanup)). `p` or a double-click plays a file. `i` opens the job configuration, where its sync settings can be edited (see [Settings overlay](#settings-overlay-editing-from-the-tui)), or, with a file selected, `i`/`Enter` show a short `ffprobe` summary (container, duration, size, bitrate, video/audio/subtitle streams), plus the episode still, title, air date, rating, runtime, watched state and overview from Jellyfin when online; `p` plays the file from there. Mouse clicks and scrolling select rows.
 - `-h, --help`: Show help message
 - `--version`: Show version
+
+## Watched state and cleanup
+
+jellysync keeps the Jellyfin user's played state for every tracked file in its
+state database, so the TUI shows it offline too:
+
+- file rows show `✓ watched`, season headings `N watched`, and job rows
+  `N/M watched`; the Details panel has a *Watched* line;
+- `w` toggles the focused file watched (in the Jobs list: the whole job) and
+  `W` its season. Marks made offline are shown as *not synced* and sent to
+  Jellyfin once it is reachable (the TUI syncs every minute while online, and
+  `download` and `prune` sync first). A local mark wins over Jellyfin's state
+  until it has been sent.
+
+Jobs with `delete_watched: true` clean up after themselves: `jellysync
+download` (and so the timer) deletes their watched files once the grace period
+is over, and never downloads watched items again. The grace period defaults to
+7 days from when the item was played (`LastPlayedDate` in Jellyfin, or when
+jellysync first saw it watched); the TUI shows the countdown (`deleted in 5d`).
+
+```yaml
+cleanup:
+  delete_watched_after: 7d   # default; 12h, 30m or 0 work too (a bare number means days)
+
+jobs:
+  - name: Pioneer One
+    directory: tv_shows
+    delete_watched: true
+    delete_watched_after: 2d  # overrides the global grace period
+```
+
+`jellysync prune --watched` applies the same cleanup to every selected job,
+with or without `delete_watched`.
+
+### Ignoring items
+
+Deleting a file with `X` (or a whole show with `c`) in the TUI also makes
+syncs ignore it, so it does not come back with the next sync; `x` only deletes.
+`I` toggles ignoring a file without deleting it. Ignored files stay in the Files
+list, dimmed, and `I` there syncs them again.
 
 ## Configuration File Locations
 
@@ -671,7 +715,8 @@ Press `,` in the TUI for the Settings screen:
   when the editor exits.
 
 `i` on a job edits the same sync settings directly: enabled, Jellyfin name,
-seasons, episodes and unwatched-only (plus wildcard in rsync mode). Invalid
+seasons, episodes, delete watched, its grace period and unwatched-only (plus
+wildcard in rsync mode). Invalid
 values, such as a bad filter or a cleared required option, are rejected before
 anything is saved.
 
@@ -737,7 +782,7 @@ jellysync download "Pioneer One"
 
 ### Preview Changes
 ```bash
-jellysync prune
+jellysync prune --dry-run
 ```
 
 ### Sync Multiple Specific Jobs
@@ -757,7 +802,7 @@ jellysync download "Pioneer One" Sintel "Big Buck Bunny"
 ## Tips
 
 - Set up SSH key authentication to avoid password prompts
-- Use `jellysync prune` to preview deletions before applying them
+- Use `jellysync prune --dry-run` to preview deletions before running `jellysync prune`
 - Absolute paths in `local.directories` override the `local.root`
 
 ## License

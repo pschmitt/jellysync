@@ -65,6 +65,11 @@ player: mpv
 # (default: xdg-open, falling back to `gio open`).
 # file_manager: nautilus
 
+# Optional: grace period before watched files of jobs with delete_watched are
+# deleted (default 7d; 12h, 30m or 0 work too).
+cleanup:
+  delete_watched_after: 7d
+
 jobs:
   # Example titles: Pioneer One (CC BY-NC-SA), the Blender open movies
   # (CC BY) and Night of the Living Dead (public domain); the others are
@@ -96,10 +101,11 @@ jobs:
   - name: Example Comedy
     directory: tv_shows
     seasons: latest
+    delete_watched: true # delete watched episodes after the grace period
 
   - name: Example Soap
     directory: tv_shows
-    seasons: "13-9999" # season 13 and later
+    seasons: "13+" # season 13 and later
 
   - name: Example Drama
     directory: tv_shows

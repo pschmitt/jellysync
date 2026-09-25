@@ -148,10 +148,17 @@ enum Commands {
     },
     /// Show recent job status and the timer state
     Status,
-    /// Remove tracked files whose media no longer exists in Jellyfin (or remotely, in rsync mode)
+    /// Delete tracked files whose media is gone from Jellyfin (or the remote, in
+    /// rsync mode) and watched files past their grace period (jobs with delete_watched)
     Prune {
-        /// Actually delete files instead of previewing
+        /// Only show what would be deleted
+        #[arg(short = 'k', long = "dry-run", visible_alias = "dryrun")]
+        dry_run: bool,
+        /// Also delete watched files of jobs without delete_watched (after the grace period)
         #[arg(long)]
+        watched: bool,
+        /// Former opt-in to deleting; prune deletes by default now (see --dry-run)
+        #[arg(long, hide = true)]
         apply: bool,
         /// Job names to prune (default: all jobs)
         #[arg(value_name = "JOB")]
@@ -195,8 +202,38 @@ struct Config {
     #[serde(default)]
     library: Option<Library>,
     #[serde(default)]
+    cleanup: Option<Cleanup>,
+    #[serde(default)]
     jobs: Vec<Job>,
 }
+/// Automatic removal of watched downloads (for jobs with `delete_watched`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct Cleanup {
+    /// How long watched files are kept before they are deleted, e.g. `7d`.
+    #[serde(default, deserialize_with = "duration_spec")]
+    delete_watched_after: Option<String>,
+}
+
+/// A duration setting written as text (`7d`) or a bare number of days (`0`).
+fn duration_spec<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Spec {
+        Text(String),
+        Days(u64),
+    }
+    Ok(
+        Option::<Spec>::deserialize(deserializer)?.map(|spec| match spec {
+            Spec::Text(text) => text,
+            Spec::Days(days) => days.to_string(),
+        }),
+    )
+}
+/// Default grace period before watched files are deleted.
+const DEFAULT_DELETE_WATCHED_AFTER: &str = "7d";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Remote {
     hostname: String,
@@ -257,11 +294,66 @@ struct Job {
     /// false skips the job when syncing all jobs; it can still be synced by name.
     #[serde(default)]
     enabled: Option<bool>,
+    /// Delete downloaded files once they are watched (after the grace period)
+    /// and do not download watched items again.
+    #[serde(default)]
+    delete_watched: Option<bool>,
+    /// Per-job grace period, overriding `cleanup.delete_watched_after`.
+    #[serde(default, deserialize_with = "duration_spec")]
+    delete_watched_after: Option<String>,
 }
 
 impl Job {
     fn enabled(&self) -> bool {
         self.enabled != Some(false)
+    }
+
+    /// Grace period before this job's watched files are deleted, if it deletes them.
+    fn watched_grace(&self, config: &Config) -> Option<Duration> {
+        if self.delete_watched != Some(true) {
+            return None;
+        }
+        let spec = self
+            .delete_watched_after
+            .as_deref()
+            .or(config
+                .cleanup
+                .as_ref()
+                .and_then(|cleanup| cleanup.delete_watched_after.as_deref()))
+            .unwrap_or(DEFAULT_DELETE_WATCHED_AFTER);
+        // Validated when the config is loaded.
+        parse_duration(spec).ok()
+    }
+}
+
+/// A duration like `7d`, `12h`, `30m`, `45s` or `0`; a bare number means days.
+fn parse_duration(spec: &str) -> Result<Duration> {
+    let spec = spec.trim();
+    let (number, unit) = match spec.find(|c: char| !c.is_ascii_digit()) {
+        Some(split) => spec.split_at(split),
+        None => (spec, "d"),
+    };
+    let number: u64 = number
+        .parse()
+        .with_context(|| format!("invalid duration '{spec}' (e.g. 7d, 12h, 30m)"))?;
+    let seconds = match unit.trim() {
+        "d" | "day" | "days" => 86_400,
+        "h" | "hour" | "hours" => 3600,
+        "m" | "min" | "minutes" => 60,
+        "s" | "sec" | "seconds" => 1,
+        _ => bail!("invalid duration '{spec}' (e.g. 7d, 12h, 30m)"),
+    };
+    Ok(Duration::from_secs(number.saturating_mul(seconds)))
+}
+
+/// "7d", "5h", "12m" for a remaining time, rounded up: something watched a
+/// minute ago with a 7-day grace period is "deleted in 7d", not "6d".
+fn format_duration_short(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds.div_ceil(60)),
+        3600..86_400 => format!("{}h", seconds.div_ceil(3600)),
+        _ => format!("{}d", seconds.div_ceil(86_400)),
     }
 }
 impl Default for Download {
@@ -383,6 +475,19 @@ fn parse_config(value: serde_yaml::Value) -> Result<Config> {
     if config.download.mode != "rsync" && config.download.mode != "jellyfin" {
         bail!("download.mode must be either 'rsync' or 'jellyfin'");
     }
+    if let Some(spec) = config
+        .cleanup
+        .as_ref()
+        .and_then(|cleanup| cleanup.delete_watched_after.as_deref())
+    {
+        parse_duration(spec).context("cleanup.delete_watched_after")?;
+    }
+    for job in &config.jobs {
+        if let Some(spec) = job.delete_watched_after.as_deref() {
+            parse_duration(spec)
+                .with_context(|| format!("job '{}': delete_watched_after", job.name))?;
+        }
+    }
     config.remote.root = expand_home(&config.remote.root);
     config.local.root = expand_home(&config.local.root);
     Ok(config)
@@ -417,6 +522,7 @@ enum SettingKind {
     Text,
     Filter,
     Toggle,
+    Duration,
 }
 
 /// A job setting that the TUI can edit.
@@ -453,6 +559,18 @@ fn job_settings(mode: &str) -> Vec<JobSetting> {
             label: "Enabled",
             kind: SettingKind::Toggle,
             help: "disabled jobs are skipped when syncing all jobs",
+        },
+        JobSetting {
+            key: "delete_watched",
+            label: "Delete watched",
+            kind: SettingKind::Toggle,
+            help: "delete files once watched (after the grace period); watched items are not downloaded again",
+        },
+        JobSetting {
+            key: "delete_watched_after",
+            label: "Keep watched for",
+            kind: SettingKind::Duration,
+            help: "grace period before watched files are deleted, e.g. 7d, 12h (default: cleanup setting, 7d)",
         },
         JobSetting {
             key: "unwatched",
@@ -497,6 +615,7 @@ fn job_setting_text(job: &Job, key: &str) -> Option<String> {
     };
     match key {
         "jellyfin_name" => job.jellyfin_name.clone(),
+        "delete_watched_after" => job.delete_watched_after.clone(),
         "seasons" => yaml(job.seasons.as_ref()),
         "episodes" => yaml(job.episodes.as_ref()),
         _ => None,
@@ -508,6 +627,7 @@ fn job_setting_bool(job: &Job, key: &str) -> Option<bool> {
         "unwatched" => job.unwatched,
         "wildcard" => job.wildcard,
         "enabled" => Some(job.enabled()),
+        "delete_watched" => job.delete_watched,
         _ => None,
     }
 }
@@ -520,6 +640,10 @@ fn parse_setting_input(kind: SettingKind, input: &str) -> Result<SettingChange> 
     }
     match kind {
         SettingKind::Text => Ok(SettingChange::Set(input.into())),
+        SettingKind::Duration => {
+            parse_duration(input)?;
+            Ok(SettingChange::Set(input.into()))
+        }
         SettingKind::Filter => {
             let value = match input.parse::<u64>() {
                 Ok(number) => serde_yaml::Value::from(number),
@@ -544,6 +668,8 @@ enum FieldKind {
     Choice(&'static [&'static str]),
     /// Whitespace-separated words, stored as a YAML list.
     List,
+    /// A duration such as `7d` or `12h`.
+    Duration,
 }
 
 /// A top-level config option the Settings screen edits natively.
@@ -686,6 +812,14 @@ const GLOBAL_FIELDS: &[GlobalField] = &[
         default: "-a -v -z",
         help: "space-separated rsync options",
     },
+    GlobalField {
+        section: "Cleanup",
+        path: &["cleanup", "delete_watched_after"],
+        label: "Keep watched for",
+        kind: FieldKind::Duration,
+        default: "7d",
+        help: "grace period before watched files of delete-watched jobs are deleted",
+    },
 ];
 
 /// How a config value reads in the Settings screen.
@@ -727,6 +861,10 @@ fn parse_field_input(kind: FieldKind, input: &str) -> Result<SettingChange> {
                 .map(serde_yaml::Value::from)
                 .collect(),
         ),
+        FieldKind::Duration => {
+            parse_duration(input)?;
+            input.into()
+        }
         FieldKind::Text | FieldKind::Choice(_) => input.into(),
     }))
 }
@@ -1231,7 +1369,8 @@ fn open_db(path: &Path) -> Result<Connection> {
         loop {
             match conn.execute_batch("PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS jobs (name TEXT PRIMARY KEY, status TEXT NOT NULL, message TEXT, updated_at TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS transfers (item_id TEXT PRIMARY KEY, job TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, total INTEGER, updated_at TEXT NOT NULL);")
+                CREATE TABLE IF NOT EXISTS transfers (item_id TEXT PRIMARY KEY, job TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, total INTEGER, updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS watched (item_id TEXT PRIMARY KEY, played INTEGER NOT NULL, pending INTEGER NOT NULL DEFAULT 0, played_at TEXT, updated_at TEXT NOT NULL);")
             {
                 Ok(()) => break,
                 Err(rusqlite::Error::SqliteFailure(error, _))
@@ -1255,6 +1394,223 @@ fn forget_job(name: &str) -> Result<()> {
     db()?.execute("DELETE FROM jobs WHERE name=?1", params![name])?;
     Ok(())
 }
+/// Played state of a tracked item: Jellyfin's, or a local mark not yet pushed.
+#[derive(Clone, Debug, PartialEq)]
+struct WatchedState {
+    played: bool,
+    /// Marked in jellysync (possibly offline) and not yet sent to Jellyfin.
+    pending: bool,
+    /// When it was (first seen) played, as an SQLite UTC datetime.
+    played_at: Option<String>,
+}
+
+fn watched_states(conn: &Connection) -> Result<HashMap<String, WatchedState>> {
+    let mut statement = conn.prepare("SELECT item_id,played,pending,played_at FROM watched")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            WatchedState {
+                played: row.get::<_, i64>(1)? != 0,
+                pending: row.get::<_, i64>(2)? != 0,
+                played_at: row.get(3)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Jellyfin's `LastPlayedDate` (`2026-09-25T10:55:43.71Z`) as an SQLite datetime.
+fn jellyfin_datetime(value: &str) -> Option<String> {
+    let value = value.replace('T', " ");
+    (value.len() >= 19).then(|| value[..19].to_string())
+}
+
+/// Record played state reported by Jellyfin. Items with a pending local mark
+/// keep it: that change is newer and will be pushed.
+fn record_server_watched(
+    conn: &Connection,
+    items: &[(String, bool, Option<String>)],
+) -> Result<()> {
+    let mut statement = conn.prepare(
+        "INSERT INTO watched(item_id,played,pending,played_at,updated_at)
+         VALUES(?1,?2,0,CASE WHEN ?2 THEN COALESCE(?3,datetime('now')) END,datetime('now'))
+         ON CONFLICT(item_id) DO UPDATE SET
+           played=excluded.played,
+           played_at=CASE WHEN excluded.played THEN COALESCE(watched.played_at,excluded.played_at) END,
+           updated_at=excluded.updated_at
+         WHERE watched.pending=0",
+    )?;
+    for (item_id, played, played_at) in items {
+        statement.execute(params![item_id, played, played_at])?;
+    }
+    Ok(())
+}
+
+/// Mark items watched or unwatched locally; pushed to Jellyfin when online.
+fn mark_watched(conn: &Connection, item_ids: &[String], played: bool) -> Result<()> {
+    let mut statement = conn.prepare(
+        "INSERT INTO watched(item_id,played,pending,played_at,updated_at)
+         VALUES(?1,?2,1,CASE WHEN ?2 THEN datetime('now') END,datetime('now'))
+         ON CONFLICT(item_id) DO UPDATE SET
+           played=excluded.played,
+           pending=1,
+           played_at=CASE WHEN excluded.played THEN COALESCE(watched.played_at,excluded.played_at) END,
+           updated_at=excluded.updated_at",
+    )?;
+    for item_id in item_ids {
+        statement.execute(params![item_id, played])?;
+    }
+    Ok(())
+}
+
+/// Send pending local marks to Jellyfin; returns how many were pushed.
+async fn push_pending_watched(api: &JellyfinApi) -> Result<usize> {
+    let pending: Vec<(String, bool)> = {
+        let conn = db()?;
+        let mut statement = conn.prepare("SELECT item_id,played FROM watched WHERE pending=1")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let mut pushed = 0;
+    for (item_id, played) in pending {
+        let method = if played {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::DELETE
+        };
+        let send = |url: String| {
+            api.client
+                .request(method.clone(), url)
+                .header("Authorization", jellyfin_authorization(&api.token))
+                .timeout(Duration::from_secs(10))
+                .send()
+        };
+        // Jellyfin 10.9+ API first, the older per-user route as a fallback.
+        let mut response = send(format!(
+            "{}/UserPlayedItems/{item_id}?userId={}",
+            api.base, api.user_id
+        ))
+        .await
+        .context("update Jellyfin played state")?;
+        if response.status() == StatusCode::NOT_FOUND {
+            response = send(format!(
+                "{}/Users/{}/PlayedItems/{item_id}",
+                api.base, api.user_id
+            ))
+            .await
+            .context("update Jellyfin played state")?;
+        }
+        response
+            .error_for_status()
+            .with_context(|| format!("Jellyfin rejected the played state of {item_id}"))?;
+        // Only clear the flag if nobody changed the mark while we pushed it.
+        db()?.execute(
+            "UPDATE watched SET pending=0 WHERE item_id=?1 AND played=?2",
+            params![item_id, played],
+        )?;
+        pushed += 1;
+    }
+    Ok(pushed)
+}
+
+/// Fetch Jellyfin's played state for the given items into the watched table.
+async fn refresh_watched(api: &JellyfinApi, item_ids: &[String]) -> Result<()> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct PlayedData {
+        #[serde(default)]
+        played: bool,
+        last_played_date: Option<String>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct PlayedItem {
+        id: String,
+        user_data: Option<PlayedData>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct PlayedItems {
+        items: Vec<PlayedItem>,
+    }
+    for chunk in item_ids.chunks(100) {
+        let response: PlayedItems = api
+            .client
+            .get(format!("{}/Users/{}/Items", api.base, api.user_id))
+            .query(&[("Ids", chunk.join(",")), ("Fields", "UserData".into())])
+            .header("Authorization", jellyfin_authorization(&api.token))
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+            .context("query Jellyfin played state")?
+            .error_for_status()
+            .context("Jellyfin played state query failed")?
+            .json()
+            .await
+            .context("parse Jellyfin played state")?;
+        let items: Vec<_> = response
+            .items
+            .into_iter()
+            .map(|item| {
+                let data = item.user_data;
+                let played = data.as_ref().is_some_and(|data| data.played);
+                let played_at = data
+                    .and_then(|data| data.last_played_date)
+                    .and_then(|date| jellyfin_datetime(&date));
+                (item.id, played, played_at)
+            })
+            .collect();
+        record_server_watched(&db()?, &items)?;
+    }
+    Ok(())
+}
+
+/// Push pending marks and refresh the played state of every tracked item.
+async fn sync_watched(config: &Config) -> Result<usize> {
+    let credentials = config
+        .jellyfin
+        .as_ref()
+        .context("watched state requires Jellyfin credentials")?;
+    let api = jellyfin_login(credentials).await?;
+    let pushed = push_pending_watched(&api).await?;
+    let item_ids: Vec<String> = tracked_downloads()?
+        .into_iter()
+        .map(|entry| entry.item_id)
+        .collect();
+    refresh_watched(&api, &item_ids).await?;
+    Ok(pushed)
+}
+
+/// Ignore a tracked item (syncs leave it alone; a downloaded file is kept) or
+/// allow it again (the next sync downloads it if its file is missing).
+fn set_ignored(entry: &DownloadEntry, ignored: bool) -> Result<()> {
+    let status = if ignored {
+        "ignored"
+    } else if entry.path.exists() {
+        "complete"
+    } else {
+        "queued"
+    };
+    // A requeued file starts over; its old byte count would read as 100%.
+    db()?.execute(
+        "UPDATE transfers SET status=?2,bytes=CASE WHEN ?2='queued' THEN 0 ELSE bytes END,updated_at=datetime('now') WHERE item_id=?1",
+        params![entry.item_id, status],
+    )?;
+    Ok(())
+}
+
+/// Items the user removed in the TUI; syncs must not download them again.
+fn ignored_items() -> Result<HashSet<String>> {
+    let conn = db()?;
+    let mut statement = conn.prepare("SELECT item_id FROM transfers WHERE status='ignored'")?;
+    Ok(statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 fn update_transfer(
     item_id: &str,
     job: &str,
@@ -1490,7 +1846,12 @@ impl ExploreState {
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct UserData {
+    /// Jellyfin calls it `Played`; PascalCase alone would look for `IsPlayed`,
+    /// which never matched and left the unwatched filter with nothing.
+    #[serde(rename = "Played")]
     is_played: Option<bool>,
+    #[serde(default)]
+    last_played_date: Option<String>,
 }
 
 /// Cheap unauthenticated reachability check used by the TUI's offline mode.
@@ -2225,15 +2586,16 @@ fn number_filter(
         values
             .iter()
             .map(|value| match value {
+                // Unquoted `-5` is a negative YAML number: "up to 5".
                 serde_yaml::Value::Number(number) => number
-                    .as_u64()
+                    .as_i64()
                     .map(|number| number.to_string())
-                    .context("filter numbers must be non-negative integers"),
+                    .context("filter numbers must be integers"),
                 serde_yaml::Value::String(text) => Ok(text.clone()),
                 _ => bail!("filter list entries must be numbers or strings"),
             })
             .collect::<Result<_>>()?
-    } else if let Some(value) = spec.as_u64() {
+    } else if let Some(value) = spec.as_i64() {
         vec![value.to_string()]
     } else {
         let spec = spec
@@ -2275,8 +2637,21 @@ fn number_filter(
             }
             let skip = existing.len().saturating_sub(count as usize);
             ranges.extend(existing[skip..].iter().map(|number| (*number, *number)));
+        } else if let Some(first) = part.strip_suffix('+') {
+            // `13+`: season 13 and every later one.
+            ranges.push((number(first)?, u32::MAX));
         } else if let Some((first, last)) = part.split_once('-') {
-            let (first, last) = (number(first)?, number(last)?);
+            // `13-` is open-ended like `13+`; `-5` means up to 5.
+            let first = if first.trim().is_empty() {
+                0
+            } else {
+                number(first)?
+            };
+            let last = if last.trim().is_empty() {
+                u32::MAX
+            } else {
+                number(last)?
+            };
             if last < first {
                 bail!("filter range end must be greater than or equal to start");
             }
@@ -2442,9 +2817,33 @@ async fn jellyfin_job_items(
                 .is_some_and(|n| selected.contains(&n))
         });
     }
-    if job.unwatched == Some(true) {
-        items.retain(|item| item.user_data.as_ref().and_then(|u| u.is_played) == Some(false));
+    // Remember what Jellyfin says; a local mark made since (maybe offline) wins.
+    let server_played: Vec<_> = items
+        .iter()
+        .filter_map(|item| {
+            let data = item.user_data.as_ref()?;
+            Some((
+                item.id.clone(),
+                data.is_played?,
+                data.last_played_date.as_deref().and_then(jellyfin_datetime),
+            ))
+        })
+        .collect();
+    let conn = db()?;
+    record_server_watched(&conn, &server_played)?;
+    let local = watched_states(&conn)?;
+    let played = |item: &MediaItem| match local.get(&item.id) {
+        Some(state) if state.pending => state.played,
+        _ => item.user_data.as_ref().and_then(|data| data.is_played) == Some(true),
+    };
+    // Unwatched-only jobs skip watched items; so do jobs that delete watched
+    // files, which would otherwise download them again after the cleanup.
+    if job.unwatched == Some(true) || job.delete_watched == Some(true) {
+        items.retain(|item| !played(item));
     }
+    // Items removed in the TUI stay away until restored there.
+    let ignored = ignored_items()?;
+    items.retain(|item| !ignored.contains(&item.id));
     if let Some(filter) = &job.episodes {
         let mut by_season: BTreeMap<Option<u32>, Vec<MediaItem>> = BTreeMap::new();
         for item in items {
@@ -2605,13 +3004,11 @@ fn transfer_status(item_id: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
-/// Record download progress unless the transfer was paused meanwhile; returns false
-/// when it was paused and the download should stop.
-/// Record progress; false when the transfer was paused or cleared meanwhile, in
-/// which case the download stops (a cleared one must not come back to life).
+/// Record progress; false when the transfer was paused, cleared or ignored
+/// meanwhile, in which case the download stops (and must not come back to life).
 fn update_progress(item_id: &str, bytes: u64, total: Option<u64>) -> Result<bool> {
     let updated = db()?.execute(
-        "UPDATE transfers SET status='downloading',bytes=?2,total=?3,updated_at=datetime('now') WHERE item_id=?1 AND status NOT IN ('paused','cleared')",
+        "UPDATE transfers SET status='downloading',bytes=?2,total=?3,updated_at=datetime('now') WHERE item_id=?1 AND status NOT IN ('paused','cleared','ignored')",
         params![item_id, bytes as i64, total.map(|v| v as i64)],
     )?;
     Ok(updated > 0)
@@ -2641,7 +3038,12 @@ fn toggle_pause(entry: &DownloadEntry) -> Result<&'static str> {
 }
 
 fn mark_queued(job: &str, item: &MediaItem, destination: &Path) -> Result<()> {
-    if destination.exists() || transfer_status(&item.id)?.as_deref() == Some("paused") {
+    if destination.exists()
+        || matches!(
+            transfer_status(&item.id)?.as_deref(),
+            Some("paused" | "ignored")
+        )
+    {
         return Ok(());
     }
     let partial = PathBuf::from(format!("{}.partial", destination.to_string_lossy()));
@@ -2701,7 +3103,10 @@ async fn jellyfin_download_inner(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(());
     }
-    if transfer_status(&item.id)?.as_deref() == Some("paused") {
+    if matches!(
+        transfer_status(&item.id)?.as_deref(),
+        Some("paused" | "ignored")
+    ) {
         return Ok(());
     }
     // The TUI, the timer and ad-hoc workers may all reach the same item; only one
@@ -2881,9 +3286,22 @@ async fn run_sync_mode(
         );
         say!("{}", "─".repeat(48).with(TerminalColor::DarkGrey));
     }
+    // Push marks made in the TUI (maybe offline) before the filters use
+    // Jellyfin's played state, and refresh the local copy of it.
+    if config.download.mode == "jellyfin"
+        && config.jellyfin.is_some()
+        && let Err(error) = sync_watched(&config).await
+        && !quiet
+    {
+        say!(
+            "{} {}",
+            "!".with(TerminalColor::Yellow).bold(),
+            format!("could not sync the watched state: {error:#}").with(TerminalColor::Yellow)
+        );
+    }
     let slots = Arc::new(Semaphore::new(parallelism));
     let mut tasks = JoinSet::new();
-    for job in jobs {
+    for job in jobs.clone() {
         let config = config.clone();
         let slots = slots.clone();
         tasks.spawn(async move { sync_job(config, job, slots, quiet).await });
@@ -2893,6 +3311,26 @@ async fn run_sync_mode(
         match result.context("sync worker failed")? {
             Ok(()) => {}
             Err(error) => failures.push(format!("{error:#}")),
+        }
+    }
+    // Jobs with delete_watched drop watched files once their grace period is over.
+    let due: Vec<DownloadEntry> = watched_cleanup(&config, &jobs, false)?
+        .into_iter()
+        .filter(|(_, remaining)| *remaining == 0)
+        .map(|(entry, _)| entry)
+        .collect();
+    if !due.is_empty() {
+        match clear_tracked(&config, &due, false) {
+            Ok(removed) => {
+                if !quiet {
+                    say!(
+                        "{} {}",
+                        "✗".with(TerminalColor::DarkGrey),
+                        format!("removed {removed} watched file(s)").with(TerminalColor::Grey)
+                    );
+                }
+            }
+            Err(error) => failures.push(format!("watched cleanup: {error:#}")),
         }
     }
     if !quiet {
@@ -3183,10 +3621,95 @@ fn status_json(conn: &Connection) -> Result<()> {
     );
     Ok(())
 }
-async fn prune(config: Config, target: Vec<String>, apply: bool, json_output: bool) -> Result<()> {
+/// The global grace period before watched files are deleted.
+fn default_watched_grace(config: &Config) -> Duration {
+    config
+        .cleanup
+        .as_ref()
+        .and_then(|cleanup| cleanup.delete_watched_after.as_deref())
+        .and_then(|spec| parse_duration(spec).ok())
+        .unwrap_or(Duration::from_secs(7 * 86_400))
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
+/// Seconds until a file watched at `played_at` is due for deletion (0 = due).
+fn cleanup_remaining(played_at: Option<&str>, grace: Duration, now: i64) -> u64 {
+    // Unknown play time: count from now, so it is never deleted early.
+    let played_at = played_at.and_then(sqlite_utc_seconds).unwrap_or(now);
+    (played_at + grace.as_secs() as i64 - now).max(0) as u64
+}
+
+/// Downloaded, watched files of `jobs` with the seconds left until each is
+/// deleted. Jobs without `delete_watched` only count when `force` is set
+/// (`prune --watched`), with the global grace period.
+fn watched_cleanup(
+    config: &Config,
+    jobs: &[Job],
+    force: bool,
+) -> Result<Vec<(DownloadEntry, u64)>> {
+    let states = watched_states(&db()?)?;
+    let now = unix_now();
+    let mut candidates = Vec::new();
+    for entry in tracked_downloads()? {
+        let Some(job) = jobs.iter().find(|job| job.name == entry.job) else {
+            continue;
+        };
+        let Some(grace) = job
+            .watched_grace(config)
+            .or_else(|| force.then(|| default_watched_grace(config)))
+        else {
+            continue;
+        };
+        let Some(state) = states.get(&entry.item_id).filter(|state| state.played) else {
+            continue;
+        };
+        if download_complete(&entry.status) {
+            let remaining = cleanup_remaining(state.played_at.as_deref(), grace, now);
+            candidates.push((entry, remaining));
+        }
+    }
+    Ok(candidates)
+}
+
+/// A file prune removes (or would remove) and why.
+#[derive(Serialize)]
+struct Pruned {
+    path: String,
+    reason: &'static str,
+}
+
+/// Remove tracked files whose media is gone from Jellyfin, and watched files
+/// past their grace period (jobs with `delete_watched`, or all jobs with
+/// `watched`). Watched state works offline; the check for removed media needs
+/// Jellyfin and is skipped without it.
+async fn prune(
+    config: Config,
+    target: Vec<String>,
+    dry_run: bool,
+    watched: bool,
+    json_output: bool,
+) -> Result<Vec<Pruned>> {
     let jobs = selected_jobs(&config, &target)?;
     if config.download.mode == "jellyfin" {
-        for job in jobs {
+        let mut doomed: Vec<(DownloadEntry, &'static str)> = Vec::new();
+        let online = match sync_watched(&config).await {
+            Ok(_) => true,
+            Err(error) => {
+                if !json_output {
+                    eprintln!(
+                        "Jellyfin unavailable ({error:#}); using the local watched state and \
+                         skipping the check for media removed from Jellyfin"
+                    );
+                }
+                false
+            }
+        };
+        if online {
             let api = jellyfin_login(
                 config
                     .jellyfin
@@ -3194,23 +3717,55 @@ async fn prune(config: Config, target: Vec<String>, apply: bool, json_output: bo
                     .context("Jellyfin mode requires credentials")?,
             )
             .await?;
-            let current = jellyfin_item_ids(&api, &job).await?;
-            let stale: Vec<_> = tracked_downloads()?
-                .into_iter()
-                .filter(|entry| entry.job == job.name && !current.contains(&entry.item_id))
-                .collect();
-            for entry in &stale {
-                if apply {
-                    if !json_output {
-                        println!("pruning {}", entry.path.display());
-                    }
-                    clear_tracked(&config, std::slice::from_ref(entry))?;
-                } else if !json_output {
-                    println!("would prune {}", entry.path.display());
-                }
+            let tracked = tracked_downloads()?;
+            for job in &jobs {
+                let current = jellyfin_item_ids(&api, job).await?;
+                doomed.extend(
+                    tracked
+                        .iter()
+                        .filter(|entry| entry.job == job.name && entry.status != "ignored")
+                        .filter(|entry| !current.contains(&entry.item_id))
+                        .map(|entry| (entry.clone(), "no longer in Jellyfin")),
+                );
             }
         }
-        return Ok(());
+        for (entry, remaining) in watched_cleanup(&config, &jobs, watched)? {
+            if doomed
+                .iter()
+                .any(|(other, _)| other.item_id == entry.item_id)
+            {
+                continue;
+            }
+            if remaining == 0 {
+                doomed.push((entry, "watched"));
+            } else if dry_run && !json_output {
+                println!(
+                    "keeping {} (watched, deleted in {})",
+                    entry.path.display(),
+                    format_duration_short(remaining)
+                );
+            }
+        }
+        for (entry, reason) in &doomed {
+            if !json_output {
+                let verb = if dry_run { "would delete" } else { "deleting" };
+                println!("{verb} {} ({reason})", entry.path.display());
+            }
+        }
+        if !dry_run && !doomed.is_empty() {
+            let entries: Vec<_> = doomed.iter().map(|(entry, _)| entry.clone()).collect();
+            clear_tracked(&config, &entries, false)?;
+        }
+        return Ok(doomed
+            .into_iter()
+            .map(|(entry, reason)| Pruned {
+                path: entry.path.display().to_string(),
+                reason,
+            })
+            .collect());
+    }
+    if watched {
+        bail!("prune --watched needs Jellyfin download mode");
     }
     if jobs.iter().any(|job| {
         job.seasons.is_some()
@@ -3231,7 +3786,7 @@ async fn prune(config: Config, target: Vec<String>, apply: bool, json_output: bo
         );
         let mut command = Command::new("rsync");
         command.args(&config.rsync.flags).arg("--delete");
-        if !apply {
+        if dry_run {
             command.arg("--dry-run");
         }
         command
@@ -3247,12 +3802,11 @@ async fn prune(config: Config, target: Vec<String>, apply: bool, json_output: bo
             bail!("prune for '{}' failed with {status}", job.name);
         }
     }
-    Ok(())
+    Ok(Vec::new())
 }
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum ClearScope {
     File,
-    Season,
     Show,
 }
 
@@ -3262,16 +3816,20 @@ struct ClearRequest {
     scope: ClearScope,
     job: String,
     adhoc: bool,
+    /// Also ignore the items so syncs do not download them again.
+    ignore: bool,
     targets: Vec<DownloadEntry>,
     label: String,
 }
 
-/// Build a clear request for the selected job, or None when there is nothing to clear.
+/// Build a clear request for the selected job, or None when there is nothing to
+/// clear. Ignoring only applies to configured jobs; ad-hoc downloads are never
+/// synced again anyway.
 fn clear_request(
     scope: ClearScope,
+    ignore: bool,
     job: &TuiJob,
     downloads: &[DownloadEntry],
-    rows: &[FileRow],
     selected: usize,
 ) -> Option<ClearRequest> {
     let files = |count: usize| format!("{count} {}", if count == 1 { "file" } else { "files" });
@@ -3288,24 +3846,6 @@ fn clear_request(
                     .to_string_lossy()
                     .into_owned(),
             )
-        }
-        ClearScope::Season => {
-            let targets: Vec<_> = season_files(rows, downloads, selected)
-                .into_iter()
-                .map(|index| downloads[index].clone())
-                .collect();
-            let position = rows
-                .iter()
-                .position(|row| matches!(row, FileRow::File(index) if *index == selected))?;
-            let season = rows[..position].iter().rev().find_map(|row| match row {
-                FileRow::Season(label) => Some(label.clone()),
-                FileRow::File(_) => None,
-            });
-            let label = match season {
-                Some(season) => format!("{show} · {season} ({})", files(targets.len())),
-                None => format!("{show} · this folder ({})", files(targets.len())),
-            };
-            (targets, label)
         }
         ClearScope::Show => {
             // An ad-hoc job without files can still be removed from the list.
@@ -3325,6 +3865,7 @@ fn clear_request(
         scope,
         job: job.name.clone(),
         adhoc: job.adhoc,
+        ignore: ignore && !job.adhoc,
         targets,
         label,
     })
@@ -3374,6 +3915,7 @@ struct DownloadEntry {
 struct DashboardSnapshot {
     history: BTreeMap<String, (String, String, String)>,
     downloads: Vec<DownloadEntry>,
+    watched: HashMap<String, WatchedState>,
     timer: String,
 }
 
@@ -3413,9 +3955,11 @@ fn dashboard_snapshot(check_timer: bool) -> Result<DashboardSnapshot> {
     } else {
         String::new()
     };
+    let watched = watched_states(&conn)?;
     Ok(DashboardSnapshot {
         history,
         downloads,
+        watched,
         timer,
     })
 }
@@ -3436,8 +3980,9 @@ fn tracked_downloads() -> Result<Vec<DownloadEntry>> {
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-/// Delete the given tracked files (and their partial data) and mark them cleared.
-fn clear_tracked(config: &Config, targets: &[DownloadEntry]) -> Result<usize> {
+/// Delete the given tracked files (and their partial data) and mark them
+/// cleared, or ignored so that syncs do not download them again.
+fn clear_tracked(config: &Config, targets: &[DownloadEntry], ignore: bool) -> Result<usize> {
     let mut roots = vec![
         PathBuf::from(&config.local.root)
             .canonicalize()
@@ -3475,8 +4020,8 @@ fn clear_tracked(config: &Config, targets: &[DownloadEntry]) -> Result<usize> {
     let conn = db()?;
     for entry in targets {
         conn.execute(
-            "UPDATE transfers SET status='cleared',updated_at=datetime('now') WHERE item_id=?1",
-            params![entry.item_id],
+            "UPDATE transfers SET status=?2,updated_at=datetime('now') WHERE item_id=?1",
+            params![entry.item_id, if ignore { "ignored" } else { "cleared" }],
         )?;
     }
     for job in job_names {
@@ -3646,6 +4191,9 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
         let mut sync_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
         let mut sync_notice: Option<(String, bool)> = None;
         let mut reply_filter = ReplyFilter::default();
+        // Watched state: pushed/pulled in the background while online.
+        let mut watched_task: Option<tokio::task::JoinHandle<Result<usize>>> = None;
+        let mut watched_synced_at: Option<Instant> = None;
         // Debugging aid for terminal quirks: log every input event to this file.
         let mut input_log = env::var_os("JELLYSYNC_INPUT_LOG")
             .and_then(|path| std::fs::File::create(path).ok());
@@ -3756,6 +4304,33 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 dashboard_task =
                     Some(tokio::task::spawn_blocking(move || dashboard_snapshot(check_timer)));
             }
+            if watched_task.as_ref().is_some_and(|task| task.is_finished()) {
+                let task = watched_task.take().expect("finished watched task exists");
+                match task.await {
+                    Ok(Ok(pushed)) if pushed > 0 => {
+                        sync_notice = Some((
+                            format!("Synced {pushed} watched {} to Jellyfin", if pushed == 1 { "mark" } else { "marks" }),
+                            true,
+                        ));
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        sync_notice = Some((format!("Could not sync watched state: {error:#}"), false));
+                    }
+                    Err(error) => {
+                        sync_notice = Some((format!("Watched sync stopped: {error}"), false));
+                    }
+                }
+                watched_synced_at = Some(Instant::now());
+            }
+            if watched_task.is_none()
+                && online == Some(Some(true))
+                && config.download.mode == "jellyfin"
+                && watched_synced_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(60))
+            {
+                let config = config.clone();
+                watched_task = Some(tokio::spawn(async move { sync_watched(&config).await }));
+            }
             if ping_task.as_ref().is_some_and(|task| task.is_finished()) {
                 let task = ping_task.take().expect("finished ping task exists");
                 let reachable = task.await.unwrap_or(false);
@@ -3764,7 +4339,9 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 online = Some(Some(reachable));
                 pinged_at = Some(Instant::now());
                 if reachable && !was_online {
-                    // Retry what failed while the connection was flaky.
+                    // Retry what failed while the connection was flaky, and push
+                    // watched marks made offline right away.
+                    watched_synced_at = None;
                     job_details_failed.clear();
                     explore_poster_failed.clear();
                     if sync_notice.as_ref().is_some_and(|(message, _)| message.starts_with("Offline:")) {
@@ -4276,13 +4853,20 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD)
                     };
-                    let total_size = dashboard
+                    let job_files: Vec<&DownloadEntry> = dashboard
                         .downloads
                         .iter()
-                        .filter(|entry| entry.job == job.name)
-                        .fold(0u64, |total, entry| {
-                            total.saturating_add(entry.total.unwrap_or(entry.bytes))
-                        });
+                        .filter(|entry| entry.job == job.name && entry.status != "ignored")
+                        .collect();
+                    let total_size = job_files.iter().fold(0u64, |total, entry| {
+                        total.saturating_add(entry.total.unwrap_or(entry.bytes))
+                    });
+                    let seen = job_files
+                        .iter()
+                        .filter(|entry| {
+                            dashboard.watched.get(&entry.item_id).is_some_and(|state| state.played)
+                        })
+                        .count();
                     ListItem::new(vec![
                         Line::from(vec![
                             Span::raw(POSTER_INDENT),
@@ -4296,6 +4880,14 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             Span::styled(
                                 format!("  {}", format_bytes(total_size)),
                                 Style::default().fg(Color::Gray),
+                            ),
+                            Span::styled(
+                                if seen > 0 {
+                                    format!("  {seen}/{} watched", job_files.len())
+                                } else {
+                                    String::new()
+                                },
+                                Style::default().fg(Color::DarkGray),
                             ),
                         ]),
                         Line::from(vec![
@@ -4366,6 +4958,13 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
             let download_text_width = usize::from(downloads_area.width.saturating_sub(6)).max(8);
             // Leading indent plus the " 100%" suffix.
             let download_bar_width = download_text_width.saturating_sub(7).clamp(8, 60);
+            let watched = &dashboard.watched;
+            let now = unix_now();
+            let is_played =
+                |entry: &DownloadEntry| watched.get(&entry.item_id).is_some_and(|state| state.played);
+            let job_grace = selected_job
+                .and_then(|job| config.jobs.iter().find(|configured| configured.name == job.name))
+                .and_then(|job| job.watched_grace(&config));
             let season_stats = |row: usize| {
                 // Files and size from this heading up to the next one.
                 let files: Vec<&DownloadEntry> = rows[row + 1..]
@@ -4375,11 +4974,15 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         FileRow::Season(_) => None,
                     })
                     .collect();
+                // Ignored files are not part of the season's downloads anymore.
+                let files: Vec<&DownloadEntry> =
+                    files.into_iter().filter(|entry| entry.status != "ignored").collect();
                 let done = files.iter().filter(|entry| download_complete(&entry.status)).count();
+                let seen = files.iter().filter(|entry| is_played(entry)).count();
                 let size = files
                     .iter()
                     .fold(0u64, |total, entry| total.saturating_add(entry.total.unwrap_or(entry.bytes)));
-                (files.len(), done, size)
+                (files.len(), done, seen, size)
             };
             let download_rows: Vec<ListItem> = rows
                 .iter()
@@ -4387,13 +4990,16 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 .map(|(row, file_row)| {
                     let entry = match file_row {
                         FileRow::Season(label) => {
-                            let (count, done, size) = season_stats(row);
+                            let (count, done, seen, size) = season_stats(row);
                             let mut stats = format!(
                                 "{count} {}",
                                 if count == 1 { "file" } else { "files" }
                             );
                             if done < count {
                                 stats.push_str(&format!(", {done} done"));
+                            }
+                            if seen > 0 {
+                                stats.push_str(&format!(", {seen} watched"));
                             }
                             stats.push_str(&format!(" · {}", format_bytes(size)));
                             let used = label.chars().count() + stats.chars().count() + 6;
@@ -4427,7 +5033,16 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             })
                             .unwrap_or_else(|| format!("{} downloaded", format_bytes(entry.bytes)))
                     };
-                    let mut subtitle = if completed {
+                    let ignored = entry.status == "ignored";
+                    let mut subtitle = if ignored {
+                        vec![
+                            Span::styled("  ⊘ ignored by sync", Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                if entry.path.exists() { "  file kept · I to sync again" } else { "  I to sync again" },
+                                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                            ),
+                        ]
+                    } else if completed {
                         vec![
                             Span::styled("  ✓ downloaded", Style::default().fg(Color::Green)),
                             Span::styled(format!("  {size}"), Style::default().fg(Color::Gray)),
@@ -4446,7 +5061,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             Style::default().fg(Color::Blue),
                         ));
                     }
-                    let third_line = if !completed {
+                    let third_line = if !completed && !ignored {
                         Line::from(vec![
                             Span::styled("  ", Style::default()),
                             Span::styled(bar, Style::default().fg(Color::Cyan)),
@@ -4478,7 +5093,23 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         )],
                     };
                     let mut first = vec![Span::styled("● ", state_style(&entry.status))];
-                    first.extend(title_line);
+                    if ignored {
+                        // Dim the whole title: the file is gone and stays gone.
+                        first.extend(title_line.into_iter().map(|span| {
+                            Span::styled(span.content, Style::default().fg(Color::DarkGray))
+                        }));
+                    } else {
+                        first.extend(title_line);
+                        if let Some((label, soon)) =
+                            watched_label(watched.get(&entry.item_id), job_grace, now)
+                        {
+                            let used: usize = first.iter().map(|span| span.content.chars().count()).sum();
+                            first.push(Span::styled(
+                                format!("  {}", truncate(&label, download_text_width.saturating_sub(used))),
+                                Style::default().fg(if soon { Color::Yellow } else { Color::DarkGray }),
+                            ));
+                        }
+                    }
                     ListItem::new(vec![Line::from(first), Line::from(subtitle), third_line])
                 })
                 .collect();
@@ -4596,8 +5227,11 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
 
                 let jobs_title = format!("Jobs · {}", jobs.len());
                 let seasons = rows.iter().filter(|row| matches!(row, FileRow::Season(_))).count();
+                let ignored_count = downloads.iter().filter(|entry| entry.status == "ignored").count();
+                let file_count = downloads.len() - ignored_count;
                 let files_size = downloads
                     .iter()
+                    .filter(|entry| entry.status != "ignored")
                     .fold(0u64, |total, entry| total.saturating_add(entry.total.unwrap_or(entry.bytes)));
                 let downloads_title = match selected_job {
                     None => "Files · no job selected".to_string(),
@@ -4605,14 +5239,17 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         let mut title = format!(
                             "Files: {} · {} {}",
                             job.name.trim_start_matches("library:"),
-                            downloads.len(),
-                            if downloads.len() == 1 { "file" } else { "files" }
+                            file_count,
+                            if file_count == 1 { "file" } else { "files" }
                         );
                         if seasons > 1 {
                             title.push_str(&format!(" · {seasons} seasons"));
                         }
-                        if !downloads.is_empty() {
+                        if file_count > 0 {
                             title.push_str(&format!(" · {}", format_bytes(files_size)));
+                        }
+                        if ignored_count > 0 {
+                            title.push_str(&format!(" · {ignored_count} ignored"));
                         }
                         title
                     }
@@ -4701,6 +5338,13 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         let age = status_age(time)?;
                         Some((state.clone(), age))
                     });
+                    let file_watched = selected_entry
+                        .filter(|entry| download_complete(&entry.status))
+                        .map(|entry| {
+                            watched_label(dashboard.watched.get(&entry.item_id), job_grace, now)
+                                .map(|(label, _)| label.trim_start_matches("✓ ").replacen("watched", "yes", 1))
+                                .unwrap_or_else(|| "no · w marks it watched".into())
+                        });
                     render_job_details(
                         frame,
                         details_area,
@@ -4709,6 +5353,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         loading,
                         last_sync,
                         file_label.filter(|_| !still_downloading),
+                        file_watched,
                         probe,
                     );
                 }
@@ -5115,7 +5760,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         shortcuts.push(("↑/↓", "move"));
                     }
                     if download_focus && !downloads.is_empty() {
-                        shortcuts.extend([("p", "play"), ("i", "info"), ("x", "clear")]);
+                        shortcuts.extend([("p", "play"), ("w", "watched"), ("i", "info"), ("x", "clear")]);
                     } else {
                         shortcuts.extend([("s", "sync"), ("i", "config")]);
                     }
@@ -5178,8 +5823,10 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             Line::from(Span::styled(
                                 if request.targets.is_empty() {
                                     "Removes this ad-hoc job from the list."
-                                } else {
+                                } else if !request.ignore {
                                     "Deletes these files from disk.  y confirm · n / Esc cancel"
+                                } else {
+                                    "Deletes them and syncs skip them (I undoes).  y confirm · n / Esc"
                                 },
                                 Style::default().fg(Color::Gray),
                             )),
@@ -5411,7 +6058,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     );
                 }
                 if show_help {
-                    let help_popup = centered_rect(84, 32, area);
+                    let help_popup = centered_rect(84, 34, area);
                     let help_lines = vec![
                         Line::from(Span::styled(
                             "Main view",
@@ -5430,7 +6077,10 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         Line::from("  p / double-click  play selected file"),
                         Line::from("  Space             pause / resume selected download"),
                         Line::from("  o                 open the file's or show's directory"),
-                        Line::from("  x / X / c         clear file / season / show (x on ad-hoc job removes it)"),
+                        Line::from("  x / X             delete file / delete and ignore it in syncs"),
+                        Line::from("  c                 delete and ignore the whole show"),
+                        Line::from("  I                 ignore the file in syncs / sync it again"),
+                        Line::from("  w / W             toggle watched: file (job in Jobs) / season"),
                         Line::from("  q or Ctrl-C twice quit the TUI (Esc closes dialogs)"),
                         Line::from(""),
                         Line::from(Span::styled(
@@ -6244,7 +6894,9 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                 // Only ad-hoc jobs are cleared without files.
                                 forget_job(&request.job).map(|()| 0)
                             } else {
-                                clear_tracked(&config, &request.targets).and_then(|removed| {
+                                // Removing items of a configured job must stick:
+                                // ignore them so the next sync does not bring them back.
+                                clear_tracked(&config, &request.targets, request.ignore).and_then(|removed| {
                                     // Ad-hoc jobs are dropped by clear_tracked once empty;
                                     // recording a status here would resurrect them.
                                     if request.scope == ClearScope::Show && !request.adhoc {
@@ -6471,9 +7123,11 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                 });
                             }
                         }
-                        KeyCode::Char('x') if download_focus && !downloads.is_empty() => {
+                        // x deletes the file (a later sync may bring it back); X also ignores it.
+                        KeyCode::Char('x' | 'X') if download_focus && !downloads.is_empty() => {
+                            let ignore = key.code == KeyCode::Char('X');
                             confirm_clear = selected_job.and_then(|job| {
-                                clear_request(ClearScope::File, job, &downloads, &rows, selected_download)
+                                clear_request(ClearScope::File, ignore, job, &downloads, selected_download)
                             });
                         }
                         KeyCode::Char('x')
@@ -6481,7 +7135,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                 && jobs.get(selected).is_some_and(|job| job.adhoc) =>
                         {
                             confirm_clear = selected_job.and_then(|job| {
-                                clear_request(ClearScope::Show, job, &downloads, &rows, selected_download)
+                                clear_request(ClearScope::Show, false, job, &downloads, selected_download)
                             });
                         }
                         KeyCode::Char('p') if download_focus && !downloads.is_empty() => {
@@ -6518,14 +7172,69 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                 },
                             );
                         }
-                        KeyCode::Char('X') if download_focus && !downloads.is_empty() => {
-                            confirm_clear = selected_job.and_then(|job| {
-                                clear_request(ClearScope::Season, job, &downloads, &rows, selected_download)
+                        // w: the focused file (or the whole job from the Jobs list);
+                        // W: the file's season. Marks all watched unless all already are.
+                        KeyCode::Char('w' | 'W') if !downloads.is_empty() => {
+                            let indices: Vec<usize> = if !download_focus {
+                                (0..downloads.len()).collect()
+                            } else if key.code == KeyCode::Char('W') {
+                                season_files(&rows, &downloads, selected_download)
+                            } else {
+                                vec![selected_download]
+                            };
+                            let ids: Vec<String> = indices
+                                .iter()
+                                .filter_map(|index| downloads.get(*index))
+                                .filter(|entry| entry.status != "ignored")
+                                .map(|entry| entry.item_id.clone())
+                                .collect();
+                            let played = !ids.iter().all(|id| {
+                                dashboard.watched.get(id).is_some_and(|state| state.played)
                             });
+                            sync_notice = Some(match db().and_then(|conn| mark_watched(&conn, &ids, played)) {
+                                Ok(()) => {
+                                    // Show it right away instead of at the next refresh.
+                                    for id in &ids {
+                                        dashboard.watched.insert(
+                                            id.clone(),
+                                            WatchedState { played, pending: true, played_at: None },
+                                        );
+                                    }
+                                    watched_synced_at = None;
+                                    (
+                                        format!(
+                                            "Marked {} {} {}{}",
+                                            ids.len(),
+                                            if ids.len() == 1 { "file" } else { "files" },
+                                            if played { "watched" } else { "unwatched" },
+                                            if online == Some(Some(true)) {
+                                                ""
+                                            } else {
+                                                "; syncs to Jellyfin when online"
+                                            }
+                                        ),
+                                        true,
+                                    )
+                                }
+                                Err(error) => (format!("Could not mark watched: {error:#}"), false),
+                            });
+                        }
+                        // I: ignore the focused file (syncs skip it; a downloaded file
+                        // is kept) or, when it is ignored, allow it again.
+                        KeyCode::Char('I') if download_focus && !downloads.is_empty() => {
+                            if let Some(entry) = downloads.get(selected_download) {
+                                let ignore = entry.status != "ignored";
+                                let name = entry.path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                                sync_notice = Some(match set_ignored(entry, ignore) {
+                                    Ok(()) if ignore => (format!("Ignoring {name}; syncs skip it (I again to undo)"), true),
+                                    Ok(()) => (format!("{name} is synced again"), true),
+                                    Err(error) => (format!("Could not change ignore: {error:#}"), false),
+                                });
+                            }
                         }
                         KeyCode::Char('c') if !jobs.is_empty() => {
                             confirm_clear = selected_job.and_then(|job| {
-                                clear_request(ClearScope::Show, job, &downloads, &rows, selected_download)
+                                clear_request(ClearScope::Show, true, job, &downloads, selected_download)
                             });
                             if confirm_clear.is_none() {
                                 sync_notice = Some(("Nothing to clear for this job".into(), false));
@@ -6881,6 +7590,7 @@ fn render_job_details(
     loading: bool,
     last_sync: Option<(String, String)>,
     file_label: Option<String>,
+    file_watched: Option<String>,
     probe: Option<&std::result::Result<MediaProbe, String>>,
 ) {
     let block = panel_block("Details", false);
@@ -7002,6 +7712,15 @@ fn render_job_details(
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
+        if let Some(watched) = file_watched {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:<11}", "Watched"),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(truncate(&watched, width.saturating_sub(13))),
+            ]));
+        }
         match probe {
             Some(Ok(probe)) => {
                 // Streams first; the container line matters least.
@@ -7567,6 +8286,34 @@ fn tilde_path(path: &Path) -> String {
     }
 }
 
+/// The watched marker for a file row: "watched", whether the mark still has to
+/// reach Jellyfin, and when cleanup deletes the file (for `delete_watched` jobs).
+fn watched_label(
+    state: Option<&WatchedState>,
+    grace: Option<Duration>,
+    now: i64,
+) -> Option<(String, bool)> {
+    let state = state.filter(|state| state.played)?;
+    let mut label = "✓ watched".to_string();
+    if state.pending {
+        label.push_str(" (not synced)");
+    }
+    let mut soon = false;
+    if let Some(grace) = grace {
+        match cleanup_remaining(state.played_at.as_deref(), grace, now) {
+            0 => {
+                label.push_str(" · deleted at next sync");
+                soon = true;
+            }
+            remaining => label.push_str(&format!(
+                " · deleted in {}",
+                format_duration_short(remaining)
+            )),
+        }
+    }
+    Some((label, soon))
+}
+
 fn download_complete(status: &str) -> bool {
     matches!(status, "complete" | "completed" | "success")
 }
@@ -7707,21 +8454,27 @@ async fn main() -> Result<()> {
                     }
                     result
                 }
-                Some(Commands::Prune { apply, target }) => {
-                    let result = prune(config, target.clone(), apply, cli.json).await;
+                Some(Commands::Prune {
+                    dry_run,
+                    watched,
+                    apply: _,
+                    target,
+                }) => {
+                    let result = prune(config, target.clone(), dry_run, watched, cli.json).await;
                     if cli.json {
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&json!({
                                 "command": "prune",
                                 "targets": target,
-                                "apply": apply,
+                                "dry_run": dry_run,
                                 "ok": result.is_ok(),
+                                "pruned": result.as_ref().ok(),
                                 "error": result.as_ref().err().map(|error| format!("{error:#}")),
                             }))?
                         );
                     }
-                    result
+                    result.map(|_| ())
                 }
                 Some(Commands::Config) => {
                     if cli.json {
@@ -7975,29 +8728,32 @@ mod tests {
 
     #[test]
     fn clear_requests_capture_their_targets() {
-        let (files, rows) = season_fixture();
+        let (files, _) = season_fixture();
         let job = TuiJob {
             name: "library:Show".into(),
             adhoc: true,
         };
-        let request = clear_request(ClearScope::Season, &job, &files, &rows, 1).unwrap();
-        assert_eq!(request.targets.len(), 2);
-        assert_eq!(request.label, "Show · Season 1 (2 files)");
-        let request = clear_request(ClearScope::File, &job, &files, &rows, 2).unwrap();
+        let request = clear_request(ClearScope::File, true, &job, &files, 2).unwrap();
         assert_eq!(request.targets[0].item_id, "c");
-        let request = clear_request(ClearScope::Show, &job, &files, &rows, 0).unwrap();
+        // Ad-hoc downloads are never synced again, so there is nothing to ignore.
+        assert!(!request.ignore);
+        let request = clear_request(ClearScope::Show, true, &job, &files, 0).unwrap();
         assert_eq!(request.label, "Show · all 3 files");
         // An empty ad-hoc job can still be removed; an empty configured job cannot.
         assert!(
-            clear_request(ClearScope::Show, &job, &[], &[], 0)
+            clear_request(ClearScope::Show, false, &job, &[], 0)
                 .is_some_and(|r| r.targets.is_empty())
         );
         let configured = TuiJob {
             name: "Show".into(),
             adhoc: false,
         };
-        assert!(clear_request(ClearScope::Show, &configured, &[], &[], 0).is_none());
-        assert!(clear_request(ClearScope::File, &configured, &[], &[], 0).is_none());
+        assert!(clear_request(ClearScope::Show, true, &configured, &[], 0).is_none());
+        assert!(clear_request(ClearScope::File, true, &configured, &[], 0).is_none());
+        let request = clear_request(ClearScope::File, true, &configured, &files, 0).unwrap();
+        assert!(request.ignore);
+        let request = clear_request(ClearScope::File, false, &configured, &files, 0).unwrap();
+        assert!(!request.ignore);
     }
 
     #[test]
@@ -8059,7 +8815,7 @@ mod tests {
 
     #[test]
     fn invalid_number_filters_are_errors() {
-        for spec in ["latestX", "latest-0", "5-3", "one", "[]", "[true]", "[-1]"] {
+        for spec in ["latestX", "latest-0", "5-3", "one", "[]", "[true]", "[1.5]"] {
             let value = serde_yaml::from_str::<serde_yaml::Value>(spec).unwrap();
             assert!(number_filter(Some(&value), &[1, 2]).is_err(), "{spec}");
         }
@@ -8638,5 +9394,177 @@ jobs:
             .unwrap();
         assert_eq!(count, 16);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(
+            parse_duration("7d").unwrap(),
+            Duration::from_secs(7 * 86_400)
+        );
+        assert_eq!(
+            parse_duration("12h").unwrap(),
+            Duration::from_secs(12 * 3600)
+        );
+        assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
+        assert_eq!(
+            parse_duration("3").unwrap(),
+            Duration::from_secs(3 * 86_400)
+        );
+        assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+        assert!(parse_duration("soon").is_err());
+        assert!(parse_duration("7w").is_err());
+        assert_eq!(format_duration_short(3 * 86_400 - 5), "3d");
+        assert_eq!(format_duration_short(3 * 86_400 + 5), "4d");
+        assert_eq!(format_duration_short(7200), "2h");
+    }
+
+    #[test]
+    fn grace_period_countdown() {
+        let played_at = "2026-09-20 12:00:00";
+        let played = sqlite_utc_seconds(played_at).unwrap();
+        let grace = Duration::from_secs(7 * 86_400);
+        assert_eq!(
+            cleanup_remaining(Some(played_at), grace, played + 86_400),
+            6 * 86_400
+        );
+        assert_eq!(
+            cleanup_remaining(Some(played_at), grace, played + 8 * 86_400),
+            0
+        );
+        // Unknown play time counts from now: never deleted early.
+        assert_eq!(cleanup_remaining(None, grace, played), 7 * 86_400);
+        let state = WatchedState {
+            played: true,
+            pending: true,
+            played_at: Some(played_at.into()),
+        };
+        let (label, soon) = watched_label(Some(&state), Some(grace), played + 86_400).unwrap();
+        assert_eq!(label, "✓ watched (not synced) · deleted in 6d");
+        let (label, _) = watched_label(Some(&state), Some(grace), played + 60).unwrap();
+        assert_eq!(label, "✓ watched (not synced) · deleted in 7d");
+        assert!(!soon);
+        let (label, soon) = watched_label(Some(&state), Some(grace), played + 8 * 86_400).unwrap();
+        assert!(label.ends_with("deleted at next sync") && soon);
+        let unwatched = WatchedState {
+            played: false,
+            pending: false,
+            played_at: None,
+        };
+        assert!(watched_label(Some(&unwatched), Some(grace), played).is_none());
+        assert_eq!(
+            watched_label(Some(&state), None, played).unwrap().0,
+            "✓ watched (not synced)"
+        );
+    }
+
+    #[test]
+    fn local_marks_win_over_the_server_until_pushed() {
+        let dir = temp_dir("watched-db");
+        let conn = open_db(&dir.join("state.db")).unwrap();
+        record_server_watched(
+            &conn,
+            &[
+                ("a".into(), true, Some("2026-09-01 10:00:00".into())),
+                ("b".into(), false, None),
+            ],
+        )
+        .unwrap();
+        mark_watched(&conn, &["b".into()], true).unwrap();
+        mark_watched(&conn, &["a".into()], false).unwrap();
+        // The server still reports the old state; the pending marks stay.
+        record_server_watched(
+            &conn,
+            &[("a".into(), true, None), ("b".into(), false, None)],
+        )
+        .unwrap();
+        let states = watched_states(&conn).unwrap();
+        assert!(!states["a"].played && states["a"].pending && states["a"].played_at.is_none());
+        assert!(states["b"].played && states["b"].pending && states["b"].played_at.is_some());
+        // Once pushed, the server's state applies again and keeps the first play time.
+        conn.execute("UPDATE watched SET pending=0", []).unwrap();
+        record_server_watched(
+            &conn,
+            &[("b".into(), true, Some("2030-01-01 00:00:00".into()))],
+        )
+        .unwrap();
+        let states = watched_states(&conn).unwrap();
+        assert!(states["b"].played && !states["b"].pending);
+        assert_ne!(
+            states["b"].played_at.as_deref(),
+            Some("2030-01-01 00:00:00")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn jellyfin_user_data_is_parsed() {
+        let item: MediaItem = serde_json::from_value(json!({
+            "Id": "x",
+            "Name": "Earthfall",
+            "UserData": {"Played": true, "LastPlayedDate": "2026-09-25T10:55:43.716309Z"}
+        }))
+        .unwrap();
+        let data = item.user_data.unwrap();
+        assert_eq!(data.is_played, Some(true));
+        assert_eq!(
+            data.last_played_date
+                .as_deref()
+                .and_then(jellyfin_datetime)
+                .as_deref(),
+            Some("2026-09-25 10:55:43")
+        );
+    }
+
+    #[test]
+    fn open_ended_ranges() {
+        assert_eq!(filter("13+", &[1]).unwrap().last(), Some(&29));
+        assert_eq!(filter("13+", &[1]).unwrap().first(), Some(&13));
+        assert_eq!(filter("13-", &[1]).unwrap().first(), Some(&13));
+        assert_eq!(filter("-3", &[1]), Some(vec![0, 1, 2, 3]));
+        assert_eq!(filter("\"-3\"", &[1]), Some(vec![0, 1, 2, 3]));
+        assert_eq!(filter("[-2, 5]", &[1]), Some(vec![0, 1, 2, 5]));
+        assert_eq!(filter("1, 20+", &[1]).unwrap()[..2], [1, 20]);
+    }
+
+    #[test]
+    fn durations_may_be_bare_numbers() {
+        let config = parse_config(
+            serde_yaml::from_str(
+                "remote: {hostname: h, username: u, root: /r}
+local: {root: /l}
+cleanup: {delete_watched_after: 0}
+jobs: [{name: X, directory: tv, delete_watched: true, delete_watched_after: 3}]",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.jobs[0].watched_grace(&config),
+            Some(Duration::from_secs(3 * 86_400))
+        );
+        assert_eq!(default_watched_grace(&config), Duration::ZERO);
+        let broken = serde_yaml::from_str(
+            "remote: {hostname: h, username: u, root: /r}
+local: {root: /l}
+cleanup: {delete_watched_after: soon}",
+        )
+        .unwrap();
+        assert!(parse_config(broken).is_err());
+    }
+
+    #[test]
+    fn sample_config_is_valid() {
+        let sample = include_str!("../jellysync-config.sample.yaml");
+        let config = parse_config(serde_yaml::from_str(sample).unwrap()).unwrap();
+        assert!(
+            config
+                .jobs
+                .iter()
+                .any(|job| job.watched_grace(&config).is_some())
+        );
+        for job in &config.jobs {
+            validate_job_filters(job).unwrap();
+        }
     }
 }

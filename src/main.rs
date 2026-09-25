@@ -3020,7 +3020,18 @@ async fn download_planned(
     for (item, output) in planned {
         let api = api.clone();
         let name = job.name.clone();
-        let permit = slots.clone().acquire_owned().await?;
+        // Files already on disk (or paused/ignored) finish instantly; they must
+        // not wait behind running downloads for a worker slot.
+        let needs_slot = !output.exists()
+            && !matches!(
+                transfer_status(&item.id)?.as_deref(),
+                Some("paused" | "ignored")
+            );
+        let permit = if needs_slot {
+            Some(slots.clone().acquire_owned().await?)
+        } else {
+            None
+        };
         tasks.spawn(async move {
             let _permit = permit;
             jellyfin_download(&api, &name, &item, &output, quiet).await

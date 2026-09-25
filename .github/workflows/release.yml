@@ -36,9 +36,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # Bundled C code (SQLite, ring) must see musl's headers: built against
+      # glibc's it calls open64/pread64/..., which musl does not provide.
       - name: Install musl compiler
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y clang-18
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: nttld/setup-ndk@v1
         if: matrix.target == 'aarch64-linux-android'
         id: setup-ndk
@@ -51,7 +53,7 @@ jobs:
         run: cargo binstall --no-confirm --force cargo-ndk
       - name: Build musl binary
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: TARGET_CC=clang-18 TARGET_AR=llvm-ar-18 cargo build --locked --release --target ${{ matrix.target }}
+        run: TARGET_CC=musl-gcc cargo build --locked --release --target ${{ matrix.target }}
       - name: Build Android binary
         if: matrix.target == 'aarch64-linux-android'
         run: cargo ndk --target aarch64-linux-android --platform 24 -- build --locked --release

@@ -4202,8 +4202,24 @@ fn status(json_output: bool, config: Option<&Config>) -> Result<()> {
             format!("{:<28}", truncate_near_end(display_job_name(name), 28)).bold(),
             time.as_str().dim()
         );
+        let job_eta = pending_eta_seconds(
+            active
+                .get(name)
+                .into_iter()
+                .flatten()
+                .filter(|(_, state, ..)| matches!(state.as_str(), "queued" | "downloading"))
+                .map(|(_, state, bytes, total, rate)| {
+                    (*bytes, *total, *rate, state == "downloading")
+                }),
+        );
         if let Some(summary) = configured_summary(name).filter(|summary| !summary.is_empty()) {
             println!("      {}", truncate(&summary, summary_width).dim());
+        }
+        if let Some(eta) = job_eta {
+            println!(
+                "      {}",
+                format!("ETA {}", format_eta(eta)).italic().dim()
+            );
         }
         if let Some(message) = message.filter(|message| !message.is_empty()) {
             println!(
@@ -4586,6 +4602,56 @@ struct DownloadEntry {
     total: Option<u64>,
     /// Live throughput in bytes per second while downloading.
     rate: Option<u64>,
+}
+
+/// Estimate time remaining across pending files, using only live download
+/// rates. Queued files contribute their full remaining size once a worker is
+/// active, while paused or otherwise inactive transfers are ignored.
+fn pending_eta_seconds(
+    transfers: impl IntoIterator<Item = (u64, Option<u64>, Option<u64>, bool)>,
+) -> Option<u64> {
+    let (mut remaining, mut rate, mut downloading) = (0u64, 0u64, false);
+    for (bytes, total, transfer_rate, is_downloading) in transfers {
+        if let Some(total) = total {
+            remaining = remaining.saturating_add(total.saturating_sub(bytes));
+        }
+        if is_downloading && total.is_some() {
+            downloading = true;
+            rate = rate.saturating_add(transfer_rate.unwrap_or(0));
+        }
+    }
+    (downloading && remaining > 0 && rate > 0).then(|| remaining.div_ceil(rate))
+}
+
+fn download_entries_eta(entries: &[DownloadEntry]) -> Option<u64> {
+    pending_eta_seconds(entries.iter().filter_map(|entry| {
+        matches!(entry.status.as_str(), "downloading" | "queued").then_some((
+            entry.bytes,
+            entry.total,
+            entry.rate,
+            entry.status == "downloading",
+        ))
+    }))
+}
+
+fn transfer_eta_seconds(bytes: u64, total: Option<u64>, rate: Option<u64>) -> Option<u64> {
+    let total = total?;
+    let rate = rate.filter(|rate| *rate > 0)?;
+    (total > bytes).then(|| (total - bytes).div_ceil(rate))
+}
+
+fn format_eta(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds.div_ceil(60);
+    let hours = minutes / 60;
+    let minutes = minutes % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
 }
 
 #[derive(Default)]
@@ -5576,6 +5642,21 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         total.saturating_add(entry.total.unwrap_or(entry.bytes))
                     });
                     let job_rate: u64 = job_files.iter().filter_map(|entry| entry.rate).sum();
+                    let job_eta = pending_eta_seconds(
+                        job_files
+                            .iter()
+                            .filter(|entry| {
+                                matches!(entry.status.as_str(), "queued" | "downloading")
+                            })
+                            .map(|entry| {
+                                (
+                                    entry.bytes,
+                                    entry.total,
+                                    entry.rate,
+                                    entry.status == "downloading",
+                                )
+                            }),
+                    );
                     let seen = job_files
                         .iter()
                         .filter(|entry| {
@@ -5608,6 +5689,14 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                     String::new()
                                 },
                                 Style::default().fg(Color::Cyan),
+                            ),
+                            Span::styled(
+                                job_eta
+                                    .map(|eta| format!("  ETA {}", format_eta(eta)))
+                                    .unwrap_or_default(),
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::ITALIC),
                             ),
                             Span::styled(
                                 if seen > 0 {
@@ -5810,9 +5899,21 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         ];
                         if let Some(rate) = entry.rate {
                             spans.push(Span::styled(
-                                format!("  {}", format_throughput(rate, entry.bytes, entry.total)),
+                                format!("  {}/s", format_bytes(rate)),
                                 Style::default().fg(Color::Cyan),
                             ));
+                            if let Some(eta) = transfer_eta_seconds(
+                                entry.bytes,
+                                entry.total,
+                                Some(rate),
+                            ) {
+                                spans.push(Span::styled(
+                                    format!("  ETA {}", format_eta(eta)),
+                                    Style::default()
+                                        .fg(Color::DarkGray)
+                                        .add_modifier(Modifier::ITALIC),
+                                ));
+                            }
                         }
                         spans
                     };
@@ -5972,6 +6073,14 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     header_segments.push(vec![Span::styled(
                         format!("{} {}/s", downloading_icon(), format_bytes(total_rate)),
                         Style::default().fg(Color::Cyan),
+                    )]);
+                }
+                if let Some(eta) = download_entries_eta(&dashboard.downloads) {
+                    header_segments.push(vec![Span::styled(
+                        format!("ETA {}", format_eta(eta)),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
                     )]);
                 }
                 // The timer only deserves attention when it is not running.
@@ -7185,8 +7294,13 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         }
                     }
                 } else if let Event::Key(key) = input {
+                // Match Neovim's global `<M-Q>` → `quitall!` mapping from every view.
+                if key.code == KeyCode::Char('Q')
+                    && key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    break;
                 // In the Explore library pane every printable key belongs to the search.
-                if key.code == KeyCode::Char('?')
+                } else if key.code == KeyCode::Char('?')
                     && explore.as_ref().is_none_or(|browser| browser.details_focus)
                 {
                     show_help = !show_help;
@@ -9176,17 +9290,11 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_RATE_SQL: &str =
     "CASE WHEN status='downloading' AND updated_at >= datetime('now','-15 seconds') THEN rate END";
 
-/// "12.3 MiB/s · 4m left" for a running transfer.
+/// "12.3 MiB/s · ETA 2h 3m" for a running transfer.
 fn format_throughput(rate: u64, bytes: u64, total: Option<u64>) -> String {
     let mut text = format!("{}/s", format_bytes(rate));
-    if let Some(total) = total
-        && rate > 0
-        && total > bytes
-    {
-        text.push_str(&format!(
-            " · {} left",
-            format_duration_short((total - bytes).div_ceil(rate))
-        ));
+    if let Some(eta) = transfer_eta_seconds(bytes, total, Some(rate)) {
+        text.push_str(&format!(" · ETA {}", format_eta(eta)));
     }
     text
 }

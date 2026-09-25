@@ -433,6 +433,15 @@ fn parse_duration(spec: &str) -> Result<Duration> {
 
 /// "7d", "5h", "12m" for a remaining time, rounded up: something watched a
 /// minute ago with a 7-day grace period is "deleted in 7d", not "6d".
+/// "1 item", "2 items".
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
 fn format_duration_short(seconds: u64) -> String {
     match seconds {
         0..60 => format!("{seconds}s"),
@@ -1582,6 +1591,13 @@ fn open_db(path: &Path) -> Result<Connection> {
         {
             return Err(error).context("add the rate column to the state database");
         }
+        // Job messages used to read "downloaded N item(s)", then "N item(s) …".
+        conn.execute_batch(
+            "UPDATE jobs SET message=substr(message,12)||' downloaded' WHERE message LIKE 'downloaded % item(s)';
+            UPDATE jobs SET message=replace(message,' item(s)',' items') WHERE message LIKE '% item(s)%';
+            UPDATE jobs SET message='1 item'||substr(message,8) WHERE message LIKE '1 items%';",
+        )
+        .context("update job messages in the state database")?;
         ready.push(path.to_path_buf());
     }
     Ok(conn)
@@ -2446,7 +2462,11 @@ fn queue_library_items(
         let destination = item_destination(item, &folder, "Season $season_number", title, movie)?;
         mark_queued(&job, item, &destination)?;
     }
-    update_job(&job, "queued", &format!("{} item(s) queued", items.len()))?;
+    update_job(
+        &job,
+        "queued",
+        &format!("{} queued", plural(items.len(), "item")),
+    )?;
     Ok((items.len(), job, items[0].id.clone()))
 }
 
@@ -2508,7 +2528,7 @@ async fn library_worker(config: &Config, job: &str) -> Result<()> {
             return Ok(());
         }
         let api = jellyfin_login(credentials).await?;
-        update_job(job, "running", &format!("{} item(s)", pending.len()))?;
+        update_job(job, "running", &plural(pending.len(), "item"))?;
         let count = pending.len();
         let slots = Arc::new(Semaphore::new(config.parallelism.max(1)));
         let mut tasks = JoinSet::new();
@@ -2550,7 +2570,11 @@ async fn library_worker(config: &Config, job: &str) -> Result<()> {
             }
         }
         if failures.is_empty() {
-            update_job(job, "success", &format!("{count} item(s) downloaded"))?;
+            update_job(
+                job,
+                "success",
+                &format!("{} downloaded", plural(count, "item")),
+            )?;
         } else {
             update_job(job, "failed", &failures.join("; "))?;
         }
@@ -2950,8 +2974,11 @@ async fn jellyfin_job(
                     "{} {}  {}",
                     "▸".with(TerminalColor::DarkGrey),
                     job.name.clone().with(TerminalColor::Grey).bold(),
-                    format!("removed {removed} item(s) that newer ones replaced")
-                        .with(TerminalColor::DarkGrey)
+                    format!(
+                        "removed {} that newer ones replaced",
+                        plural(removed, "item")
+                    )
+                    .with(TerminalColor::DarkGrey)
                 );
             }
         }
@@ -3005,10 +3032,10 @@ async fn download_planned(
             "{} {}  {}",
             "▸".with(TerminalColor::Cyan),
             job.name.clone().with(TerminalColor::Cyan).bold(),
-            format!("{count} item(s)").with(TerminalColor::DarkGrey)
+            plural(count, "item").with(TerminalColor::DarkGrey)
         );
     }
-    update_job(&job.name, "running", &format!("{count} item(s)"))?;
+    update_job(&job.name, "running", &plural(count, "item"))?;
     // Record every pending item up front so ones waiting for a worker slot show as queued.
     for (item, output) in &planned {
         if let Some(parent) = output.parent() {
@@ -3047,13 +3074,17 @@ async fn download_planned(
     if !failures.is_empty() {
         update_job(&job.name, "failed", &failures.join("; "))?;
         bail!(
-            "{} Jellyfin download(s) failed for '{}': {}",
-            failures.len(),
+            "{} failed for '{}': {}",
+            plural(failures.len(), "Jellyfin download"),
             job.name,
             failures.join("; ")
         );
     }
-    update_job(&job.name, "success", &format!("{count} item(s) downloaded"))?;
+    update_job(
+        &job.name,
+        "success",
+        &format!("{} downloaded", plural(count, "item")),
+    )?;
     Ok(())
 }
 
@@ -3737,9 +3768,10 @@ async fn run_sync_mode(
             "◆".with(TerminalColor::Cyan),
             "jellysync download".bold(),
             format!(
-                "{} job(s) · {} mode · {parallelism} worker(s)",
-                jobs.len(),
-                config.download.mode
+                "{} · {} mode · {}",
+                plural(jobs.len(), "job"),
+                config.download.mode,
+                plural(parallelism, "worker")
             )
             .with(TerminalColor::DarkGrey)
         );
@@ -3785,7 +3817,8 @@ async fn run_sync_mode(
                     say!(
                         "{} {}",
                         "✗".with(TerminalColor::DarkGrey),
-                        format!("removed {removed} watched file(s)").with(TerminalColor::Grey)
+                        format!("removed {} watched", plural(removed, "file"))
+                            .with(TerminalColor::Grey)
                     );
                 }
             }
@@ -3828,8 +3861,8 @@ async fn run_sync_mode(
     }
     if !failures.is_empty() {
         bail!(
-            "{} sync job(s) failed:\n{}",
-            failures.len(),
+            "{} failed:\n{}",
+            plural(failures.len(), "sync job"),
             failures.join("\n")
         );
     }
@@ -4662,11 +4695,6 @@ fn edit_config_file(
 }
 
 async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
-    // Status messages used to read "downloaded N item(s)".
-    db()?.execute(
-        "UPDATE jobs SET message=substr(message,12)||' downloaded' WHERE message LIKE 'downloaded % item(s)'",
-        [],
-    )?;
     let mut out = stdout();
     enable_raw_mode()?;
     execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
@@ -5412,7 +5440,8 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     } else if disabled {
                         ("DISABLED", Style::default().fg(Color::Yellow))
                     } else {
-                        ("JOB", Style::default().fg(Color::DarkGray))
+                        // Regular jobs need no label; only ad-hoc and disabled ones stand out.
+                        ("", Style::default())
                     };
                     let title_style = if job.adhoc {
                         Style::default()
@@ -5443,7 +5472,10 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             Span::raw(POSTER_INDENT),
                             Span::styled(if job.adhoc { "↳ " } else { "● " }, state_style(state)),
                             Span::styled(job.name.clone(), title_style),
-                            Span::styled(format!("  {kind}"), kind_style),
+                            Span::styled(
+                                if kind.is_empty() { String::new() } else { format!("  {kind}") },
+                                kind_style,
+                            ),
                         ]),
                         Line::from(vec![
                             Span::raw(POSTER_INDENT),
@@ -7483,8 +7515,8 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                 Some(Ok((count, job, first_item))) => {
                                     focus_request = Some((job.clone(), first_item, Instant::now()));
                                     explore_notice = Some(match spawn_library_worker(&config_path, &job) {
-                                        Ok(()) => (format!("Queued {count} download(s); they continue after the TUI exits"), true),
-                                        Err(error) => (format!("Queued {count} download(s) but could not start worker: {error:#}"), false),
+                                        Ok(()) => (format!("Queued {}; they continue after the TUI exits", plural(count, "download")), true),
+                                        Err(error) => (format!("Queued {} but could not start worker: {error:#}", plural(count, "download")), false),
                                     });
                                     if let Some(task) = job_poster_catalog_task.take() {
                                         task.abort();
@@ -9751,6 +9783,13 @@ jobs: []",
     }
 
     #[test]
+    fn plurals() {
+        assert_eq!(plural(0, "item"), "0 items");
+        assert_eq!(plural(1, "item"), "1 item");
+        assert_eq!(plural(2, "sync job"), "2 sync jobs");
+    }
+
+    #[test]
     fn throughput_with_eta() {
         assert_eq!(format_throughput(1024 * 1024, 0, None), "1.0 MiB/s");
         assert_eq!(
@@ -10163,6 +10202,34 @@ jobs:
             // The internal worker command stays hidden.
             assert!(!script.contains("worker"), "{shell}");
         }
+    }
+
+    #[test]
+    fn legacy_job_messages_are_pluralized() {
+        let dir = temp_dir("state-db-plural");
+        let path = dir.join("state.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE jobs (name TEXT PRIMARY KEY, status TEXT NOT NULL, message TEXT, updated_at TEXT NOT NULL);
+                INSERT INTO jobs VALUES('a','success','1 item(s) downloaded','');
+                INSERT INTO jobs VALUES('b','running','12 item(s)','');
+                INSERT INTO jobs VALUES('c','success','downloaded 1 item(s)','');",
+            )
+            .unwrap();
+        }
+        let conn = open_db(&path).unwrap();
+        let message = |name: &str| -> String {
+            conn.query_row(
+                "SELECT message FROM jobs WHERE name=?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(message("a"), "1 item downloaded");
+        assert_eq!(message("b"), "12 items");
+        assert_eq!(message("c"), "1 item downloaded");
     }
 
     #[test]

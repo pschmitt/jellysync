@@ -1988,6 +1988,13 @@ struct JobDetails {
     poster: Option<StatefulProtocol>,
 }
 type JobDetailsTask = tokio::task::JoinHandle<Result<JobDetails>>;
+/// Library browser items share the job details cache under this key prefix,
+/// which no job name uses.
+const BROWSE_DETAILS_PREFIX: &str = "\0browse:";
+
+fn browse_details_key(item_id: &str) -> String {
+    format!("{BROWSE_DETAILS_PREFIX}{item_id}")
+}
 /// A list index together with the identity (job name or item id) it pointed at.
 type Anchor = (usize, String);
 /// A row in the Files list: a season heading or an index into the file list.
@@ -5473,6 +5480,19 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     )),
                 );
             }
+            // Details for the title selected in the library browser; one request at
+            // a time so scrolling through the list does not flood Jellyfin.
+            if let Some(explore) = explore.as_ref()
+                && let Some(item) = explore.filtered_items().get(explore.selected).map(|item| (*item).clone())
+                && let Some(api) = explore.api.clone().or_else(|| jellyfin_api.clone())
+            {
+                let key = browse_details_key(&item.id);
+                let browsing = job_details_tasks.keys().any(|name| name.starts_with(BROWSE_DETAILS_PREFIX));
+                if !browsing && !job_details.contains_key(&key) && !job_details_failed.contains(&key) {
+                    let cached = poster_cache.get(&item.id).cloned();
+                    job_details_tasks.insert(key, tokio::spawn(jellyfin_job_details(api, item, picker.clone(), cached)));
+                }
+            }
             if let Some(item_id) = focus_item
                 && let Some(index) = downloads.iter().position(|entry| entry.item_id == item_id)
             {
@@ -5601,7 +5621,8 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                 .collect();
             let size = terminal.size()?;
             let area = Rect::new(0, 0, size.width, size.height);
-            let explore_popup = centered_rect(100, 96, area);
+            // The library browser takes the whole terminal.
+            let explore_popup = centered_rect(area.width, area.height, area);
             let [explore_list_area, explore_poster_area] = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -5611,11 +5632,26 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                     width: explore_popup.width.saturating_sub(2),
                     height: explore_popup.height.saturating_sub(4),
                 });
+            // With room, a Details panel (like the Files one) tops the right side,
+            // then a hint line, then the contents; otherwise a short header.
+            let explore_room = explore_poster_area.height.saturating_sub(3);
+            let explore_details_height = if explore_room >= 24 {
+                (explore_room * 2 / 5).clamp(10, 20)
+            } else {
+                0
+            };
+            let explore_details_area = (explore_details_height > 0).then_some(Rect {
+                x: explore_poster_area.x + 1,
+                y: explore_poster_area.y + 1,
+                width: explore_poster_area.width.saturating_sub(2),
+                height: explore_details_height,
+            });
+            let explore_header_height = if explore_details_height > 0 { explore_details_height + 1 } else { 3 };
             let explore_contents_area = Rect {
                 x: explore_poster_area.x + 1,
-                y: explore_poster_area.y + 5,
+                y: explore_poster_area.y + 2 + explore_header_height,
                 width: explore_poster_area.width.saturating_sub(2),
-                height: explore_poster_area.height.saturating_sub(7),
+                height: explore_poster_area.height.saturating_sub(4 + explore_header_height),
             };
             let [header, body, footer] = Layout::default()
                 .direction(Direction::Vertical)
@@ -6656,22 +6692,43 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             }
                         }
                         if let Some(item) = filtered.get(explore.selected) {
-                            let details_area = Rect { x: explore_poster_area.x + 1, y: explore_poster_area.y + 1, width: explore_poster_area.width.saturating_sub(2), height: 3 };
-                            frame.render_widget(
-                                Paragraph::new(vec![
-                                    Line::from(Span::styled(item.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
-                                    Line::from(Span::styled(format!("{}{}", item.item_type.as_deref().unwrap_or("Media"), item.production_year.map(|year| format!(" · {year}")).unwrap_or_default()), Style::default().fg(Color::Gray))),
-                                    Line::from(Span::styled(
-                                        if explore.details_focus {
-                                            "Space select · a select all · d download · Tab/←/Esc back"
-                                        } else {
-                                            "Tab/→/Enter select episodes · Enter download movie"
-                                        },
-                                        Style::default().fg(Color::Cyan),
-                                    )),
-                                ]),
-                                details_area,
-                            );
+                            let hint = Line::from(Span::styled(
+                                if explore.details_focus {
+                                    "Space select · a select all · d download · Tab/←/Esc back"
+                                } else {
+                                    "Tab/→/Enter select episodes · Enter download movie"
+                                },
+                                Style::default().fg(Color::Cyan),
+                            ));
+                            if let Some(details_area) = explore_details_area {
+                                let key = browse_details_key(&item.id);
+                                let loading = job_details_tasks.contains_key(&key);
+                                render_job_details(
+                                    frame,
+                                    details_area,
+                                    &item.name,
+                                    job_details.get_mut(&key),
+                                    loading,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                );
+                                frame.render_widget(
+                                    Paragraph::new(hint),
+                                    Rect { y: details_area.y + details_area.height, height: 1, ..details_area },
+                                );
+                            } else {
+                                let details_area = Rect { x: explore_poster_area.x + 1, y: explore_poster_area.y + 1, width: explore_poster_area.width.saturating_sub(2), height: 3 };
+                                frame.render_widget(
+                                    Paragraph::new(vec![
+                                        Line::from(Span::styled(item.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+                                        Line::from(Span::styled(format!("{}{}", item.item_type.as_deref().unwrap_or("Media"), item.production_year.map(|year| format!(" · {year}")).unwrap_or_default()), Style::default().fg(Color::Gray))),
+                                        hint,
+                                    ]),
+                                    details_area,
+                                );
+                            }
                             let content_area = explore_contents_area;
                             if item.item_type.as_deref() == Some("Series") {
                                 if explore.preview_loading && explore.episodes.is_empty() {

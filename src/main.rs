@@ -6438,17 +6438,17 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                         rows_area,
                     );
                     if overview_height > 0 {
+                        let overview_area = Rect {
+                            x: inner.x,
+                            y: inner.y + inner.height.saturating_sub(overview_height) + 1,
+                            width: inner.width,
+                            height: overview_height - 1,
+                        }
+                        .intersection(inner);
                         frame.render_widget(
-                            Paragraph::new(overview.to_string())
-                                .wrap(Wrap { trim: true })
+                            Paragraph::new(overview_lines(overview, overview_area.width, overview_area.height))
                                 .style(Style::default().fg(Color::Gray)),
-                            Rect {
-                                x: inner.x,
-                                y: inner.y + inner.height.saturating_sub(overview_height) + 1,
-                                width: inner.width,
-                                height: overview_height - 1,
-                            }
-                            .intersection(inner),
+                            overview_area,
                         );
                     }
                 }
@@ -7406,7 +7406,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                 editor.input = None;
                                 editor.error = None;
                                 sync_notice = Some((
-                                    format!("Saved {} for {} to {}; the next sync uses it", setting.label, job.name, tilde_path(&path)),
+                                    format!("Saved {} for {} to {}", setting.label, job.name, tilde_path(&path)),
                                     true,
                                 ));
                                 if setting.key == "jellyfin_name" {
@@ -8692,13 +8692,13 @@ fn render_job_details(
     frame.render_widget(Paragraph::new(lines), text_area);
     // The overview fills whatever space is left below.
     if !overview.is_empty() && text_area.height > used + 1 {
+        let height = text_area.height - used - 1;
         frame.render_widget(
-            Paragraph::new(overview)
-                .wrap(Wrap { trim: true })
+            Paragraph::new(overview_lines(&overview, text_area.width, height))
                 .style(Style::default().fg(Color::Gray)),
             Rect {
                 y: text_area.y + used + 1,
-                height: text_area.height - used - 1,
+                height,
                 ..text_area
             },
         );
@@ -9110,6 +9110,46 @@ fn open_directory(config: &Config, path: &Path) -> Result<String> {
         .spawn()
         .with_context(|| format!("start file manager '{label}'"))?;
     Ok(label)
+}
+
+/// Word-wrap `text` into at most `max_lines` lines of `width` characters; when
+/// it does not fit, the last line ends in an ellipsis.
+fn wrap_ellipsized(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.len() > max_lines {
+        // Out of room: the rest joins the last visible line, cut with "…".
+        let rest = lines.split_off(max_lines.saturating_sub(1)).join(" ");
+        if max_lines > 0 {
+            lines.push(rest);
+        }
+    }
+    // Also cuts words longer than a line.
+    lines
+        .into_iter()
+        .map(|line| truncate(&line, width))
+        .collect()
+}
+
+/// The overview as ellipsized lines for a `width` × `height` area.
+fn overview_lines(overview: &str, width: u16, height: u16) -> Vec<Line<'static>> {
+    wrap_ellipsized(overview, usize::from(width), usize::from(height))
+        .into_iter()
+        .map(Line::from)
+        .collect()
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -9972,6 +10012,19 @@ jobs: []",
             job_display_state("running", ["downloading", "queued", "queued"]),
             ("downloading", Some("1 downloading · 2 queued".into()))
         );
+    }
+
+    #[test]
+    fn overview_is_wrapped_and_ellipsized() {
+        assert_eq!(wrap_ellipsized("one two three", 20, 3), ["one two three"]);
+        assert_eq!(wrap_ellipsized("one two three", 7, 3), ["one two", "three"]);
+        assert_eq!(
+            wrap_ellipsized("one two three four five six", 7, 2),
+            ["one two", "three …"]
+        );
+        assert_eq!(wrap_ellipsized("aaaa bbbb cccc", 4, 1), ["aaa…"]);
+        assert!(wrap_ellipsized("", 10, 3).is_empty());
+        assert!(wrap_ellipsized("a b", 10, 0).is_empty());
     }
 
     #[test]

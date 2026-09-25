@@ -11,7 +11,7 @@
 # protocol) under a virtual X server with software OpenGL.
 #
 # Environment:
-#   FONT_FAMILY    kitty font (default: JetBrainsMono Nerd Font; the TUI
+#   FONT_FAMILY    kitty font (default: JetBrainsMono Nerd Font Mono; the TUI
 #                  draws its icons with Nerd Font glyphs)
 #   FONT_DIR       extra font directory to make FONT_FAMILY available
 #   JELLYFIN_PORT  loopback port for the throwaway server (default: any free one)
@@ -26,7 +26,7 @@ WINDOW_HEIGHT=920
 
 WORK_DIR="$PWD/.screenshot"
 CONTAINER="jellysync-screenshot-$$"
-FONT_FAMILY="${FONT_FAMILY:-JetBrainsMono Nerd Font}"
+FONT_FAMILY="${FONT_FAMILY:-JetBrainsMono Nerd Font Mono}"
 FONT_DIR="${FONT_DIR:-}"
 JELLYFIN_PORT="${JELLYFIN_PORT:-}"
 OUTPUT="${OUTPUT:-docs/screenshot.png}"

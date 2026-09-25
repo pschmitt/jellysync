@@ -621,32 +621,56 @@ jellysync --config /path/to/config.yaml config
 - `sync [JOB...]`: Sync all jobs or selected jobs
 - `status`: Show latest job state and systemd timer state
 - `prune [--apply] [JOB...]`: Preview deletions, or apply them
-- `tui`: Select a job to see its files; `s` syncs that job, `S` syncs all jobs, `b` opens Jellyfin Explore, and `o` opens the job's download directory. Explore searches the library, renders posters with `ratatui-image` (including Kitty graphics protocol support), shows a series' episodes in the details pane (`Tab` to focus, `Space`/`a` to select), and downloads movies or selected episodes with `d`. In the main view, `x` (file), `X` (season), `c` (show), then `y` clears media; `x` on an ad-hoc job removes it. `p` or a double-click plays a file. `i` shows the job configuration, or, with a file selected, `i`/`Enter` show a short `ffprobe` summary (container, duration, size, bitrate, video/audio/subtitle streams), plus the episode still, title, air date, rating, runtime, watched state and overview from Jellyfin when online; `p` plays the file from there. Mouse clicks and scrolling select rows.
+- `tui`: Select a job to see its files; `s` syncs that job, `S` syncs all jobs, `b` opens Jellyfin Explore, and `o` opens the job's download directory. Explore searches the library, renders posters with `ratatui-image` (including Kitty graphics protocol support), shows a series' episodes in the details pane (`Tab` to focus, `Space`/`a` to select), and downloads movies or selected episodes with `d`. In the main view, `x` (file), `X` (season), `c` (show), then `y` clears media; `x` on an ad-hoc job removes it. `p` or a double-click plays a file. `i` opens the job configuration, where its sync settings can be edited (see [Settings overlay](#settings-overlay-editing-from-the-tui)), or, with a file selected, `i`/`Enter` show a short `ffprobe` summary (container, duration, size, bitrate, video/audio/subtitle streams), plus the episode still, title, air date, rating, runtime, watched state and overview from Jellyfin when online; `p` plays the file from there. Mouse clicks and scrolling select rows.
 - `-h, --help`: Show help message
 - `--version`: Show version
 
 ## Configuration File Locations
 
-jellysync searches for configuration files in the following order:
+jellysync uses the first configuration file it finds:
 
-1. **`JELLYSYNC_CONFIG` environment variable** (if set)
-2. **`./jellysync.yaml`** (current directory)
-3. **`~/.config/jellysync/config.yaml`** (user config directory)
-4. Falls back to `./jellysync.yaml` (will error if not found)
+1. **`--config FILE`**
+2. **`JELLYSYNC_CONFIG` environment variable**
+3. **`./jellysync.yaml`** (current directory)
+4. **`~/.config/jellysync/config.yaml`** (user config directory; the Home Manager module writes it)
 
-The active configuration file path is displayed when jellysync runs.
-
-**Examples:**
 ```bash
-# Use default search order
-jellysync config
-
-# Use specific config file
-jellysync --config /path/to/config.yaml config
-
-# Use environment variable
-JELLYSYNC_CONFIG=~/my-config.yaml jellysync config
+jellysync --config /path/to/config.yaml status
+JELLYSYNC_CONFIG=~/my-config.yaml jellysync download
 ```
+
+### Settings overlay (editing from the TUI)
+
+Press `i` on a job in the TUI to edit its sync settings: Jellyfin name,
+seasons, episodes and unwatched-only (plus wildcard in rsync mode). Use `↑`/`↓`
+to pick a setting, `Enter` to edit or toggle it, `Del` to clear it and `r` to
+reset it. Invalid filters are rejected before anything is saved.
+
+Edits go into the configuration file when it is writable. When it is read-only,
+as with the Nix store symlink the Home Manager module creates, they go into a
+settings overlay at `$XDG_STATE_HOME/jellysync/config.yaml` (usually
+`~/.local/state/jellysync/config.yaml`), next to the state database.
+
+Every command (the TUI, `download`, the systemd timer, `prune`) loads the
+configuration file and then merges the overlay on top of it, if the overlay exists:
+
+- mappings merge key by key;
+- jobs merge by `name` (an overlay entry for an unknown name adds a job);
+- `null` unsets a value (`seasons: null` means all seasons);
+- any other value replaces the one from the configuration file.
+
+```yaml
+# ~/.local/state/jellysync/config.yaml
+jobs:
+  - name: Fallout
+    seasons: latest-2
+    unwatched: true
+```
+
+Settings set by the overlay show as *overridden* in the TUI; `r` removes the
+override so the Nix-managed value applies again. Delete the file to make the
+Nix configuration fully authoritative again. `jellysync status` shows the
+overlay's path when one exists.
 
 ## Environment Variables
 

@@ -250,9 +250,79 @@ fn config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
         .join("jellysync/config.yaml"))
 }
 fn load_config(path: &Path) -> Result<Config> {
+    load_config_with_overlay(path, &state_config_path()?)
+}
+
+/// The writable settings overlay. The main config is often read-only (e.g. a
+/// Nix store symlink from the Home Manager module); settings changed in the TUI
+/// then land here and are merged on top of it by every command.
+fn state_config_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join("config.yaml"))
+}
+
+fn read_yaml(path: &Path) -> Result<serde_yaml::Value> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
-    let mut config: Config = serde_yaml::from_str(&content).context("parse YAML config")?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&content)
+        .with_context(|| format!("parse YAML config {}", path.display()))?;
+    // An empty file parses as null; treat it as an empty mapping.
+    Ok(if value.is_null() {
+        serde_yaml::Value::Mapping(Default::default())
+    } else {
+        value
+    })
+}
+
+/// Deep-merge `overlay` into `base`. Mappings merge key by key, lists of named
+/// entries (the jobs) merge by `name`, and anything else — including `null`,
+/// which unsets a value — replaces what was there.
+fn merge_config(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
+    use serde_yaml::Value;
+    let named = |items: &[Value]| items.iter().all(|item| item.get("name").is_some());
+    match (base, overlay) {
+        (Value::Mapping(base), Value::Mapping(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_config(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (Value::Sequence(base), Value::Sequence(overlay)) if named(base) && named(&overlay) => {
+            for item in overlay {
+                let name = item.get("name").cloned();
+                match base
+                    .iter_mut()
+                    .find(|entry| entry.get("name") == name.as_ref())
+                {
+                    Some(existing) => merge_config(existing, item),
+                    None => base.push(item),
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+fn load_config_with_overlay(path: &Path, overlay: &Path) -> Result<Config> {
+    let mut value = read_yaml(path)?;
+    let same_file = path.canonicalize().ok() == overlay.canonicalize().ok();
+    if overlay.is_file() && !same_file {
+        merge_config(&mut value, read_yaml(overlay)?);
+    }
+    parse_config(value).with_context(|| {
+        if overlay.is_file() && !same_file {
+            format!("with settings overlay {}", overlay.display())
+        } else {
+            format!("in {}", path.display())
+        }
+    })
+}
+
+fn parse_config(value: serde_yaml::Value) -> Result<Config> {
+    let mut config: Config = serde_yaml::from_value(value).context("parse YAML config")?;
     if config.parallelism == 0 {
         bail!("parallelism must be at least 1");
     }
@@ -275,14 +345,311 @@ fn expand_home(value: &str) -> String {
         value
     }
 }
-fn state_db() -> Result<PathBuf> {
+fn state_dir() -> Result<PathBuf> {
     let base = env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))
         .context("cannot determine state directory")?;
     let dir = base.join("jellysync");
     std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("state.db"))
+    Ok(dir)
+}
+fn state_db() -> Result<PathBuf> {
+    Ok(state_dir()?.join("state.db"))
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SettingKind {
+    Text,
+    Filter,
+    Toggle,
+}
+
+/// A job setting that the TUI can edit.
+#[derive(Clone, Copy)]
+struct JobSetting {
+    key: &'static str,
+    label: &'static str,
+    kind: SettingKind,
+    help: &'static str,
+}
+
+fn job_settings(mode: &str) -> Vec<JobSetting> {
+    let mut settings = vec![
+        JobSetting {
+            key: "jellyfin_name",
+            label: "Jellyfin name",
+            kind: SettingKind::Text,
+            help: "title to look up in Jellyfin (defaults to the job name)",
+        },
+        JobSetting {
+            key: "seasons",
+            label: "Seasons",
+            kind: SettingKind::Filter,
+            help: "all, latest, latest-2, 3, 1-4 or 1,3,5",
+        },
+        JobSetting {
+            key: "episodes",
+            label: "Episodes",
+            kind: SettingKind::Filter,
+            help: "per season: all, latest, latest-3, 1-6 or 1,2",
+        },
+        JobSetting {
+            key: "unwatched",
+            label: "Unwatched only",
+            kind: SettingKind::Toggle,
+            help: "only download episodes not yet played in Jellyfin",
+        },
+    ];
+    // Remote path wildcards only exist for rsync transfers.
+    if mode == "rsync" {
+        settings.push(JobSetting {
+            key: "wildcard",
+            label: "Wildcard",
+            kind: SettingKind::Toggle,
+            help: "match the remote directory as *name*",
+        });
+    }
+    settings
+}
+
+/// The current value of a text or filter setting, as the user would type it.
+fn job_setting_text(job: &Job, key: &str) -> Option<String> {
+    let yaml = |value: Option<&serde_yaml::Value>| {
+        value.map(|value| match value {
+            serde_yaml::Value::String(text) => text.clone(),
+            serde_yaml::Value::Sequence(items) => items
+                .iter()
+                .map(|item| match item {
+                    serde_yaml::Value::String(text) => text.clone(),
+                    other => serde_yaml::to_string(other)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            other => serde_yaml::to_string(other)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        })
+    };
+    match key {
+        "jellyfin_name" => job.jellyfin_name.clone(),
+        "seasons" => yaml(job.seasons.as_ref()),
+        "episodes" => yaml(job.episodes.as_ref()),
+        _ => None,
+    }
+}
+
+fn job_setting_bool(job: &Job, key: &str) -> Option<bool> {
+    match key {
+        "unwatched" => job.unwatched,
+        "wildcard" => job.wildcard,
+        _ => None,
+    }
+}
+
+/// Turn what was typed for a setting into a change; empty input clears it.
+fn parse_setting_input(kind: SettingKind, input: &str) -> Result<SettingChange> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(SettingChange::Clear);
+    }
+    match kind {
+        SettingKind::Text => Ok(SettingChange::Set(input.into())),
+        SettingKind::Filter => {
+            let value = match input.parse::<u64>() {
+                Ok(number) => serde_yaml::Value::from(number),
+                Err(_) => serde_yaml::Value::from(input),
+            };
+            number_filter(Some(&value), &[1, 2, 3])?;
+            Ok(SettingChange::Set(value))
+        }
+        SettingKind::Toggle => match input {
+            "true" | "yes" | "on" | "1" => Ok(SettingChange::Set(true.into())),
+            "false" | "no" | "off" | "0" => Ok(SettingChange::Set(false.into())),
+            _ => bail!("expected yes or no"),
+        },
+    }
+}
+
+/// State of the job configuration dialog's settings editor.
+#[derive(Default)]
+struct JobEditor {
+    cursor: usize,
+    /// Text being typed for the selected setting.
+    input: Option<String>,
+    /// Settings the overlay file sets for this job.
+    overrides: HashSet<String>,
+    error: Option<String>,
+}
+
+/// A change to one job setting made in the TUI.
+#[derive(Clone, Debug, PartialEq)]
+enum SettingChange {
+    Set(serde_yaml::Value),
+    /// Remove the setting (in the overlay: override it with null).
+    Clear,
+    /// Drop the overlay's value so the main config's applies again.
+    Reset,
+}
+
+/// Whether the main config accepts edits (a Nix store file does not). Opening
+/// for append never truncates or changes the file.
+fn config_is_writable(path: &Path) -> bool {
+    std::fs::OpenOptions::new().append(true).open(path).is_ok()
+}
+
+/// Settings of `job` that the overlay file sets.
+fn overlay_job_keys(overlay: &Path, job: &str) -> HashSet<String> {
+    let Ok(value) = read_yaml(overlay) else {
+        return HashSet::new();
+    };
+    value
+        .get("jobs")
+        .and_then(|jobs| jobs.as_sequence())
+        .and_then(|jobs| {
+            jobs.iter()
+                .find(|entry| entry.get("name").and_then(|v| v.as_str()) == Some(job))
+        })
+        .and_then(|entry| entry.as_mapping())
+        .map(|entry| {
+            entry
+                .keys()
+                .filter_map(|key| key.as_str())
+                .filter(|key| *key != "name")
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The mapping for job `name` in a config document, created when `create` is set.
+fn job_entry<'a>(
+    document: &'a mut serde_yaml::Value,
+    name: &str,
+    create: bool,
+) -> Option<&'a mut serde_yaml::Mapping> {
+    use serde_yaml::Value;
+    let root = document.as_mapping_mut()?;
+    if !root.contains_key("jobs") {
+        if !create {
+            return None;
+        }
+        root.insert("jobs".into(), Value::Sequence(Vec::new()));
+    }
+    let jobs = root.get_mut("jobs")?.as_sequence_mut()?;
+    let position = jobs
+        .iter()
+        .position(|entry| entry.get("name").and_then(|v| v.as_str()) == Some(name));
+    let index = match position {
+        Some(index) => index,
+        None if create => {
+            let mut entry = serde_yaml::Mapping::new();
+            entry.insert("name".into(), name.into());
+            jobs.push(Value::Mapping(entry));
+            jobs.len() - 1
+        }
+        None => return None,
+    };
+    jobs[index].as_mapping_mut()
+}
+
+/// Write a YAML document next to its (resolved) target and rename it into place,
+/// so a crash never leaves a half-written config. A symlink to a writable file
+/// keeps pointing at that file.
+fn write_yaml_atomic(path: &Path, value: &serde_yaml::Value) -> Result<()> {
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let dir = target
+        .parent()
+        .context("config path has no parent directory")?;
+    std::fs::create_dir_all(dir)?;
+    let temporary = dir.join(format!(
+        ".{}.tmp",
+        target.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    std::fs::write(&temporary, serde_yaml::to_string(value)?)
+        .with_context(|| format!("write {}", temporary.display()))?;
+    if let Ok(metadata) = std::fs::metadata(&target) {
+        std::fs::set_permissions(&temporary, metadata.permissions())?;
+    }
+    std::fs::rename(&temporary, &target)
+        .with_context(|| format!("replace {}", target.display()))?;
+    Ok(())
+}
+
+/// Apply a job setting change and return the file it was written to: the main
+/// config when it is writable and defines the job, otherwise the overlay. The
+/// merged result is validated before anything is written.
+fn save_job_setting(
+    config_path: &Path,
+    overlay_path: &Path,
+    job: &str,
+    key: &str,
+    change: SettingChange,
+) -> Result<PathBuf> {
+    let mut base = read_yaml(config_path)?;
+    let mut overlay = if overlay_path.is_file() {
+        read_yaml(overlay_path)?
+    } else {
+        serde_yaml::Value::Mapping(Default::default())
+    };
+    let write_base = config_is_writable(config_path) && job_entry(&mut base, job, false).is_some();
+    if write_base {
+        let entry = job_entry(&mut base, job, false).context("job vanished from the config")?;
+        match &change {
+            SettingChange::Set(value) => {
+                entry.insert(key.into(), value.clone());
+            }
+            SettingChange::Clear | SettingChange::Reset => {
+                entry.remove(key);
+            }
+        }
+        // An older overlay value would otherwise hide the edit.
+        if let Some(entry) = job_entry(&mut overlay, job, false) {
+            entry.remove(key);
+        }
+    } else {
+        let entry = job_entry(&mut overlay, job, true).context("overlay is not a mapping")?;
+        match &change {
+            SettingChange::Set(value) => {
+                entry.insert(key.into(), value.clone());
+            }
+            SettingChange::Clear => {
+                entry.insert(key.into(), serde_yaml::Value::Null);
+            }
+            SettingChange::Reset => {
+                entry.remove(key);
+            }
+        }
+    }
+    let mut merged = base.clone();
+    merge_config(&mut merged, overlay.clone());
+    let config = parse_config(merged)?;
+    if let Some(job) = config.jobs.iter().find(|candidate| candidate.name == job) {
+        validate_job_filters(job)?;
+    }
+    if write_base {
+        write_yaml_atomic(config_path, &base)?;
+        if overlay_path.is_file() {
+            write_yaml_atomic(overlay_path, &overlay)?;
+        }
+        Ok(config_path.to_path_buf())
+    } else {
+        write_yaml_atomic(overlay_path, &overlay)?;
+        Ok(overlay_path.to_path_buf())
+    }
+}
+
+/// Reject seasons/episodes filters that would fail at sync time.
+fn validate_job_filters(job: &Job) -> Result<()> {
+    // Any existing numbers do: only the syntax matters here.
+    let sample = [1, 2, 3];
+    number_filter(job.seasons.as_ref(), &sample).context("invalid seasons filter")?;
+    number_filter(job.episodes.as_ref(), &sample).context("invalid episodes filter")?;
+    Ok(())
 }
 fn db() -> Result<Connection> {
     let conn = Connection::open(state_db()?)?;
@@ -2026,6 +2393,15 @@ fn status(json_output: bool) -> Result<()> {
     }
     println!("\n{} {}", "◆".with(TerminalColor::Cyan), "Jellysync".bold());
     println!("{}", "─".repeat(48).with(TerminalColor::DarkGrey));
+    if let Ok(overlay) = state_config_path()
+        && overlay.is_file()
+    {
+        println!(
+            "{} {}",
+            "settings overlay".with(TerminalColor::DarkGrey),
+            tilde_path(&overlay).with(TerminalColor::Grey)
+        );
+    }
     println!("{}", "JOBS".with(TerminalColor::Magenta).bold());
     let mut statement =
         conn.prepare("SELECT name,status,message,updated_at FROM jobs ORDER BY name")?;
@@ -2528,7 +2904,7 @@ async fn reconcile_existing(config: &Config) -> Result<usize> {
     Ok(indexed)
 }
 
-async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
+async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
     // Status messages used to read "downloaded N item(s)".
     db()?.execute(
         "UPDATE jobs SET message=substr(message,12)||' downloaded' WHERE message LIKE 'downloaded % item(s)'",
@@ -2577,6 +2953,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
         let mut confirm_clear: Option<ClearRequest> = None;
         let mut show_help = false;
         let mut show_job_config = false;
+        let mut editor = JobEditor::default();
         let mut file_info: Option<FileInfo> = None;
         let mut file_info_entry: Option<DownloadEntry> = None;
         // (index, job name) and (index, item id) selected when the last frame was drawn.
@@ -3700,38 +4077,100 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                 }
 
                 if show_job_config {
-                    let popup = centered_rect(76, 72, area);
-                    let lines = if let Some(job) = jobs
+                    let mut lines = Vec::new();
+                    let mut title = "Job configuration · i / Esc close".to_string();
+                    if let Some(job) = jobs
                         .get(selected)
                         .and_then(|selected| config.jobs.iter().find(|job| job.name == selected.name))
                     {
-                        vec![
+                        lines.extend([
                             config_line("Name", job.name.clone()),
-                            config_line(
-                                "Jellyfin",
-                                job.jellyfin_name.clone().unwrap_or_else(|| job.name.clone()),
-                            ),
                             config_line("Directory", job.directory.clone().unwrap_or_else(|| "—".into())),
                             config_line("Remote dir", job.remote_dir.clone().unwrap_or_else(|| "—".into())),
                             config_line("Local dir", job.local_dir.clone().unwrap_or_else(|| "—".into())),
-                            config_line("Seasons", yaml_value_display(job.seasons.as_ref())),
-                            config_line("Episodes", yaml_value_display(job.episodes.as_ref())),
-                            config_line("Wildcard", optional_bool_display(job.wildcard)),
-                            config_line("Unwatched", optional_bool_display(job.unwatched)),
-                        ]
+                            Line::from(""),
+                            Line::from(Span::styled(
+                                "Sync settings",
+                                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                            )),
+                        ]);
+                        let settings = job_settings(&config.download.mode);
+                        let cursor = editor.cursor.min(settings.len() - 1);
+                        let value_width = usize::from(area.width.min(84).saturating_sub(34));
+                        for (index, setting) in settings.iter().enumerate() {
+                            let focused = index == cursor;
+                            let value = match (focused, &editor.input) {
+                                (true, Some(input)) => format!("{input}▏"),
+                                _ if setting.kind == SettingKind::Toggle => {
+                                    if job_setting_bool(job, setting.key).unwrap_or(false) { "yes" } else { "no" }.to_string()
+                                }
+                                _ => job_setting_text(job, setting.key).unwrap_or_else(|| match setting.key {
+                                    "jellyfin_name" => format!("{} (job name)", job.name),
+                                    _ => "all".into(),
+                                }),
+                            };
+                            let mut spans = vec![
+                                Span::styled(
+                                    if focused { "▸ " } else { "  " },
+                                    Style::default().fg(Color::Cyan),
+                                ),
+                                Span::styled(
+                                    format!("{:<16}", setting.label),
+                                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    truncate(&value, value_width),
+                                    if focused && editor.input.is_some() {
+                                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                                    } else if focused {
+                                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                                    } else {
+                                        Style::default().fg(Color::White)
+                                    },
+                                ),
+                            ];
+                            if editor.overrides.contains(setting.key) {
+                                spans.push(Span::styled("  overridden", Style::default().fg(Color::Yellow)));
+                            }
+                            lines.push(Line::from(spans));
+                        }
+                        lines.push(Line::from(""));
+                        if let Some(error) = &editor.error {
+                            lines.push(Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))));
+                        } else if let Some(setting) = settings.get(cursor) {
+                            lines.push(Line::from(Span::styled(
+                                setting.help,
+                                Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+                            )));
+                        }
+                        let target = if config_is_writable(&config_path) {
+                            format!("Edits are saved to {}", tilde_path(&config_path))
+                        } else {
+                            format!(
+                                "Config is read-only; edits go to {}",
+                                state_config_path().map(|path| tilde_path(&path)).unwrap_or_default()
+                            )
+                        };
+                        lines.push(Line::from(Span::styled(target, Style::default().fg(Color::DarkGray))));
+                        title = if editor.input.is_some() {
+                            "Job configuration · Enter save · Esc cancel · empty clears".into()
+                        } else {
+                            "Job configuration · ↑/↓ · Enter edit/toggle · Del clear · r reset · Esc".into()
+                        };
                     } else if let Some(job) = jobs.get(selected) {
-                        vec![
+                        lines.extend([
                             config_line("Name", job.name.clone()),
                             config_line("Type", "Ad-hoc library download"),
                             config_line("Configured", "No static job configuration"),
-                        ]
+                        ]);
                     } else {
-                        vec![Line::from("No job selected")]
-                    };
+                        lines.push(Line::from("No job selected"));
+                    }
+                    let popup = centered_rect(84, lines.len() as u16 + 2, area);
                     frame.render_widget(Clear, popup);
                     frame.render_widget(
                         Paragraph::new(lines)
-                            .block(panel_block("Job configuration · i / Esc close", true))
+                            .block(panel_block(&title, true))
                             .style(Style::default().fg(Color::White)),
                         popup,
                     );
@@ -4156,7 +4595,7 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                         Line::from("  Mouse drag        resize Jobs/Files split (wide terminals)"),
                         Line::from("  s / S             sync selected / all jobs"),
                         Line::from("  b                 browse the Jellyfin library"),
-                        Line::from("  i                 job configuration (Jobs focused)"),
+                        Line::from("  i                 job configuration and sync settings (Jobs focused)"),
                         Line::from("  i / Enter         file media info (Files focused)"),
                         Line::from("  p / double-click  play selected file"),
                         Line::from("  Space             pause / resume selected download"),
@@ -4452,10 +4891,101 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                     }
                     file_info = None;
                     file_meta = None;
-                } else if show_job_config
-                    && matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i'))
-                {
-                    show_job_config = false;
+                } else if show_job_config && !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    let job = jobs
+                        .get(selected)
+                        .and_then(|selected| config.jobs.iter().find(|job| job.name == selected.name))
+                        .cloned();
+                    let settings = job_settings(&config.download.mode);
+                    let setting = settings.get(editor.cursor.min(settings.len() - 1)).copied();
+                    // The change to save, if this key produced one.
+                    let mut change = None;
+                    match (&job, editor.input.as_mut()) {
+                        (Some(_), Some(input)) => match key.code {
+                            KeyCode::Char(character) => input.push(character),
+                            KeyCode::Backspace => {
+                                input.pop();
+                            }
+                            KeyCode::Esc => {
+                                editor.input = None;
+                                editor.error = None;
+                            }
+                            KeyCode::Enter => {
+                                if let Some(setting) = setting {
+                                    match parse_setting_input(setting.kind, input) {
+                                        Ok(parsed) => change = Some(parsed),
+                                        Err(error) => editor.error = Some(format!("{error:#}")),
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        (Some(job), None) => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => show_job_config = false,
+                            KeyCode::Up => {
+                                editor.cursor = editor.cursor.checked_sub(1).unwrap_or(settings.len() - 1);
+                                editor.error = None;
+                            }
+                            KeyCode::Down => {
+                                editor.cursor = (editor.cursor + 1) % settings.len();
+                                editor.error = None;
+                            }
+                            KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char(' ') => {
+                                if let Some(setting) = setting {
+                                    if setting.kind == SettingKind::Toggle {
+                                        let current = job_setting_bool(job, setting.key).unwrap_or(false);
+                                        change = Some(SettingChange::Set(serde_yaml::Value::Bool(!current)));
+                                    } else if key.code != KeyCode::Char(' ') {
+                                        editor.input = Some(job_setting_text(job, setting.key).unwrap_or_default());
+                                        editor.error = None;
+                                    }
+                                }
+                            }
+                            KeyCode::Delete | KeyCode::Backspace => change = Some(SettingChange::Clear),
+                            KeyCode::Char('r') => change = Some(SettingChange::Reset),
+                            _ => {}
+                        },
+                        (None, _) => {
+                            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i')) {
+                                show_job_config = false;
+                            }
+                        }
+                    }
+                    if let (Some(change), Some(job), Some(setting)) = (change, &job, setting) {
+                        let saved = state_config_path().and_then(|overlay| {
+                            let path = save_job_setting(&config_path, &overlay, &job.name, setting.key, change)?;
+                            Ok((path, load_config(&config_path)?, overlay))
+                        });
+                        match saved {
+                            Ok((path, reloaded, overlay)) => {
+                                config = reloaded;
+                                editor.overrides = overlay_job_keys(&overlay, &job.name);
+                                editor.input = None;
+                                editor.error = None;
+                                sync_notice = Some((
+                                    format!("Saved {} for {} to {}; the next sync uses it", setting.label, job.name, tilde_path(&path)),
+                                    true,
+                                ));
+                                if setting.key == "jellyfin_name" {
+                                    // The job may now point at another show: look it up again.
+                                    job_details.remove(&job.name);
+                                    job_items.remove(&job.name);
+                                    job_details_failed.remove(&job.name);
+                                    job_poster_protocols.remove(&job.name);
+                                    if online != Some(Some(false)) && config.jellyfin.is_some() {
+                                        if let Some(task) = job_poster_catalog_task.take() {
+                                            task.abort();
+                                        }
+                                        let config = config.clone();
+                                        job_poster_catalog_task = Some(tokio::spawn(async move {
+                                            jellyfin_job_poster_catalog(&config).await
+                                        }));
+                                    }
+                                }
+                            }
+                            Err(error) => editor.error = Some(format!("{error:#}")),
+                        }
+                    }
                 } else if key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
@@ -4724,7 +5254,13 @@ async fn tui(config: Config, config_path: PathBuf) -> Result<()> {
                             }
                         }
                         KeyCode::Char('i') if !jobs.is_empty() => {
-                            show_job_config = !show_job_config;
+                            show_job_config = true;
+                            editor = JobEditor {
+                                overrides: state_config_path()
+                                    .map(|overlay| overlay_job_keys(&overlay, &jobs[selected].name))
+                                    .unwrap_or_default(),
+                                ..JobEditor::default()
+                            };
                         }
                         KeyCode::Char('b') if online == Some(Some(false)) => {
                             sync_notice = Some((
@@ -4977,23 +5513,6 @@ fn message_style(state: &str, message: &str) -> Style {
     } else {
         Style::default().fg(Color::Gray)
     }
-}
-
-fn yaml_value_display(value: Option<&serde_yaml::Value>) -> String {
-    value
-        .map(|value| {
-            serde_yaml::to_string(value)
-                .unwrap_or_else(|_| "<invalid>".into())
-                .trim()
-                .replace('\n', " ")
-        })
-        .unwrap_or_else(|| "—".into())
-}
-
-fn optional_bool_display(value: Option<bool>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "—".into())
 }
 
 async fn jellyfin_file_meta(api: JellyfinApi, item_id: String, picker: Picker) -> Result<FileMeta> {
@@ -5979,6 +6498,14 @@ fn format_age(seconds: i64) -> String {
     }
 }
 
+/// A path with the home directory shown as `~`.
+fn tilde_path(path: &Path) -> String {
+    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf)) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 fn download_complete(status: &str) -> bool {
     matches!(status, "complete" | "completed" | "success")
 }
@@ -6606,5 +7133,174 @@ jobs: []",
         assert_eq!(format_age(125), "2 min ago");
         assert_eq!(format_age(7200), "2 h ago");
         assert_eq!(format_age(3 * 86_400), "3 d ago");
+    }
+
+    const BASE_CONFIG: &str = "remote: {hostname: h, username: u, root: /srv}
+local: {root: /media}
+download: {mode: jellyfin}
+jobs:
+  - name: Fallout
+    directory: tv
+    seasons: latest
+  - name: Silo
+    directory: tv
+";
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("jellysync-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn overlay_merges_jobs_by_name() {
+        let mut base: serde_yaml::Value = serde_yaml::from_str(BASE_CONFIG).unwrap();
+        let overlay: serde_yaml::Value = serde_yaml::from_str(
+            "parallelism: 4
+jobs:
+  - {name: Fallout, seasons: null, unwatched: true}
+  - {name: Andor, directory: tv}",
+        )
+        .unwrap();
+        merge_config(&mut base, overlay);
+        let config = parse_config(base).unwrap();
+        assert_eq!(config.parallelism, 4);
+        let names: Vec<_> = config.jobs.iter().map(|job| job.name.as_str()).collect();
+        assert_eq!(names, ["Fallout", "Silo", "Andor"]);
+        // null unsets, other keys are kept.
+        assert_eq!(config.jobs[0].seasons, None);
+        assert_eq!(config.jobs[0].unwatched, Some(true));
+        assert_eq!(config.jobs[0].directory.as_deref(), Some("tv"));
+    }
+
+    #[test]
+    fn overlay_is_optional_and_errors_name_it() {
+        let dir = temp_dir("overlay-load");
+        let base = dir.join("config.yaml");
+        let overlay = dir.join("state.yaml");
+        std::fs::write(&base, BASE_CONFIG).unwrap();
+        assert_eq!(
+            load_config_with_overlay(&base, &overlay)
+                .unwrap()
+                .jobs
+                .len(),
+            2
+        );
+        std::fs::write(&overlay, "").unwrap();
+        assert_eq!(
+            load_config_with_overlay(&base, &overlay)
+                .unwrap()
+                .jobs
+                .len(),
+            2
+        );
+        std::fs::write(&overlay, "parallelism: 0").unwrap();
+        let error = format!(
+            "{:#}",
+            load_config_with_overlay(&base, &overlay).unwrap_err()
+        );
+        assert!(error.contains("state.yaml"), "{error}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn settings_go_to_a_writable_config() {
+        let dir = temp_dir("save-writable");
+        let base = dir.join("config.yaml");
+        let overlay = dir.join("state.yaml");
+        std::fs::write(&base, BASE_CONFIG).unwrap();
+        // A stale overlay value must not hide the edit.
+        std::fs::write(&overlay, "jobs: [{name: Silo, seasons: 1}]").unwrap();
+        let written = save_job_setting(
+            &base,
+            &overlay,
+            "Silo",
+            "seasons",
+            SettingChange::Set("latest-2".into()),
+        )
+        .unwrap();
+        assert_eq!(written, base);
+        let config = load_config_with_overlay(&base, &overlay).unwrap();
+        assert_eq!(config.jobs[1].seasons, Some("latest-2".into()));
+        assert!(overlay_job_keys(&overlay, "Silo").is_empty());
+        save_job_setting(&base, &overlay, "Fallout", "seasons", SettingChange::Clear).unwrap();
+        assert_eq!(
+            load_config_with_overlay(&base, &overlay).unwrap().jobs[0].seasons,
+            None
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn settings_go_to_the_overlay_when_read_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir("save-readonly");
+        let base = dir.join("config.yaml");
+        let overlay = dir.join("state").join("config.yaml");
+        std::fs::write(&base, BASE_CONFIG).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if config_is_writable(&base) {
+            // Running as root: permissions do not apply, nothing to test.
+            return;
+        }
+        let written = save_job_setting(
+            &base,
+            &overlay,
+            "Fallout",
+            "unwatched",
+            SettingChange::Set(true.into()),
+        )
+        .unwrap();
+        assert_eq!(written, overlay);
+        save_job_setting(&base, &overlay, "Fallout", "seasons", SettingChange::Clear).unwrap();
+        let config = load_config_with_overlay(&base, &overlay).unwrap();
+        assert_eq!(config.jobs[0].unwatched, Some(true));
+        assert_eq!(config.jobs[0].seasons, None);
+        assert_eq!(std::fs::read_to_string(&base).unwrap(), BASE_CONFIG);
+        let keys = overlay_job_keys(&overlay, "Fallout");
+        assert!(keys.contains("unwatched") && keys.contains("seasons"));
+        // Reset drops the override and the base value applies again.
+        save_job_setting(&base, &overlay, "Fallout", "seasons", SettingChange::Reset).unwrap();
+        let config = load_config_with_overlay(&base, &overlay).unwrap();
+        assert_eq!(config.jobs[0].seasons, Some("latest".into()));
+        // Invalid filters are rejected before anything is written.
+        let before = std::fs::read_to_string(&overlay).unwrap();
+        assert!(
+            save_job_setting(
+                &base,
+                &overlay,
+                "Fallout",
+                "seasons",
+                SettingChange::Set("nope".into())
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&overlay).unwrap(), before);
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn setting_input_parsing() {
+        assert_eq!(
+            parse_setting_input(SettingKind::Filter, " 3 ").unwrap(),
+            SettingChange::Set(3u64.into())
+        );
+        assert_eq!(
+            parse_setting_input(SettingKind::Filter, "latest-2").unwrap(),
+            SettingChange::Set("latest-2".into())
+        );
+        assert!(parse_setting_input(SettingKind::Filter, "latestX").is_err());
+        assert_eq!(
+            parse_setting_input(SettingKind::Text, "  ").unwrap(),
+            SettingChange::Clear
+        );
+        assert_eq!(
+            parse_setting_input(SettingKind::Toggle, "yes").unwrap(),
+            SettingChange::Set(true.into())
+        );
+        let job: Job = serde_yaml::from_str("{name: X, seasons: [1, \"3-4\"]}").unwrap();
+        assert_eq!(job_setting_text(&job, "seasons").as_deref(), Some("1,3-4"));
     }
 }

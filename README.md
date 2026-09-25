@@ -2,6 +2,10 @@
 
 Jellysync is a Rust CLI for syncing media from Jellyfin or over rsync and SSH. Jellyfin HTTP downloads are the default and resume interrupted files; season, episode, and unwatched filters are supported. The rsync-over-SSH mode currently supports unfiltered jobs.
 
+![jellysync TUI: jobs with posters, the Details panel for the selected show and its files grouped by season](docs/screenshot.png)
+
+<sub>Screenshot taken against a throwaway Jellyfin server with Creative Commons media: *Pioneer One* (CC BY-NC-SA), *Sintel* and *Big Buck Bunny* (Blender Foundation, CC BY).</sub>
+
 ## Features
 
 - 📁 Template-based path configuration with variable substitution

@@ -8399,8 +8399,15 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => status(cli.json),
         // Needs no config, so packaging can run it in a build sandbox.
         Some(Commands::Completions { shell }) => {
-            clap_complete::generate(shell, &mut completion_command(), "jellysync", &mut stdout());
-            Ok(())
+            use std::io::Write as _;
+            // clap_complete panics when stdout closes early (`| head`); write
+            // the script ourselves and treat a closed pipe as done.
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut completion_command(), "jellysync", &mut script);
+            match stdout().write_all(&script) {
+                Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => Err(error.into()),
+                _ => Ok(()),
+            }
         }
         Some(Commands::Version) => {
             if cli.json {

@@ -1210,11 +1210,41 @@ fn validate_job_filters(job: &Job) -> Result<()> {
     Ok(())
 }
 fn db() -> Result<Connection> {
-    let conn = Connection::open(state_db()?)?;
+    open_db(&state_db()?)
+}
+
+/// Open the state database, setting up its schema once per process.
+///
+/// Parallel jobs used to each run the WAL switch and `CREATE TABLE`s on their own
+/// connection; on a fresh database SQLite can answer that race with "database
+/// is locked" without waiting for the busy timeout. Setup is now serialized
+/// in-process and retried when another process is doing the same.
+fn open_db(path: &Path) -> Result<Connection> {
+    static READY: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_secs(10))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL;
-        CREATE TABLE IF NOT EXISTS jobs (name TEXT PRIMARY KEY, status TEXT NOT NULL, message TEXT, updated_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS transfers (item_id TEXT PRIMARY KEY, job TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, total INTEGER, updated_at TEXT NOT NULL);")?;
+    let mut ready = READY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !ready.iter().any(|done| done == path) {
+        let mut attempt = 0;
+        loop {
+            match conn.execute_batch("PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS jobs (name TEXT PRIMARY KEY, status TEXT NOT NULL, message TEXT, updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS transfers (item_id TEXT PRIMARY KEY, job TEXT NOT NULL, path TEXT NOT NULL, status TEXT NOT NULL, bytes INTEGER NOT NULL DEFAULT 0, total INTEGER, updated_at TEXT NOT NULL);")
+            {
+                Ok(()) => break,
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy && attempt < 50 =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => return Err(error).context("set up the state database"),
+            }
+        }
+        ready.push(path.to_path_buf());
+    }
     Ok(conn)
 }
 fn update_job(name: &str, status: &str, message: &str) -> Result<()> {
@@ -3616,6 +3646,9 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
         let mut sync_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
         let mut sync_notice: Option<(String, bool)> = None;
         let mut reply_filter = ReplyFilter::default();
+        // Debugging aid for terminal quirks: log every input event to this file.
+        let mut input_log = env::var_os("JELLYSYNC_INPUT_LOG")
+            .and_then(|path| std::fs::File::create(path).ok());
         let mut notice_seen: Option<(String, Instant)> = None;
         let mut last_ctrl_c: Option<Instant> = None;
         let mut last_download_click: Option<(usize, Instant)> = None;
@@ -5459,9 +5492,12 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
             );
             if event::poll(Duration::from_millis(250))? {
                 let input = event::read()?;
-                if let Event::Key(key) = &input
-                    && reply_filter.swallow(key)
-                {
+                let swallowed = matches!(&input, Event::Key(key) if reply_filter.swallow(key));
+                if let Some(log) = input_log.as_mut() {
+                    use std::io::Write as _;
+                    let _ = writeln!(log, "{:?} swallowed={swallowed} {input:?}", Instant::now());
+                }
+                if swallowed {
                     continue;
                 }
                 if let Event::Resize(_, _) = input {
@@ -7759,7 +7795,7 @@ mod tests {
             Some(10)
         );
         assert_eq!(
-            parse_season(Path::new("/movies/Heat (1995)/Heat.mkv")),
+            parse_season(Path::new("/movies/Sintel (2010)/Sintel.mkv")),
             None
         );
         // "S" inside a word is not a season tag.
@@ -7802,7 +7838,7 @@ mod tests {
 
     #[test]
     fn movies_are_not_grouped() {
-        let mut files = vec![entry("a", "/m/Heat (1995)/Heat.mkv")];
+        let mut files = vec![entry("a", "/m/Sintel (2010)/Sintel.mkv")];
         let rows = file_rows(&mut files, None);
         assert!(matches!(rows.as_slice(), [FileRow::File(0)]));
     }
@@ -7865,18 +7901,18 @@ mod tests {
     fn movie_title_only_for_a_lone_file() {
         let details = JobDetails {
             series: false,
-            title: "Heat".into(),
-            years: Some("1995".into()),
+            title: "Sintel".into(),
+            years: Some("2010".into()),
             facts: Vec::new(),
             tagline: None,
             overview: String::new(),
             episodes: HashMap::new(),
             poster: None,
         };
-        let file = entry("m", "/m/Heat/Heat.mkv");
+        let file = entry("m", "/m/Sintel/Sintel.mkv");
         assert_eq!(
             file_title(Some(&details), &file, true),
-            Some((String::new(), "Heat (1995)".into()))
+            Some((String::new(), "Sintel (2010)".into()))
         );
         assert_eq!(file_title(Some(&details), &file, false), None);
         assert_eq!(file_title(None, &file, true), None);
@@ -7929,8 +7965,8 @@ mod tests {
     #[test]
     fn season_clear_without_headings_uses_the_folder() {
         let files = vec![
-            entry("a", "/m/Heat/Heat.mkv"),
-            entry("b", "/m/Heat/Heat-extras.mkv"),
+            entry("a", "/m/Sintel/Sintel.mkv"),
+            entry("b", "/m/Sintel/Sintel-extras.mkv"),
         ];
         // An ungrouped list, as for a movie folder.
         let rows = vec![FileRow::File(0), FileRow::File(1)];
@@ -8095,17 +8131,20 @@ jobs: []",
     #[test]
     fn exact_titles_win_over_substrings() {
         let items = vec![
-            media("Heat Wave", "Series", None),
-            media("Heat", "Movie", None),
+            media("Sintel Returns", "Series", None),
+            media("Sintel", "Movie", None),
         ];
-        assert_eq!(find_one(items, "heat").unwrap().unwrap().name, "Heat");
-        let items = vec![media("Heat Wave", "Series", None)];
-        assert_eq!(find_one(items, "Heat").unwrap().unwrap().name, "Heat Wave");
+        assert_eq!(find_one(items, "sintel").unwrap().unwrap().name, "Sintel");
+        let items = vec![media("Sintel Returns", "Series", None)];
+        assert_eq!(
+            find_one(items, "Sintel").unwrap().unwrap().name,
+            "Sintel Returns"
+        );
         let items = vec![
-            media("Heat Wave", "Series", None),
-            media("Heat 2", "Movie", None),
+            media("Sintel Returns", "Series", None),
+            media("Sintel 2", "Movie", None),
         ];
-        assert!(find_one(items, "Heat").is_err());
+        assert!(find_one(items, "Sintel").is_err());
     }
 
     #[test]
@@ -8116,17 +8155,17 @@ jobs: []",
             item_destination(&item, root, "Season $season_number", "Show", false).unwrap(),
             PathBuf::from("/local/Show/Season 2/Show - S02E03.mkv")
         );
-        let item = media("Movie", "Movie", Some("/movies/Heat/Heat.mkv"));
+        let item = media("Movie", "Movie", Some("/movies/Sintel/Sintel.mkv"));
         assert_eq!(
             item_destination(
                 &item,
-                Path::new("/local/Heat"),
+                Path::new("/local/Sintel"),
                 "Season $season_number",
-                "Heat",
+                "Sintel",
                 true
             )
             .unwrap(),
-            PathBuf::from("/local/Heat/Heat.mkv")
+            PathBuf::from("/local/Sintel/Sintel.mkv")
         );
         let item = media("Bad", "Episode", Some("/tv/.."));
         assert!(item_destination(&item, root, "Season $season_number", "Show", false).is_err());
@@ -8191,10 +8230,10 @@ jobs: []",
 local: {root: /media}
 download: {mode: jellyfin}
 jobs:
-  - name: Fallout
+  - name: Pioneer One
     directory: tv
     seasons: latest
-  - name: Silo
+  - name: Sintel
     directory: tv
 ";
 
@@ -8211,15 +8250,15 @@ jobs:
         let overlay: serde_yaml::Value = serde_yaml::from_str(
             "parallelism: 4
 jobs:
-  - {name: Fallout, seasons: null, unwatched: true}
-  - {name: Andor, directory: tv}",
+  - {name: Pioneer One, seasons: null, unwatched: true}
+  - {name: Elephants Dream, directory: tv}",
         )
         .unwrap();
         merge_config(&mut base, overlay);
         let config = parse_config(base).unwrap();
         assert_eq!(config.parallelism, 4);
         let names: Vec<_> = config.jobs.iter().map(|job| job.name.as_str()).collect();
-        assert_eq!(names, ["Fallout", "Silo", "Andor"]);
+        assert_eq!(names, ["Pioneer One", "Sintel", "Elephants Dream"]);
         // null unsets, other keys are kept.
         assert_eq!(config.jobs[0].seasons, None);
         assert_eq!(config.jobs[0].unwatched, Some(true));
@@ -8263,11 +8302,11 @@ jobs:
         let overlay = dir.join("state.yaml");
         std::fs::write(&base, BASE_CONFIG).unwrap();
         // A stale overlay value must not hide the edit.
-        std::fs::write(&overlay, "jobs: [{name: Silo, seasons: 1}]").unwrap();
+        std::fs::write(&overlay, "jobs: [{name: Sintel, seasons: 1}]").unwrap();
         let written = save_job_setting(
             &base,
             &overlay,
-            "Silo",
+            "Sintel",
             "seasons",
             SettingChange::Set("latest-2".into()),
         )
@@ -8275,8 +8314,15 @@ jobs:
         assert_eq!(written, base);
         let config = load_config_with_overlay(&base, &overlay).unwrap();
         assert_eq!(config.jobs[1].seasons, Some("latest-2".into()));
-        assert!(overlay_job_keys(&overlay, "Silo").is_empty());
-        save_job_setting(&base, &overlay, "Fallout", "seasons", SettingChange::Clear).unwrap();
+        assert!(overlay_job_keys(&overlay, "Sintel").is_empty());
+        save_job_setting(
+            &base,
+            &overlay,
+            "Pioneer One",
+            "seasons",
+            SettingChange::Clear,
+        )
+        .unwrap();
         assert_eq!(
             load_config_with_overlay(&base, &overlay).unwrap().jobs[0].seasons,
             None
@@ -8299,21 +8345,35 @@ jobs:
         let written = save_job_setting(
             &base,
             &overlay,
-            "Fallout",
+            "Pioneer One",
             "unwatched",
             SettingChange::Set(true.into()),
         )
         .unwrap();
         assert_eq!(written, overlay);
-        save_job_setting(&base, &overlay, "Fallout", "seasons", SettingChange::Clear).unwrap();
+        save_job_setting(
+            &base,
+            &overlay,
+            "Pioneer One",
+            "seasons",
+            SettingChange::Clear,
+        )
+        .unwrap();
         let config = load_config_with_overlay(&base, &overlay).unwrap();
         assert_eq!(config.jobs[0].unwatched, Some(true));
         assert_eq!(config.jobs[0].seasons, None);
         assert_eq!(std::fs::read_to_string(&base).unwrap(), BASE_CONFIG);
-        let keys = overlay_job_keys(&overlay, "Fallout");
+        let keys = overlay_job_keys(&overlay, "Pioneer One");
         assert!(keys.contains("unwatched") && keys.contains("seasons"));
         // Reset drops the override and the base value applies again.
-        save_job_setting(&base, &overlay, "Fallout", "seasons", SettingChange::Reset).unwrap();
+        save_job_setting(
+            &base,
+            &overlay,
+            "Pioneer One",
+            "seasons",
+            SettingChange::Reset,
+        )
+        .unwrap();
         let config = load_config_with_overlay(&base, &overlay).unwrap();
         assert_eq!(config.jobs[0].seasons, Some("latest".into()));
         // Invalid filters are rejected before anything is written.
@@ -8322,7 +8382,7 @@ jobs:
             save_job_setting(
                 &base,
                 &overlay,
-                "Fallout",
+                "Pioneer One",
                 "seasons",
                 SettingChange::Set("nope".into())
             )
@@ -8426,18 +8486,22 @@ jobs:
         let Some((dir, base, overlay)) = read_only_fixture("jobs-ro") else {
             return;
         };
-        add_job(&base, &overlay, " Andor ", "tv").unwrap();
-        assert!(add_job(&base, &overlay, "Andor", "tv").is_err());
+        add_job(&base, &overlay, " Elephants Dream ", "tv").unwrap();
+        assert!(add_job(&base, &overlay, "Elephants Dream", "tv").is_err());
         assert!(add_job(&base, &overlay, "  ", "tv").is_err());
         let config = load_config_with_overlay(&base, &overlay).unwrap();
-        let andor = config.jobs.iter().find(|job| job.name == "Andor").unwrap();
-        assert_eq!(andor.directory.as_deref(), Some("tv"));
+        let dream = config
+            .jobs
+            .iter()
+            .find(|job| job.name == "Elephants Dream")
+            .unwrap();
+        assert_eq!(dream.directory.as_deref(), Some("tv"));
         // Jobs from the read-only config can only be disabled.
-        assert!(delete_job(&base, &overlay, "Silo").is_err());
+        assert!(delete_job(&base, &overlay, "Sintel").is_err());
         save_job_setting(
             &base,
             &overlay,
-            "Silo",
+            "Sintel",
             "enabled",
             SettingChange::Set(false.into()),
         )
@@ -8448,13 +8512,13 @@ jobs:
             .into_iter()
             .map(|job| job.name)
             .collect();
-        assert_eq!(names, ["Fallout", "Andor"]);
+        assert_eq!(names, ["Pioneer One", "Elephants Dream"]);
         // Disabled jobs still run when named.
-        assert_eq!(selected_jobs(&config, &["Silo".into()]).unwrap().len(), 1);
+        assert_eq!(selected_jobs(&config, &["Sintel".into()]).unwrap().len(), 1);
         // Overlay-only jobs can be deleted.
-        delete_job(&base, &overlay, "Andor").unwrap();
+        delete_job(&base, &overlay, "Elephants Dream").unwrap();
         let config = load_config_with_overlay(&base, &overlay).unwrap();
-        assert!(config.jobs.iter().all(|job| job.name != "Andor"));
+        assert!(config.jobs.iter().all(|job| job.name != "Elephants Dream"));
         cleanup(&dir);
     }
 
@@ -8464,12 +8528,12 @@ jobs:
         let base = dir.join("config.yaml");
         let overlay = dir.join("state.yaml");
         std::fs::write(&base, BASE_CONFIG).unwrap();
-        std::fs::write(&overlay, "jobs: [{name: Silo, unwatched: true}]").unwrap();
-        delete_job(&base, &overlay, "Silo").unwrap();
+        std::fs::write(&overlay, "jobs: [{name: Sintel, unwatched: true}]").unwrap();
+        delete_job(&base, &overlay, "Sintel").unwrap();
         let config = load_config_with_overlay(&base, &overlay).unwrap();
         let names: Vec<_> = config.jobs.iter().map(|job| job.name.as_str()).collect();
         // Gone from both files, so the overlay entry does not resurrect it.
-        assert_eq!(names, ["Fallout"]);
+        assert_eq!(names, ["Pioneer One"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -8507,7 +8571,7 @@ jobs:
             .filter(|row| matches!(row, SettingsRow::Field(_)))
             .count();
         assert_eq!(fields, GLOBAL_FIELDS.len());
-        assert!(rows.contains(&SettingsRow::Job("Silo".into())));
+        assert!(rows.contains(&SettingsRow::Job("Sintel".into())));
         assert_eq!(rows.last(), Some(&SettingsRow::OpenEditor));
     }
 
@@ -8546,5 +8610,33 @@ jobs:
             // The internal worker command stays hidden.
             assert!(!script.contains("worker"), "{shell}");
         }
+    }
+
+    #[test]
+    fn fresh_state_db_survives_parallel_first_use() {
+        let dir = temp_dir("state-db");
+        let path = dir.join("state.db");
+        let workers: Vec<_> = (0..16)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || -> Result<()> {
+                    let conn = open_db(&path)?;
+                    conn.execute(
+                        "INSERT INTO jobs(name,status,message,updated_at) VALUES(?1,'ok','',datetime('now'))",
+                        params![format!("job{index}")],
+                    )?;
+                    Ok(())
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        let count: i64 = open_db(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 16);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

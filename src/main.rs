@@ -205,6 +205,8 @@ struct Config {
     #[serde(default)]
     rsync: Rsync,
     #[serde(default)]
+    auto: AutoSettings,
+    #[serde(default)]
     jellyfin: Option<Jellyfin>,
     #[serde(default)]
     library: Option<Library>,
@@ -219,6 +221,13 @@ struct Cleanup {
     /// How long watched files are kept before they are deleted, e.g. `7d`.
     #[serde(default, deserialize_with = "duration_spec")]
     delete_watched_after: Option<String>,
+}
+
+/// Title patterns excluded from every auto job. Individual jobs can add more.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct AutoSettings {
+    #[serde(default)]
+    ignore: Vec<String>,
 }
 
 /// A duration setting written as text (`7d`) or a bare number of days (`0`).
@@ -321,6 +330,9 @@ struct Job {
     /// Restrict an auto job to one Jellyfin library (by name).
     #[serde(default)]
     library: Option<String>,
+    /// Movie title or series name patterns to exclude from this auto job.
+    #[serde(default)]
+    ignore: Vec<String>,
 }
 
 /// What an auto job picks from.
@@ -628,6 +640,8 @@ fn state_db() -> Result<PathBuf> {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SettingKind {
     Text,
+    /// Comma-separated values, stored as a YAML list.
+    List,
     Filter,
     Toggle,
     Duration,
@@ -675,6 +689,12 @@ fn auto_job_settings() -> Vec<JobSetting> {
             label: "Library",
             kind: SettingKind::Text,
             help: "only pick from this Jellyfin library (by name); empty: all libraries",
+        },
+        JobSetting {
+            key: "ignore",
+            label: "Ignore patterns",
+            kind: SettingKind::List,
+            help: "comma-separated glob patterns for movie titles or series names to skip",
         },
         JobSetting {
             key: "enabled",
@@ -795,6 +815,7 @@ fn job_setting_text(job: &Job, key: &str) -> Option<String> {
         "max_items" => job.max_items.map(|max| max.to_string()),
         "max_size" => job.max_size.map(|max| format!("{max}")),
         "library" => job.library.clone(),
+        "ignore" => (!job.ignore.is_empty()).then(|| job.ignore.join(", ")),
         "seasons" => yaml(job.seasons.as_ref()),
         "episodes" => yaml(job.episodes.as_ref()),
         _ => None,
@@ -819,6 +840,14 @@ fn parse_setting_input(kind: SettingKind, input: &str) -> Result<SettingChange> 
     }
     match kind {
         SettingKind::Text => Ok(SettingChange::Set(input.into())),
+        SettingKind::List => Ok(SettingChange::Set(serde_yaml::Value::Sequence(
+            input
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(serde_yaml::Value::from)
+                .collect(),
+        ))),
         SettingKind::Duration => {
             parse_duration(input)?;
             Ok(SettingChange::Set(input.into()))
@@ -864,6 +893,8 @@ enum FieldKind {
     Choice(&'static [&'static str]),
     /// Whitespace-separated words, stored as a YAML list.
     List,
+    /// Comma-separated values, stored as a YAML list.
+    CommaList,
     /// A duration such as `7d` or `12h`.
     Duration,
 }
@@ -1001,6 +1032,14 @@ const GLOBAL_FIELDS: &[GlobalField] = &[
         help: "season folder name; $season_number and $name are replaced",
     },
     GlobalField {
+        section: "Auto downloads",
+        path: &["auto", "ignore"],
+        label: "Ignore patterns",
+        kind: FieldKind::CommaList,
+        default: "none",
+        help: "comma-separated glob patterns for movie titles or series names skipped by every auto job",
+    },
+    GlobalField {
         section: "Local",
         path: &["rsync", "flags"],
         label: "Rsync flags",
@@ -1039,6 +1078,22 @@ fn field_display(value: Option<&serde_yaml::Value>) -> Option<String> {
     }
 }
 
+fn field_display_for_kind(value: Option<&serde_yaml::Value>, kind: FieldKind) -> Option<String> {
+    if kind != FieldKind::CommaList {
+        return field_display(value);
+    }
+    match value? {
+        serde_yaml::Value::Sequence(items) => Some(
+            items
+                .iter()
+                .filter_map(|item| field_display(Some(item)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        other => field_display(Some(other)),
+    }
+}
+
 /// Turn what was typed for a global field into a change; empty input clears it.
 fn parse_field_input(kind: FieldKind, input: &str) -> Result<SettingChange> {
     let input = input.trim();
@@ -1054,6 +1109,14 @@ fn parse_field_input(kind: FieldKind, input: &str) -> Result<SettingChange> {
         FieldKind::List => serde_yaml::Value::Sequence(
             input
                 .split_whitespace()
+                .map(serde_yaml::Value::from)
+                .collect(),
+        ),
+        FieldKind::CommaList => serde_yaml::Value::Sequence(
+            input
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
                 .map(serde_yaml::Value::from)
                 .collect(),
         ),
@@ -3162,6 +3225,39 @@ fn select_auto_items(
     selected
 }
 
+/// Match a title against a case-insensitive glob using `*` and `?`.
+fn auto_ignore_pattern_matches(pattern: &str, title: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let title: Vec<char> = title.chars().collect();
+    let (mut pattern_index, mut title_index) = (0, 0);
+    let mut star_index = None;
+    let mut star_title_index = 0;
+
+    while title_index < title.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?'
+                || pattern[pattern_index].eq_ignore_ascii_case(&title[title_index]))
+        {
+            pattern_index += 1;
+            title_index += 1;
+        } else if pattern.get(pattern_index) == Some(&'*') {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            star_title_index = title_index;
+        } else if let Some(star) = star_index {
+            star_title_index += 1;
+            title_index = star_title_index;
+            pattern_index = star + 1;
+        } else {
+            return false;
+        }
+    }
+
+    pattern[pattern_index..]
+        .iter()
+        .all(|character| *character == '*')
+}
+
 /// Plan an auto job: the newest unwatched movies and episodes within its limits,
 /// with destinations laid out like ad-hoc downloads, and the tracked items that
 /// newer ones pushed out of the window (to delete). Watched items are left to
@@ -3225,10 +3321,28 @@ async fn auto_job_plan(
         .map(|entry| entry.item_id.as_str())
         .collect();
     let unwatched_only = job.unwatched != Some(false);
+    let ignored_patterns: Vec<&str> = config
+        .auto
+        .ignore
+        .iter()
+        .chain(job.ignore.iter())
+        .map(|title| title.trim())
+        .filter(|title| !title.is_empty())
+        .collect();
     let eligible: Vec<&MediaItem> = items
         .iter()
         .filter(|item| item.path.is_some())
         .filter(|item| !ignored.contains(&item.id))
+        .filter(|item| {
+            let title = if item.item_type.as_deref() == Some("Movie") {
+                item.name.as_str()
+            } else {
+                item.series_name.as_deref().unwrap_or(&item.name)
+            };
+            !ignored_patterns
+                .iter()
+                .any(|pattern| auto_ignore_pattern_matches(pattern, title))
+        })
         .filter(|item| !owned_elsewhere.contains(item.id.as_str()))
         .filter(|item| !unwatched_only || !played(item))
         .collect();
@@ -6345,7 +6459,10 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                         format!("{input}▏"),
                                         Style::default().fg(Color::Black).bg(Color::Cyan),
                                     )),
-                                    _ => match field_display(setting_value(&screen.merged, target).as_ref()) {
+                                    _ => match field_display_for_kind(
+                                        setting_value(&screen.merged, target).as_ref(),
+                                        field.kind,
+                                    ) {
                                         Some(value) => spans.push(Span::styled(truncate(&value, value_width), value_style)),
                                         None if field.default.is_empty() => spans.push(Span::styled("not set", muted)),
                                         None => spans.push(Span::styled(format!("{} (default)", field.default), muted)),
@@ -6488,6 +6605,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                                     }
                                     "max_items" | "max_size" => "no limit".into(),
                                     "library" => "all libraries".into(),
+                                    "ignore" => "no patterns".into(),
                                     "delete_watched_after" => "cleanup setting".into(),
                                     _ => "all".into(),
                                 }),
@@ -7430,8 +7548,9 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
                             KeyCode::Enter | KeyCode::Char('e') => match &row {
                                 Some(SettingsRow::Field(index)) => {
                                     let field = &GLOBAL_FIELDS[*index];
-                                    let current = field_display(
+                                    let current = field_display_for_kind(
                                         setting_value(&screen.merged, SettingTarget::Global(field.path)).as_ref(),
+                                        field.kind,
                                     );
                                     if let FieldKind::Choice(choices) = field.kind {
                                         let current = current.unwrap_or_else(|| field.default.to_string());

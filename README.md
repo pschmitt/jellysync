@@ -274,6 +274,12 @@ jellyfin:
 library:
   season_pattern: "Season $season_number"
 
+# Patterns applied to every auto job; individual jobs can add their own.
+auto:
+  ignore:
+    - "*Christmas*"
+    - "Marvel *"
+
 rsync:
   flags:
     - -a
@@ -667,11 +673,14 @@ jobs:
   - name: New movies
     auto: movies
     max_items: 10
+    ignore: ["Some Movie*", "Another?Movie"]
 
   - name: New episodes
     auto: shows        # or `true` / `all` for both
     max_size: 30       # GiB
     library: TV Shows  # optional: only this Jellyfin library
+    ignore:
+      - "Some Series*"
 ```
 
 - Items are picked newest first; one too big for the space left is skipped so
@@ -683,6 +692,13 @@ jobs:
   delete watched files after the grace period unless `delete_watched: false`.
 - Items another job already downloads are skipped, so jobs never fight over a
   file. Ignored items are skipped too.
+- `auto.ignore` excludes movie titles or series names matching any glob pattern
+  from every auto job. A job's own `ignore` list adds patterns excluded just
+  for that job, which lets jobs scoped to different Jellyfin libraries use
+  separate lists. `*` matches any number of characters and `?` matches one;
+  patterns match the whole title and ignore letter case. For example,
+  `"*Christmas*"` matches a title containing “Christmas”, while `"Marvel *"`
+  matches titles beginning with “Marvel ”. Episodes are matched by series name.
 
 `jellysync download auto` works without any configuration: it syncs a job
 named `auto` if there is one, and otherwise an implicit auto job for all media.
@@ -695,7 +711,8 @@ jellysync download "New episodes" --max-size 50
 ```
 
 In the TUI, `i` on a job toggles **Auto** (off/all/movies/shows) and edits an
-auto job's limits and library.
+auto job's limits, library and comma-separated ignore patterns. The global
+**Ignore patterns** field is under Auto downloads in the Settings screen.
 
 ## Watched state and cleanup
 

@@ -41,6 +41,12 @@ library:
   # episode_pattern: "Episode $episode_number"       # "Episode 01"
   # episode_pattern: "S[0-9]+E$episode_number"       # Matches "S01E01" pattern
 
+# Optional: glob patterns for movie titles or series names to skip in every auto job.
+auto:
+  ignore:
+    - "*Christmas*"
+    - "Marvel *"
+
 # Optional: Custom rsync flags
 # If not specified, defaults to: -a -v -z
 rsync:
@@ -146,10 +152,16 @@ jobs:
   - name: New movies
     auto: movies # or shows, or true for both
     max_items: 10
+    # Optional: extra patterns ignored by this auto job only.
+    ignore: ["Some Movie*", "Another?Movie"]
 
   - name: New episodes
     auto: shows
     max_size: 30 # GiB
+    # Optional when this job targets a specific library.
+    library: TV Shows
+    ignore:
+      - "Some Series*"
 
   # Sync using wildcards (resolves to first match)
   - name: "Pioneer One (2010)"

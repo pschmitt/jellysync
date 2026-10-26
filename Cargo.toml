@@ -14,7 +14,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 crossterm = "0.29"
-dirs = "6"
+dirs = "7"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 ratatui = "0.29"

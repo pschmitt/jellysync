@@ -29,7 +29,7 @@ use ratatui::{
     },
 };
 use ratatui_image::{
-    Resize, StatefulImage,
+    FontSize, Resize, StatefulImage,
     picker::Picker,
     protocol::StatefulProtocol,
     thread::{ResizeRequest, ThreadProtocol},
@@ -2746,17 +2746,24 @@ const CELL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// session (e.g. a HiDPI laptop plus an SSH client): kitty then shows images
 /// too large and crops them. Use the cell size of the client actually looking at
 /// this pane instead.
+#[allow(deprecated)]
 fn with_viewer_cell_size(picker: Picker) -> Picker {
     let Some(cell) = tmux_viewer_cell_size() else {
         return picker;
     };
-    if cell == picker.font_size() {
+    let font_size = picker.font_size();
+    if cell == (font_size.width, font_size.height) {
         return picker;
     }
     let protocol = picker.protocol_type();
-    let mut updated = Picker::from_fontsize(cell);
+    let mut updated = Picker::from_fontsize(cell.into());
     updated.set_protocol_type(protocol);
     updated
+}
+
+#[allow(deprecated)]
+fn fallback_picker() -> Picker {
+    Picker::from_fontsize(FontSize::new(8, 16))
 }
 
 fn tmux_viewer_cell_size() -> Option<(u16, u16)> {
@@ -4995,7 +5002,7 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
         let mut terminal = Terminal::new(backend)?;
         let tmux_client = tmux_active_client();
         let query_started = Instant::now();
-        let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
+        let picker = Picker::from_query_stdio().unwrap_or_else(|_| fallback_picker());
         let mut picker = with_viewer_cell_size(picker);
         let mut cell_checked_at = Instant::now();
         if let Some(client) = tmux_client {
@@ -5107,7 +5114,11 @@ async fn tui(mut config: Config, config_path: PathBuf) -> Result<()> {
             if cell_checked_at.elapsed() >= CELL_CHECK_INTERVAL {
                 cell_checked_at = Instant::now();
                 let updated = with_viewer_cell_size(picker.clone());
-                if updated.font_size() != picker.font_size() {
+                let updated_font_size = updated.font_size();
+                let current_font_size = picker.font_size();
+                if (updated_font_size.width, updated_font_size.height)
+                    != (current_font_size.width, current_font_size.height)
+                {
                     // Images are encoded for a cell size; re-render them all for the new one.
                     picker = updated;
                     for (_, task) in job_poster_tasks.drain() {

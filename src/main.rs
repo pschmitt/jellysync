@@ -1610,6 +1610,31 @@ fn db() -> Result<Connection> {
     open_db(&state_db()?)
 }
 
+fn row_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value = row.get::<_, i64>(index)?;
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+fn row_opt_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+    row.get::<_, Option<i64>>(index)?
+        .map(|value| {
+            u64::try_from(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
+}
+
 /// Open the state database, setting up its schema once per process.
 ///
 /// Parallel jobs used to each run the WAL switch and `CREATE TABLE`s on their own
@@ -1908,7 +1933,7 @@ fn transfer_total(item_id: &str) -> Result<Option<u64>> {
         .query_row(
             "SELECT total FROM transfers WHERE item_id=?1",
             params![item_id],
-            |row| row.get::<_, Option<u64>>(0),
+            |row| row_opt_u64(row, 0),
         )
         .optional()?
         .flatten())
@@ -4196,9 +4221,9 @@ fn status(json_output: bool, config: Option<&Config>) -> Result<()> {
             (
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, u64>(3)?,
-                row.get::<_, Option<u64>>(4)?,
-                row.get::<_, Option<u64>>(5)?,
+                row_u64(row, 3)?,
+                row_opt_u64(row, 4)?,
+                row_opt_u64(row, 5)?,
             ),
         ))
     })? {
@@ -4404,9 +4429,9 @@ fn status_json(conn: &Connection, config: Option<&Config>) -> Result<()> {
                 "job": row.get::<_, String>(0)?,
                 "path": row.get::<_, String>(1)?,
                 "status": row.get::<_, String>(2)?,
-                "bytes": row.get::<_, u64>(3)?,
-                "total": row.get::<_, Option<u64>>(4)?,
-                "rate": row.get::<_, Option<u64>>(5)?,
+                "bytes": row_u64(row, 3)?,
+                "total": row_opt_u64(row, 4)?,
+                "rate": row_opt_u64(row, 5)?,
             }))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4832,9 +4857,9 @@ fn tracked_downloads() -> Result<Vec<DownloadEntry>> {
             job: row.get(1)?,
             path: PathBuf::from(row.get::<_, String>(2)?),
             status: row.get(3)?,
-            bytes: row.get(4)?,
-            total: row.get(5)?,
-            rate: row.get(6)?,
+            bytes: row_u64(row, 4)?,
+            total: row_opt_u64(row, 5)?,
+            rate: row_opt_u64(row, 6)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

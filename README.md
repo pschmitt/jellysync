@@ -1,5 +1,7 @@
 # jellysync
 
+[![nixbot](https://nixbot.brkn.lol/repos/github/pschmitt/jellysync/badge.svg?branch=main)](https://nixbot.brkn.lol/repos/github/pschmitt/jellysync)
+
 Jellysync is a Rust CLI for syncing media from Jellyfin or over rsync and SSH. Jellyfin HTTP downloads are the default and resume interrupted files; season, episode, and unwatched filters are supported. The rsync-over-SSH mode currently supports unfiltered jobs.
 
 ![jellysync TUI: jobs with posters, the Details panel for the selected show and its files grouped by season](docs/screenshot.png)

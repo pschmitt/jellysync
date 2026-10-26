@@ -569,6 +569,12 @@
       }
     )
     // {
+      # Linux package builds and checks run on the self-hosted nixbot.
+      hydraJobs = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (system: {
+        packages = self.packages.${system} or { };
+        checks = self.checks.${system} or { };
+      });
+
       homeManagerModules = {
         jellysync = homeModule;
         default = homeModule;

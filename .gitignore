@@ -1,7 +1,6 @@
 # Nix build results
 result
 result-*
-flake.lock
 
 # Config files
 jellysync.yaml

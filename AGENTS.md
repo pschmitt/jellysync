@@ -1,5 +1,10 @@
 # Development Guidelines for jellysync
 
+## Private infrastructure details
+
+Do not include private hostnames, device identifiers, network addresses or topology here. Use placeholders and consult the private `brkn-infra` skill for specific host or device details.
+
+
 ## Bash Scripting Rules
 
 ### Error Handling
@@ -200,9 +205,9 @@ fi
 ```bash
 # Configuration examples that must work:
 local:
-  root: ~/Videos           # Expands to /home/user/Videos
+  root: ~/Videos           # Expands to $HOME/Videos
   directories:
-    docs: $HOME/Documents  # Expands to /home/user/Documents
+    docs: $HOME/Documents  # Expands to $HOME/Documents
     abs: /absolute/path    # Remains unchanged
 
 # Implementation:

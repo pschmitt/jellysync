@@ -5,7 +5,7 @@
 Jellysync is a Rust CLI for syncing media from Jellyfin or over rsync/SSH.
 
 - Run `just check` and `just test` for project validation. The Just recipes
-  may use a remote build host; select the appropriate host role through the
+  may use a remote build host or an `rworker` (see the `rworker` skill); select the appropriate host role through the
   private `brkn-infra` skill and keep host-specific details out of this file.
 - Use `--dry-run` and disposable media sources when checking sync behavior.
 - Before changing workflows, check for reusable workflows or actions in

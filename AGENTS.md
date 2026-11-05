@@ -7,6 +7,10 @@ Jellysync is a Rust CLI for syncing media from Jellyfin or over rsync/SSH.
 - Run `just check` and `just test` for project validation. The Just recipes
   may use a remote build host or an `rworker` (see the `rworker` skill); select the appropriate host role through the
   private `brkn-infra` skill and keep host-specific details out of this file.
+- Keep `packages.default` canonical and retain named package outputs that
+  represent distinct packages; do not add the legacy `defaultPackage` alias.
+- The Home Manager integration is exported as `homeManagerModules.default` from
+  `nix/module-hm.nix`; run Nix evaluation and builds on an `rworker`.
 - Use `--dry-run` and disposable media sources when checking sync behavior.
 - Before changing workflows, check for reusable workflows or actions in
   [ci-workflows](https://github.com/pschmitt/ci-workflows) and preserve

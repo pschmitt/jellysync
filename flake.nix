@@ -43,6 +43,11 @@
           nativeBuildInputs = [
             pkgs.installShellFiles
             pkgs.makeWrapper
+            pkgs.pkg-config
+          ];
+          buildInputs = [
+            pkgs.aws-lc
+            pkgs.sqlite
           ];
           postInstall = ''
             wrapProgram $out/bin/jellysync \

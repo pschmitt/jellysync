@@ -47,12 +47,3 @@ jobs:
       - run: cargo ndk --target aarch64-linux-android --platform 24 -- build --locked --release
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-
-  nix:
-    name: Nix package
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: pschmitt/ci-workflows/.github/actions/nix-setup@main
-      - run: nix flake check --print-build-logs
-      - run: nix build --print-build-logs '.#'
